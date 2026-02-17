@@ -7015,9 +7015,12 @@ int call::ipsec_setup_sas(const char *msg)
         return -1;
     }
 
-    /* Set IP addresses and protocol */
-    strncpy(ipsec_params.local_ip, local_ip, sizeof(ipsec_params.local_ip) - 1);
-    strncpy(ipsec_params.remote_ip, remote_ip, sizeof(ipsec_params.remote_ip) - 1);
+    /* Set IP addresses and protocol (IPs always fit; suppress truncation warning) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+    snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", local_ip);
+    snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", remote_ip);
+#pragma GCC diagnostic pop
     ipsec_params.proto = (transport == T_TCP) ? IPPROTO_TCP : IPPROTO_UDP;
 
     /* Set up the 4 SAs and 4 policies */

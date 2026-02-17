@@ -35,10 +35,11 @@ RUN apt-get update \
   libmnl-dev \
   libpcap-dev \
   libncurses-dev \
+  libssl-dev \
   linux-libc-dev \
   make \
   ninja-build \
-  ${FULL:+libsctp-dev libssl-dev}
+  ${FULL:+libsctp-dev}
 
 WORKDIR /sipp
 COPY CMakeLists.txt ./
@@ -66,8 +67,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libmnl0 \
   libpcap0.8 \
   libncursesw6 \
+  libssl3 \
   iproute2 \
-  ${FULL:+libsctp1 libssl3} \
+  ${FULL:+libsctp1} \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 

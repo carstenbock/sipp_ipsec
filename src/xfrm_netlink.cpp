@@ -327,8 +327,14 @@ int xfrm_add_policy(const char *src_ip, const char *dst_ip,
     /* SA template: tells kernel which SA to use */
     xfrm_address_t tsrc_addr, tdst_addr;
     uint16_t tsrc_family, tdst_family;
-    parse_ip(tmpl_src, &tsrc_addr, &tsrc_family);
-    parse_ip(tmpl_dst, &tdst_addr, &tdst_family);
+    if (parse_ip(tmpl_src, &tsrc_addr, &tsrc_family) < 0) {
+        WARNING("Invalid template source IP: %s", tmpl_src);
+        return -1;
+    }
+    if (parse_ip(tmpl_dst, &tdst_addr, &tdst_family) < 0) {
+        WARNING("Invalid template destination IP: %s", tmpl_dst);
+        return -1;
+    }
 
     struct xfrm_user_tmpl tmpl;
     memset(&tmpl, 0, sizeof(tmpl));

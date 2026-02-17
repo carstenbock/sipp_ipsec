@@ -150,11 +150,11 @@ int parse_security_server_header(const char *header, IPSecParams &params)
     char alg_buf[64];
     extract_string(header, "alg", alg_buf, sizeof(alg_buf));
     if (alg_buf[0])
-        strncpy(params.algos.aalg, alg_buf, sizeof(params.algos.aalg) - 1);
+        snprintf(params.algos.aalg, sizeof(params.algos.aalg), "%s", alg_buf);
 
     extract_string(header, "ealg", alg_buf, sizeof(alg_buf));
     if (alg_buf[0])
-        strncpy(params.algos.ealg, alg_buf, sizeof(params.algos.ealg) - 1);
+        snprintf(params.algos.ealg, sizeof(params.algos.ealg), "%s", alg_buf);
 
     if (params.spi_pc == 0 || params.spi_ps == 0) {
         WARNING("Security-Server missing SPI values (spi-c=%u, spi-s=%u)",
