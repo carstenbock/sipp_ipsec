@@ -1,0 +1,77 @@
+# SIPp with VoLTE IPSec support
+#
+# Usage (from within the git repo):
+#   git submodule update --init
+#   docker build -t sipp-ipsec -f docker/Dockerfile.ipsec .
+#
+# Running (requires NET_ADMIN for XFRM Security Associations):
+#   docker run --rm --cap-add=NET_ADMIN --net=host sipp-ipsec \
+#       -sf /scenarios/volte_register.xml -ipsec \
+#       -au 001010000000001 \
+#       -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+#       -key aka_OP 0xCDC202D5123E20F62B6D676AC72CB318 \
+#       -key aka_AMF 0x8000 \
+#       192.168.1.1:5060
+#
+# Notes:
+#   - --net=host is recommended so SIPp can bind to real interfaces
+#     and the kernel IPSec SAs apply to actual network traffic.
+#   - --cap-add=NET_ADMIN is required to create/delete XFRM SAs and SPs.
+#   - Pass --build-arg FULL=1 to also enable SCTP and TLS support.
+#   - Pass --build-arg DEBUG=1 to build with debug symbols.
+
+FROM debian:12-slim AS build
+
+ARG FULL=''
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+  binutils \
+  cmake \
+  g++ \
+  gcc \
+  git \
+  libgsl-dev \
+  libmnl-dev \
+  libpcap-dev \
+  libncurses-dev \
+  linux-libc-dev \
+  make \
+  ninja-build \
+  ${FULL:+libsctp-dev libssl-dev}
+
+WORKDIR /sipp
+COPY CMakeLists.txt ./
+COPY src src
+COPY include include
+COPY gtest gtest
+
+ARG DEBUG=''
+RUN --mount=type=bind,target=.git,source=.git \
+  git config --global --add safe.directory /sipp && \
+  cmake . -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DUSE_PCAP=1 \
+    -DUSE_GSL=1 \
+    -DUSE_IPSEC=1 \
+    ${DEBUG:+-DDEBUG=1} \
+    ${FULL:+-DUSE_SCTP=1} \
+  && ninja
+
+FROM debian:12-slim
+ARG FULL=''
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  libgsl27 \
+  libmnl0 \
+  libpcap0.8 \
+  libncursesw6 \
+  iproute2 \
+  ${FULL:+libsctp1 libssl3} \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /sipp/sipp /usr/local/bin/sipp
+COPY sipp_scenarios /scenarios
+
+CMD ["sipp"]

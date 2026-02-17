@@ -158,6 +158,34 @@ Special arguments can be passed with `--build-arg`:
 * `WOLFSSL=1` - build with wolfSSL (only works without FULL).
 * `DEBUG=1` - build with debug symbols.
 
+## IPSec docker build (VoLTE)
+
+A dedicated Dockerfile is provided for building SIPp with VoLTE IPSec
+support. It is based on Debian 12, includes `libmnl` and `iproute2`,
+and bundles the VoLTE scenario files under `/scenarios`.
+
+To build:
+```
+git submodule update --init
+docker build -t sipp-ipsec -f docker/Dockerfile.ipsec .
+```
+
+To run (requires `--cap-add=NET_ADMIN` for XFRM and `--net=host` for
+real network interfaces):
+```
+docker run --rm --cap-add=NET_ADMIN --net=host sipp-ipsec \
+    -sf /scenarios/volte_register.xml -ipsec \
+    -au 001010000000001 \
+    -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+    -key aka_OP 0xCDC202D5123E20F62B6D676AC72CB318 \
+    -key aka_AMF 0x8000 \
+    192.168.1.1:5060
+```
+
+Special arguments can be passed with `--build-arg`:
+* `FULL=1` - also enable SCTP and TLS support.
+* `DEBUG=1` - build with debug symbols.
+
 # Support
 
 I try and be responsive to issues raised on Github, and there's [a
