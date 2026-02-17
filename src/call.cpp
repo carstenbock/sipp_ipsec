@@ -62,6 +62,9 @@
 #include "deadcall.hpp"
 #include "config.h"
 #include "version.h"
+#ifdef USE_IPSEC
+#include "security_headers.hpp"
+#endif
 
 template<typename Out>
 void split(const std::string &s, char delim, Out result) {
@@ -901,6 +904,13 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
 
     next_nonce_count = 1;
 
+#ifdef USE_IPSEC
+    memset(&ipsec_params, 0, sizeof(ipsec_params));
+    ipsec_manager = nullptr;
+    security_server_value = nullptr;
+    ipsec_socket = nullptr;
+#endif
+
     //
     // JLSRTP CLIENT context constants
     //
@@ -1191,6 +1201,17 @@ call::~call()
     if (dialog_authentication) {
         free(dialog_authentication);
     }
+
+#ifdef USE_IPSEC
+    ipsec_teardown_sas();
+    if (security_server_value) {
+        free(security_server_value);
+    }
+    if (ipsec_socket) {
+        ipsec_socket->close();
+        ipsec_socket = nullptr;
+    }
+#endif
 
     if (use_tdmmap) {
         tdm_map[tdm_map_number] = false;
@@ -3828,6 +3849,26 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             /* Drop the initial "v" from the SIPP_VERSION string for legacy reasons. */
             dest += snprintf(dest, left, "%s", (const char*)SIPP_VERSION + 1);
             break;
+#ifdef USE_IPSEC
+        case E_Message_Security_Client: {
+            char sec_client_buf[512];
+            if (ipsec_params.state >= IPSEC_STATE_PARAMS_ALLOCATED) {
+                int len = build_security_client_header(ipsec_params, sec_client_buf, sizeof(sec_client_buf));
+                if (len > 0)
+                    dest += snprintf(dest, left, "%s", sec_client_buf);
+            }
+            break;
+        }
+        case E_Message_Security_Verify: {
+            if (security_server_value) {
+                char sec_verify_buf[512];
+                int len = build_security_verify_header(security_server_value, sec_verify_buf, sizeof(sec_verify_buf));
+                if (len > 0)
+                    dest += snprintf(dest, left, "%s", sec_verify_buf);
+            }
+            break;
+        }
+#endif
         case E_Message_Variable: {
             int varId = comp->varId;
             CCallVariable *var = M_callVariableTable->getVar(varId);
@@ -4034,13 +4075,30 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         createSendingMessage(auth_comp->comp_param.auth_param.aka_AMF, SM_UNUSED, my_aka_AMF, sizeof(my_aka_AMF));
         createSendingMessage(auth_comp->comp_param.auth_param.aka_OP, SM_UNUSED, my_aka_OP, sizeof(my_aka_OP));
 
+#ifdef USE_IPSEC
+        unsigned char out_ck[16], out_ik[16];
+        unsigned char *ck_ptr = ipsec_enabled ? out_ck : nullptr;
+        unsigned char *ik_ptr = ipsec_enabled ? out_ik : nullptr;
+#else
+        unsigned char *ck_ptr = nullptr;
+        unsigned char *ik_ptr = nullptr;
+#endif
+
         if (createAuthHeader(
                 my_auth_user, my_auth_pass, src->getMethod(), uri,
                 auth_body, dialog_authentication, my_aka_OP, my_aka_AMF,
                 my_aka_K, next_nonce_count++, result + authlen,
-                MAX_HEADER_LEN - authlen) == 0) {
+                MAX_HEADER_LEN - authlen, ck_ptr, ik_ptr) == 0) {
             ERROR("%s", result + authlen);
         }
+
+#ifdef USE_IPSEC
+        if (ipsec_enabled && ck_ptr && ik_ptr) {
+            if (ipsec_manager) {
+                ipsec_manager->set_keys(ipsec_params, out_ck, out_ik);
+            }
+        }
+#endif
         authlen = strlen(result);
 
         /* Shift the end of the message to its rightful place. */
@@ -5848,6 +5906,14 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
             }
 
             M_callVariableTable->getVar(currentAction->getVarId())->setBool(result);
+#ifdef USE_IPSEC
+        } else if (currentAction->getActionType() == CAction::E_AT_IPSEC_SETUP) {
+            if (ipsec_setup_sas(msg) < 0) {
+                WARNING("IPSec SA setup failed");
+            }
+        } else if (currentAction->getActionType() == CAction::E_AT_IPSEC_TEARDOWN) {
+            ipsec_teardown_sas();
+#endif
         } else if (currentAction->getActionType() == CAction::E_AT_JUMP) {
             double operand = get_rhs(currentAction);
             if (msg_index == ((int)operand)) {
@@ -6876,3 +6942,154 @@ TEST(sdp, good_remote_media_addr_v6) {
 }
 #endif /* PCAP_PLAY */
 #endif
+
+#ifdef USE_IPSEC
+/*
+ * IPSec SA setup triggered by the <ipsec_setup/> action.
+ * This is called when the 401 response with Security-Server is received.
+ *
+ * The flow:
+ * 1. Extract Security-Server header from the 401 message
+ * 2. Parse P-CSCF's SPIs and ports
+ * 3. Set up 4 XFRM SAs and 4 policies
+ * 4. Create a new socket bound to the protected client port
+ */
+int call::ipsec_setup_sas(const char *msg)
+{
+    if (!ipsec_enabled) {
+        WARNING("ipsec_setup action used but IPSec is not enabled (-ipsec flag)");
+        return -1;
+    }
+
+    /* Create IPSec manager if not already done */
+    if (!ipsec_manager) {
+        ipsec_manager = new IPSecManager();
+        if (ipsec_manager->init() < 0) {
+            WARNING("Failed to initialize IPSec manager (need CAP_NET_ADMIN?)");
+            delete ipsec_manager;
+            ipsec_manager = nullptr;
+            return -1;
+        }
+    }
+
+    /* If params not yet allocated, do it now */
+    if (ipsec_params.state < IPSEC_STATE_PARAMS_ALLOCATED) {
+        if (ipsec_manager->allocate_local_params(ipsec_params) < 0) {
+            WARNING("Failed to allocate IPSec local parameters");
+            return -1;
+        }
+    }
+
+    /* Extract Security-Server header from the received 401 message */
+    char sec_server[1024];
+    memset(sec_server, 0, sizeof(sec_server));
+
+    const char *hdr = msg;
+    const char *needle = "Security-Server:";
+    const char *found = strcasestr(hdr, needle);
+    if (!found) {
+        needle = "Security-Server :";
+        found = strcasestr(hdr, needle);
+    }
+    if (found) {
+        found += strlen(needle);
+        while (*found == ' ' || *found == '\t') found++;
+        const char *end = found;
+        while (*end && *end != '\r' && *end != '\n') end++;
+        size_t len = (size_t)(end - found);
+        if (len >= sizeof(sec_server)) len = sizeof(sec_server) - 1;
+        memcpy(sec_server, found, len);
+        sec_server[len] = '\0';
+    } else {
+        WARNING("No Security-Server header found in 401 response");
+        return -1;
+    }
+
+    /* Store Security-Server value for Security-Verify echo */
+    if (security_server_value) free(security_server_value);
+    security_server_value = strdup(sec_server);
+
+    /* Parse the P-CSCF parameters */
+    if (parse_security_server_header(sec_server, ipsec_params) < 0) {
+        WARNING("Failed to parse Security-Server header");
+        return -1;
+    }
+
+    /* Set IP addresses and protocol */
+    strncpy(ipsec_params.local_ip, local_ip, sizeof(ipsec_params.local_ip) - 1);
+    strncpy(ipsec_params.remote_ip, remote_ip, sizeof(ipsec_params.remote_ip) - 1);
+    ipsec_params.proto = (transport == T_TCP) ? IPPROTO_TCP : IPPROTO_UDP;
+
+    /* Set up the 4 SAs and 4 policies */
+    if (ipsec_manager->setup_security_associations(ipsec_params) < 0) {
+        WARNING("Failed to set up IPSec Security Associations");
+        return -1;
+    }
+
+    /* Rebind to the protected client port for subsequent SIP traffic */
+    if (ipsec_rebind_socket() < 0) {
+        WARNING("Failed to rebind socket to IPSec protected port");
+        return -1;
+    }
+
+    LOG_MSG("IPSec setup complete: sending from port %d to P-CSCF port %d\n",
+            ipsec_params.port_uc, ipsec_params.port_ps);
+
+    return 0;
+}
+
+void call::ipsec_teardown_sas()
+{
+    if (ipsec_manager && ipsec_params.state >= IPSEC_STATE_SA_ESTABLISHED) {
+        ipsec_manager->teardown_security_associations(ipsec_params);
+    }
+    if (ipsec_manager) {
+        delete ipsec_manager;
+        ipsec_manager = nullptr;
+    }
+}
+
+int call::ipsec_rebind_socket()
+{
+    /* Create a new UDP/TCP socket bound to the protected client port */
+    ipsec_socket = SIPpSocket::new_sipp_ipsec_socket(
+        use_ipv6, transport, ipsec_params.port_uc);
+
+    if (!ipsec_socket) {
+        WARNING("Failed to create IPSec socket on port %d", ipsec_params.port_uc);
+        return -1;
+    }
+
+    /* Update the destination to P-CSCF's protected server port */
+    struct sockaddr_storage ipsec_dest;
+    memcpy(&ipsec_dest, &call_peer, sizeof(ipsec_dest));
+    sockaddr_update_port(&ipsec_dest, ipsec_params.port_ps);
+    memcpy(&ipsec_socket->ss_dest, &ipsec_dest, sizeof(ipsec_dest));
+
+    /* For TCP, connect to the P-CSCF's protected port */
+    if (transport == T_TCP) {
+        if (ipsec_socket->connect(&ipsec_dest) < 0) {
+            WARNING("Failed to connect IPSec TCP socket to P-CSCF port %d",
+                    ipsec_params.port_ps);
+            ipsec_socket->close();
+            ipsec_socket = nullptr;
+            return -1;
+        }
+    }
+
+    /*
+     * Replace the current call_socket with the IPSec-protected one.
+     * The old socket is released (reference count decremented).
+     */
+    if (call_socket) {
+        call_socket->close();
+    }
+    associate_socket(ipsec_socket);
+
+    /* Update the peer address to use the protected port */
+    sockaddr_update_port(&call_peer, ipsec_params.port_ps);
+
+    ipsec_params.state = IPSEC_STATE_ACTIVE;
+    return 0;
+}
+#endif /* USE_IPSEC */

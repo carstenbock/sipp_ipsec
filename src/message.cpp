@@ -117,6 +117,10 @@ struct KeywordMap SimpleKeywords[] = {
     {"timestamp", E_Message_Timestamp },
     {"date", E_Message_Date },
     {"sipp_version", E_Message_SippVersion },
+#ifdef USE_IPSEC
+    {"security_client", E_Message_Security_Client },
+    {"security_verify", E_Message_Security_Verify },
+#endif
 };
 
 #define KEYWORD_SIZE 256

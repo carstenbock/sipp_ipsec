@@ -238,6 +238,15 @@ struct sipp_option options_table[] = {
      "By default, the URI is composed of remote_ip:remote_port.", SIPP_OPTION_STRING, &auth_uri, 1},
     {"au", "Set authorization username for authentication challenges. Default is taken from -s argument", SIPP_OPTION_STRING, &auth_username, 1},
     {"ap", "Set the password for authentication challenges. Default is 'password'", SIPP_OPTION_STRING, &auth_password, 1},
+#ifdef USE_IPSEC
+    {"ipsec", "Enable IPSec mode for VoLTE IMS registration (3GPP TS 33.203).\n"
+     "When enabled, SIPp will set up IPSec Security Associations using\n"
+     "CK/IK derived from AKA authentication. Requires root or CAP_NET_ADMIN.", SIPP_OPTION_SETFLAG, &ipsec_enabled, 1},
+    {"ipsec_aalg", "Set the IPSec authentication algorithm. Default is 'hmac-sha-1-96'.\n"
+     "Supported: hmac-sha-1-96, hmac-md5-96", SIPP_OPTION_STRING, &ipsec_aalg, 1},
+    {"ipsec_ealg", "Set the IPSec encryption algorithm. Default is 'aes-cbc'.\n"
+     "Supported: aes-cbc, des-ede3-cbc, null", SIPP_OPTION_STRING, &ipsec_ealg, 1},
+#endif
     {"s", "Set the username part of the request URI. Default is 'service'.", SIPP_OPTION_STRING, &service, 1},
     {"default_behaviors", "Set the default behaviors that SIPp will use.  Possible values are:\n"
      "- all\tUse all default behaviors\n"

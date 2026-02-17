@@ -1,0 +1,5 @@
+if(EXISTS "/home/carsten/Schreibtisch/volte.io/software/software/sipp_ipsec/sources/sipp/build/sipp_unittest[1]_tests.cmake")
+  include("/home/carsten/Schreibtisch/volte.io/software/software/sipp_ipsec/sources/sipp/build/sipp_unittest[1]_tests.cmake")
+else()
+  add_test(sipp_unittest_NOT_BUILT sipp_unittest_NOT_BUILT)
+endif()

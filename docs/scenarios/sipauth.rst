@@ -40,6 +40,23 @@ authentication keyword:
       and key in use)
 
 
+AKA with IPSec (VoLTE)
++++++++++++++++++++++++
+
+When SIPp is built with ``-DUSE_IPSEC=ON`` and run with the ``-ipsec``
+flag, the AKA authentication process additionally exports the CK
+(Cipher Key) and IK (Integrity Key) derived during the Milenage
+computation. These keys are used to establish IPSec Security
+Associations between the UE (SIPp) and the P-CSCF.
+
+The CK is used as the encryption key (e.g. for ``aes-cbc``) and the
+IK is used as the integrity key (e.g. for ``hmac-sha-1-96``). Both
+are 128-bit values derived from the Milenage f3 and f4 functions.
+
+See the :doc:`../ipsec` section for the full VoLTE IPSec registration
+flow, command-line options, and example scenarios.
+
+
 
 In case you want to use authentication with a different
 username/password or aka_K for each call, you can do this:

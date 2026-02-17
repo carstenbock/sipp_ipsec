@@ -178,6 +178,38 @@ a UAC client sending IPv6 traffic to that port.
   The Pcap play feature may currently not work on IPv6.
 
 
+IPSec transport (VoLTE)
+```````````````````````
+
+.. note::
+   This feature requires building SIPp with ``-DUSE_IPSEC=ON`` and
+   running with the ``-ipsec`` command-line flag. See the
+   :doc:`ipsec` section for full details.
+
+When IPSec mode is enabled (``-ipsec``), SIPp manages the transport
+layer differently during VoLTE IMS registration:
+
+1. The initial REGISTER is sent on the standard unprotected
+   UDP/TCP socket.
+
+2. After receiving the 401 response and executing the
+   ``<ipsec_setup/>`` action, SIPp creates 4 ESP Security
+   Associations in the Linux kernel using the XFRM subsystem
+   (transport mode).
+
+3. SIPp then rebinds the call's socket to the negotiated protected
+   client port. All subsequent SIP messages for this call flow
+   through the IPSec-protected path transparently.
+
+4. The kernel handles ESP encapsulation and decapsulation
+   automatically -- SIPp continues to send and receive plain SIP
+   messages while the kernel applies integrity and encryption.
+
+IPSec transport works with both UDP and TCP as the underlying
+transport protocol. The protected port numbers are negotiated via the
+``Security-Client`` and ``Security-Server`` SIP headers.
+
+
 Multi-socket limit
 ``````````````````
 

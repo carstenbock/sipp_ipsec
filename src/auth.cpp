@@ -95,7 +95,8 @@ static int createAuthHeaderAKAv1MD5(
     const char* user, const char* OP, const char* AMF, const char* K,
     const char* method, const char* uri, const char* msgbody,
     const char* auth, const char* algo, unsigned int nonce_count,
-    char* result, size_t result_len);
+    char* result, size_t result_len,
+    unsigned char* out_ck, unsigned char* out_ik);
 
 static int createAuthHeaderSHA256(
     const char* user, const char* password, int password_len,
@@ -159,7 +160,8 @@ int createAuthHeader(
     const char* user, const char* password, const char* method,
     const char* uri, const char* msgbody, const char* auth,
     const char* aka_OP, const char* aka_AMF, const char* aka_K,
-    unsigned int nonce_count, char* result, size_t result_len)
+    unsigned int nonce_count, char* result, size_t result_len,
+    unsigned char* out_ck, unsigned char* out_ik)
 {
 
     char algo[32] = "MD5";
@@ -197,7 +199,7 @@ int createAuthHeader(
         }
         return createAuthHeaderAKAv1MD5(
             user, aka_OP, aka_AMF, aka_K, method, uri, msgbody, auth,
-            algo, nonce_count, result, result_len);
+            algo, nonce_count, result, result_len, out_ck, out_ik);
     } else if (strncasecmp(algo, "SHA-256", 7)==0) {
         return createAuthHeaderSHA256(
             user, password, strlen(password), method, uri, msgbody,
@@ -596,7 +598,8 @@ static int createAuthHeaderAKAv1MD5(
     const char* user, const char* aka_OP, const char* aka_AMF,
     const char* aka_K, const char* method, const char* uri,
     const char* msgbody, const char* auth, const char* algo,
-    unsigned int nonce_count, char* result, size_t result_len)
+    unsigned int nonce_count, char* result, size_t result_len,
+    unsigned char* out_ck, unsigned char* out_ik)
 {
 
     char tmp[MAX_HEADER_LEN];
@@ -654,6 +657,12 @@ static int createAuthHeaderAKAv1MD5(
     /* Compute the AK, response and keys CK IK */
     f2345(k, rnd, res, ck, ik, ak, op);
     res[RESLEN] = '\0';
+
+    /* Export CK and IK for IPSec SA establishment */
+    if (out_ck)
+        memcpy(out_ck, ck, CKLEN);
+    if (out_ik)
+        memcpy(out_ik, ik, IKLEN);
 
     /* Compute sqn encoded in AUTN */
     for (i=0; i < SQNLEN; i++)

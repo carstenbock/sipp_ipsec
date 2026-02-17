@@ -114,6 +114,10 @@ function(apply_common_sipp_dependencies TARGET_NAME)
     target_link_libraries(${TARGET_NAME} ${SCTP_LIBRARY})
   endif()
 
+  if(USE_IPSEC AND MNL_LIBRARY)
+    target_link_libraries(${TARGET_NAME} ${MNL_LIBRARY})
+  endif()
+
   if(BUILD_STATIC AND MSYS)
     target_link_libraries(${TARGET_NAME} crypt32)
   endif()
@@ -146,6 +150,7 @@ endif()
 option(BUILD_STATIC "Build a statically-linked binary" OFF)
 option(USE_LOCAL_IP_HINTS "Build with local ip hints priority" OFF)
 option(USE_ASAN "Build with AddressSanitizer support" OFF)
+option(USE_IPSEC "Build with IPSec support for VoLTE (requires libmnl)" OFF)
 
 if(USE_ASAN)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -190,6 +195,13 @@ if(NOT USE_PCAP)
     "${PROJECT_SOURCE_DIR}/src/send_packets.c")
 endif(NOT USE_PCAP)
 
+if(NOT USE_IPSEC)
+  list(REMOVE_ITEM all_SRCS
+    "${PROJECT_SOURCE_DIR}/src/ipsec_manager.cpp"
+    "${PROJECT_SOURCE_DIR}/src/xfrm_netlink.cpp"
+    "${PROJECT_SOURCE_DIR}/src/security_headers.cpp")
+endif(NOT USE_IPSEC)
+
 if(USE_PCAP)
   add_definitions("-DPCAPPLAY")
 endif(USE_PCAP)
@@ -205,6 +217,15 @@ endif(USE_GSL)
 if(USE_SCTP)
   add_definitions("-DUSE_SCTP")
 endif(USE_SCTP)
+
+if(USE_IPSEC)
+  add_definitions("-DUSE_IPSEC")
+  find_library(MNL_LIBRARY mnl)
+  if(NOT MNL_LIBRARY)
+    message(FATAL_ERROR "libmnl not found; please install libmnl-dev for IPSec support")
+  endif()
+  message(STATUS "IPSec support enabled (using libmnl)")
+endif(USE_IPSEC)
 
 # Find all libraries before creating targets
 if(PKG_CONFIG_FOUND)

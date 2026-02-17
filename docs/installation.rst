@@ -67,8 +67,9 @@ Installing SIPp
     + For pcap play support: libpcap and libnet
     + For SCTP support: lksctp-tools
     + For distributed pauses: `Gnu Scientific Libraries`_
+    + For VoLTE IPSec support: libmnl (minimalistic Netlink library)
 
-+ You have four options to compile SIPp:
++ You have several options to compile SIPp:
 
     + With PCAP play support::
 
@@ -91,11 +92,30 @@ Installing SIPp
         cmake . -DUSE_GSL=1
         make
 
+    + With VoLTE IPSec support (Linux only)::
+
+        tar -xvzf sipp-xxx.tar.gz
+        cd sipp
+        cmake . -DUSE_IPSEC=1
+        make
+
+      This requires the libmnl development library. On Debian/Ubuntu::
+
+        sudo apt-get install libmnl-dev
+
+      On RHEL/CentOS/Fedora::
+
+        sudo dnf install libmnl-devel
+
+      At runtime, SIPp needs root privileges or the ``CAP_NET_ADMIN``
+      capability to create kernel IPSec Security Associations. See
+      the `VoLTE IPSec Support` section for details.
+
     + You can also combine these various options, e.g.::
 
         tar -xvzf sipp-xxx.tar.gz
         cd sipp
-        cmake . -DUSE_GSL=1 -DUSE_PCAP=1 -DUSE_SCTP=1
+        cmake . -DUSE_GSL=1 -DUSE_PCAP=1 -DUSE_SCTP=1 -DUSE_IPSEC=1
         make
 
 

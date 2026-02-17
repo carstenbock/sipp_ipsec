@@ -99,6 +99,11 @@ public:
 
     static void pollset_process(int wait);
 
+#ifdef USE_IPSEC
+    /* Create a new socket bound to a specific local port for IPSec protected traffic */
+    static SIPpSocket* new_sipp_ipsec_socket(bool use_ipv6, int transport, uint16_t local_port);
+#endif
+
     int ss_count = 1;           /* How many users are there of this socket? */
     bool ss_ipv6 = false;
     int ss_transport = 0;       /* T_TCP, T_UDP, or T_TLS. */

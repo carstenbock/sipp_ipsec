@@ -1387,6 +1387,33 @@ SIPpSocket* SIPpSocket::new_sipp_call_socket(bool use_ipv6, int transport, bool 
     return sock;
 }
 
+#ifdef USE_IPSEC
+SIPpSocket* SIPpSocket::new_sipp_ipsec_socket(bool use_ipv6, int transport, uint16_t local_port) {
+    SIPpSocket *sock = new_sipp_socket(use_ipv6, transport);
+    if (!sock) {
+        WARNING("Could not create IPSec socket");
+        return nullptr;
+    }
+    sock->ss_call_socket = true;
+
+    /* Bind to the specific local port for IPSec protected traffic */
+    struct sockaddr_storage bind_addr;
+    memcpy(&bind_addr, &local_sockaddr, sizeof(bind_addr));
+    sockaddr_update_port(&bind_addr, local_port);
+
+    int port_val = local_port;
+    if (sipp_bind_socket(sock, &bind_addr, &port_val) != 0) {
+        WARNING("Could not bind IPSec socket to port %d: %s", local_port, strerror(errno));
+        sock->close();
+        return nullptr;
+    }
+
+    sock->ss_port = local_port;
+    sock->ss_bind_port = local_port;
+    return sock;
+}
+#endif
+
 SIPpSocket* SIPpSocket::accept() {
     SIPpSocket *ret;
     struct sockaddr_storage remote_sockaddr;

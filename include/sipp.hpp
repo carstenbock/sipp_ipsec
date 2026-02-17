@@ -289,6 +289,11 @@ MAYBE_EXTERN int                currentScreenToDisplay  DEFVAL
 MAYBE_EXTERN int                currentRepartitionToDisplay  DEFVAL(1);
 MAYBE_EXTERN unsigned int       base_cseq               DEFVAL(0);
 MAYBE_EXTERN char             * auth_uri                DEFVAL(0);
+#ifdef USE_IPSEC
+MAYBE_EXTERN bool               ipsec_enabled           DEFVAL(false);
+MAYBE_EXTERN const char       * ipsec_aalg              DEFVAL("hmac-sha-1-96");
+MAYBE_EXTERN const char       * ipsec_ealg              DEFVAL("aes-cbc");
+#endif
 MAYBE_EXTERN const char       * call_id_string          DEFVAL("%u-%p@%s");
 typedef std::unordered_map<std::string, std::string> ParamMap;
 MAYBE_EXTERN ParamMap           generic;

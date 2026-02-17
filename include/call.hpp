@@ -34,6 +34,9 @@
 #endif
 #include "rtpstream.hpp"
 #include "srtp_channel.hpp"
+#ifdef USE_IPSEC
+#include "ipsec_manager.hpp"
+#endif
 
 #include <stdarg.h>
 
@@ -204,6 +207,18 @@ protected:
     int            dialog_challenge_type;
 
     unsigned int   next_nonce_count;
+
+#ifdef USE_IPSEC
+    /* IPSec state for VoLTE IMS registration */
+    IPSecParams    ipsec_params;
+    IPSecManager  *ipsec_manager;
+    char         * security_server_value;
+    SIPpSocket    *ipsec_socket;
+
+    int  ipsec_setup_sas(const char *msg);
+    void ipsec_teardown_sas();
+    int  ipsec_rebind_socket();
+#endif
 
     unsigned int   next_retrans;
     int            nb_retrans;

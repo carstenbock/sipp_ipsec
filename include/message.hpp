@@ -121,6 +121,10 @@ typedef enum {
     E_Message_UEAesCm128Sha1802Video,
     E_Message_UEAesCm128Sha1321Video,
     E_Message_UEAesCm128Sha1322Video,
+#ifdef USE_IPSEC
+    E_Message_Security_Client,
+    E_Message_Security_Verify,
+#endif
 } MessageCompType;
 
 class SendingMessage

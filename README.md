@@ -42,12 +42,72 @@ make
 _The SIPp master branch (3.7.x) requires a modern C++17 compiler._
 
 There are several optional flags to enable features (SIP-over-SCTP, media
-playback from PCAP files and the GNU Scientific Libraries for random
-distributions):
+playback from PCAP files, the GNU Scientific Libraries for random
+distributions, and VoLTE IPSec):
 
 ```
-cmake . -DUSE_SCTP=1 -DUSE_PCAP=1 -DUSE_GSL=1
+cmake . -DUSE_SCTP=1 -DUSE_PCAP=1 -DUSE_GSL=1 -DUSE_IPSEC=1
 ```
+
+## VoLTE IPSec support
+
+To build with IPSec support for VoLTE IMS registration (3GPP TS 33.203),
+pass `-DUSE_IPSEC=1` to cmake:
+
+```
+cmake . -DUSE_IPSEC=1
+make
+```
+
+This requires the `libmnl` (minimalistic Netlink) development library:
+
+```
+# Debian/Ubuntu
+sudo apt-get install libmnl-dev
+
+# RHEL/Fedora
+sudo dnf install libmnl-devel
+```
+
+When IPSec is enabled, SIPp can emulate a VoLTE UE by:
+
+- Performing 3GPP AKA authentication and deriving CK/IK keys
+- Creating IPSec Security Associations (ESP transport mode) via the
+  Linux XFRM subsystem
+- Negotiating security parameters using `Security-Client` /
+  `Security-Server` / `Security-Verify` SIP headers (RFC 3329)
+- Rebinding to protected ports for IPSec-encrypted SIP signaling
+
+New command-line options:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-ipsec` | Enable IPSec mode | disabled |
+| `-ipsec_aalg` | Authentication algorithm (`hmac-sha-1-96`, `hmac-md5-96`) | `hmac-sha-1-96` |
+| `-ipsec_ealg` | Encryption algorithm (`aes-cbc`, `des-ede3-cbc`, `null`) | `aes-cbc` |
+
+New scenario keywords: `[security_client]`, `[security_verify]`
+
+New scenario actions: `<ipsec_setup />`, `<ipsec_teardown />`
+
+An example VoLTE registration scenario is provided in
+`sipp_scenarios/volte_register.xml`.
+
+**Note:** At runtime, SIPp needs root privileges or the `CAP_NET_ADMIN`
+capability to create kernel IPSec Security Associations:
+
+```
+sudo ./sipp -sf sipp_scenarios/volte_register.xml -ipsec \
+    -au 001010000000001 \
+    -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+    -key aka_OP 0xCDC202D5123E20F62B6D676AC72CB318 \
+    -key aka_AMF 0x8000 \
+    192.168.1.1:5060
+```
+
+See `docs/ipsec.rst` for the full documentation.
+
+## TLS key logging
 
 To enable TLS key logging pass `-DTLS_KEY_LOGGING=1` to cmake.
 

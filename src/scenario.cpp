@@ -1600,6 +1600,12 @@ void scenario::parseAction(CActions *actions)
             tmpAction->setActionType(CAction::E_AT_SET_DEST);
         } else if(!strcmp(actionElem, "closecon")) {
             tmpAction->setActionType(CAction::E_AT_CLOSE_CON);
+#ifdef USE_IPSEC
+        } else if(!strcmp(actionElem, "ipsec_setup")) {
+            tmpAction->setActionType(CAction::E_AT_IPSEC_SETUP);
+        } else if(!strcmp(actionElem, "ipsec_teardown")) {
+            tmpAction->setActionType(CAction::E_AT_IPSEC_TEARDOWN);
+#endif
         } else if(!strcmp(actionElem, "strcmp")) {
             if (xp_get_value("check_it")) {
                 tmpAction->setCheckIt(xp_get_bool("check_it", "strcmp"));

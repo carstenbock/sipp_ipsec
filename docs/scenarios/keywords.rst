@@ -208,3 +208,22 @@ Keyword list
 :Description: If the -users command line option is specified, then this keyword
   contains the integer identifier of the current user (starting at zero
   and ending at [users-1]).
+
+``[security_client]``
+=====================
+:Description: Available when built with IPSec support (``-DUSE_IPSEC=ON``) and
+  running with ``-ipsec``. Expands to the ``ipsec-3gpp`` Security-Client header
+  value containing the UE's locally allocated SPIs, protected ports, and
+  negotiated algorithms (authentication and encryption). Example expansion:
+  ``ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc; spi-c=12345; spi-s=12346; port-c=5060; port-s=5061``.
+  Use in the ``Security-Client:`` header of REGISTER messages.
+  See :doc:`../ipsec` for details.
+
+``[security_verify]``
+=====================
+:Description: Available when built with IPSec support (``-DUSE_IPSEC=ON``) and
+  running with ``-ipsec``. Expands to the cached value of the ``Security-Server``
+  header received from the P-CSCF in the 401 response. Per RFC 3329, the
+  ``Security-Verify`` header in the re-REGISTER must be an exact echo of the
+  ``Security-Server`` value. Use in the ``Security-Verify:`` header of the
+  IPSec-protected re-REGISTER message. See :doc:`../ipsec` for details.

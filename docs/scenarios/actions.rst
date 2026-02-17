@@ -17,6 +17,7 @@ an action. Several actions are available:
 + Lookup a key in an indexed injection file
 + Verify Authorization credentials
 + Change a Call's Network Destination
++ `IPSec setup and teardown`_ (VoLTE)
 
 
 
@@ -582,5 +583,56 @@ on the result::
 
     <nop hide="true" test="authvalid" next="goodauth" />
     <nop hide="true" next="badauth" />
+
+IPSec setup and teardown
+++++++++++++++++++++++++
+
+.. note::
+   These actions are only available when SIPp is compiled with
+   ``-DUSE_IPSEC=ON`` and run with the ``-ipsec`` command-line flag.
+
+Two actions are provided to manage IPSec Security Associations during
+a VoLTE IMS registration flow:
+
+``<ipsec_setup />``
+    Triggers IPSec Security Association and Security Policy creation
+    via the Linux XFRM subsystem. Place this inside the ``<action>``
+    block of the ``<recv response="401">`` step to process the
+    ``Security-Server`` header and establish the protected path.
+
+    The action automatically:
+
+    + Extracts the ``Security-Server`` header from the received 401
+    + Parses the P-CSCF's SPIs (``spi-c``, ``spi-s``), ports
+      (``port-c``, ``port-s``), and algorithms
+    + Creates 4 ESP Security Associations (transport mode)
+    + Creates corresponding Security Policies
+    + Rebinds the call's socket to the protected client port
+
+    Example::
+
+        <recv response="401" auth="true">
+          <action>
+            <ipsec_setup />
+          </action>
+        </recv>
+
+``<ipsec_teardown />``
+    Removes the IPSec Security Associations and Policies from the
+    kernel. Place this when de-registering or cleaning up.
+
+    If not called explicitly, IPSec state is automatically cleaned up
+    when the call is destroyed.
+
+    Example::
+
+        <recv response="200">
+          <action>
+            <ipsec_teardown />
+          </action>
+        </recv>
+
+See the :doc:`../ipsec` section for the complete VoLTE registration
+flow and a full example scenario.
 
 .. _PCAP library: https://www.tcpdump.org/manpages/pcap.3pcap.html

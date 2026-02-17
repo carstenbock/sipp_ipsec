@@ -14,6 +14,8 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#include <stdint.h>
+
 int createAuthHeader(const char *user,
                      const char *password,
                      const char *method,
@@ -25,7 +27,9 @@ int createAuthHeader(const char *user,
                      const char *aka_K,
                      unsigned int nonce_count,
                      char *result,
-                     size_t result_len);
+                     size_t result_len,
+                     unsigned char *out_ck = nullptr,
+                     unsigned char *out_ik = nullptr);
 int verifyAuthHeader(const char *user, const char *password,
                      const char *method, const char *auth,
                      const char *msgbody);
