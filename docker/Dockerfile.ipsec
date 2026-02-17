@@ -76,4 +76,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /sipp/sipp /usr/local/bin/sipp
 COPY sipp_scenarios /scenarios
 
-CMD ["sipp"]
+ENTRYPOINT ["sipp"]
