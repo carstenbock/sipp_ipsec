@@ -105,6 +105,17 @@ sudo ./sipp -sf sipp_scenarios/volte_register.xml -ipsec \
     192.168.1.1:5060
 ```
 
+If your OPc is pre-computed, use `-key aka_OPc` instead of `-key aka_OP`:
+
+```
+sudo ./sipp -sf sipp_scenarios/volte_register.xml -ipsec \
+    -au 001010000000001 \
+    -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+    -key aka_OPc 0xE8ED289DEBA952E4283B54E88E6183CA \
+    -key aka_AMF 0x8000 \
+    192.168.1.1:5060
+```
+
 See `docs/ipsec.rst` for the full documentation.
 
 ## TLS key logging
@@ -175,9 +186,25 @@ real network interfaces):
 ```
 docker run --rm --cap-add=NET_ADMIN --net=host sipp-ipsec \
     -sf /scenarios/volte_register.xml -ipsec \
+    -s 001010000000001 \
+    -key domain ims.mnc001.mcc001.3gppnetwork.org \
     -au 001010000000001 \
     -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
     -key aka_OP 0xCDC202D5123E20F62B6D676AC72CB318 \
+    -key aka_AMF 0x8000 \
+    192.168.1.1:5060
+```
+
+If your OPc is pre-computed, use `-key aka_OPc` instead of `-key aka_OP`:
+
+```
+docker run --rm --cap-add=NET_ADMIN --net=host sipp-ipsec \
+    -sf /scenarios/volte_register.xml -ipsec \
+    -s 001010000000001 \
+    -key domain ims.mnc001.mcc001.3gppnetwork.org \
+    -au 001010000000001 \
+    -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+    -key aka_OPc 0xE8ED289DEBA952E4283B54E88E6183CA \
     -key aka_AMF 0x8000 \
     192.168.1.1:5060
 ```

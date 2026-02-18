@@ -4066,6 +4066,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         char my_auth_user[MAX_HEADER_LEN + 2];
         char my_auth_pass[MAX_HEADER_LEN + 2];
         char my_aka_OP[MAX_HEADER_LEN + 2];
+        char my_aka_OPc[MAX_HEADER_LEN + 2];
         char my_aka_AMF[MAX_HEADER_LEN + 2];
         char my_aka_K[MAX_HEADER_LEN + 2];
 
@@ -4074,6 +4075,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         createSendingMessage(auth_comp->comp_param.auth_param.aka_K, SM_UNUSED, my_aka_K, sizeof(my_aka_K));
         createSendingMessage(auth_comp->comp_param.auth_param.aka_AMF, SM_UNUSED, my_aka_AMF, sizeof(my_aka_AMF));
         createSendingMessage(auth_comp->comp_param.auth_param.aka_OP, SM_UNUSED, my_aka_OP, sizeof(my_aka_OP));
+        createSendingMessage(auth_comp->comp_param.auth_param.aka_OPc, SM_UNUSED, my_aka_OPc, sizeof(my_aka_OPc));
 
 #ifdef USE_IPSEC
         unsigned char out_ck[16], out_ik[16];
@@ -4088,7 +4090,8 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
                 my_auth_user, my_auth_pass, src->getMethod(), uri,
                 auth_body, dialog_authentication, my_aka_OP, my_aka_AMF,
                 my_aka_K, next_nonce_count++, result + authlen,
-                MAX_HEADER_LEN - authlen, ck_ptr, ik_ptr) == 0) {
+                MAX_HEADER_LEN - authlen, ck_ptr, ik_ptr,
+                my_aka_OPc) == 0) {
             ERROR("%s", result + authlen);
         }
 

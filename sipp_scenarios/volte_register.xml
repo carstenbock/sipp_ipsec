@@ -16,13 +16,16 @@
   Usage:
     sudo ./sipp -sf volte_register.xml \
       -ipsec \
+      -s <imsi> \
+      -key domain <realm> \
       -au <imsi> -ap <password> \
       -key aka_K <hex_K> -key aka_OP <hex_OP> -key aka_AMF <hex_AMF> \
       <pcscf_ip>:<pcscf_port>
 
   The -ipsec flag enables IPSec SA management.
-  AKA keys (K, OP, AMF) can be provided via -key or inline in the
+  AKA keys (K, OP/OPc, AMF) can be provided via -key or inline in the
   [authentication] keyword.
+  If your OPc is pre-computed, use `-key aka_OPc` instead of `-key aka_OP`:
   Requires root or CAP_NET_ADMIN for XFRM SA/SP creation.
 -->
 
@@ -32,11 +35,11 @@
   <send retrans="500">
     <![CDATA[
 
-      REGISTER sip:[remote_ip] SIP/2.0
+      REGISTER sip:[domain] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
-      From: <sip:[service]@ims.mnc001.mcc001.3gppnetwork.org>;tag=[call_number]
-      To: <sip:[service]@ims.mnc001.mcc001.3gppnetwork.org>
+      From: <sip:[service]@[domain]>;tag=[call_number]
+      To: <sip:[service]@[domain]>
       Call-ID: [call_id]
       CSeq: 1 REGISTER
       Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
@@ -44,7 +47,7 @@
       Require: sec-agree
       Proxy-Require: sec-agree
       Security-Client: [security_client]
-      Authorization: Digest username="[service]@ims.mnc001.mcc001.3gppnetwork.org",realm="ims.mnc001.mcc001.3gppnetwork.org",uri="sip:ims.mnc001.mcc001.3gppnetwork.org",nonce="",response=""
+      Authorization: Digest username="[service]@[domain]",realm="[domain]",uri="sip:[domain]",nonce="",response=""
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
       User-Agent: SIPp-VoLTE/1.0
@@ -69,15 +72,15 @@
   <send retrans="500">
     <![CDATA[
 
-      REGISTER sip:[remote_ip] SIP/2.0
+      REGISTER sip:[domain] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
-      From: <sip:[service]@ims.mnc001.mcc001.3gppnetwork.org>;tag=[call_number]
-      To: <sip:[service]@ims.mnc001.mcc001.3gppnetwork.org>
+      From: <sip:[service]@[domain]>;tag=[call_number]
+      To: <sip:[service]@[domain]>
       Call-ID: [call_id]
       CSeq: 2 REGISTER
       Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
-      [authentication username=[service]@ims.mnc001.mcc001.3gppnetwork.org]
+      [authentication username=[service]@[domain]]
       Supported: path, gruu, sec-agree
       Require: sec-agree
       Proxy-Require: sec-agree
@@ -103,15 +106,15 @@
   <send retrans="500">
     <![CDATA[
 
-      REGISTER sip:[remote_ip] SIP/2.0
+      REGISTER sip:[domain] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
-      From: <sip:[service]@ims.mnc001.mcc001.3gppnetwork.org>;tag=[call_number]
-      To: <sip:[service]@ims.mnc001.mcc001.3gppnetwork.org>
+      From: <sip:[service]@[domain]>;tag=[call_number]
+      To: <sip:[service]@[domain]>
       Call-ID: [call_id]
       CSeq: 3 REGISTER
       Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=0
-      [authentication username=[service]@ims.mnc001.mcc001.3gppnetwork.org]
+      [authentication username=[service]@[domain]]
       Supported: path, gruu, sec-agree
       Require: sec-agree
       Proxy-Require: sec-agree

@@ -96,7 +96,8 @@ static int createAuthHeaderAKAv1MD5(
     const char* method, const char* uri, const char* msgbody,
     const char* auth, const char* algo, unsigned int nonce_count,
     char* result, size_t result_len,
-    unsigned char* out_ck, unsigned char* out_ik);
+    unsigned char* out_ck, unsigned char* out_ik,
+    const char* OPc);
 
 static int createAuthHeaderSHA256(
     const char* user, const char* password, int password_len,
@@ -161,7 +162,8 @@ int createAuthHeader(
     const char* uri, const char* msgbody, const char* auth,
     const char* aka_OP, const char* aka_AMF, const char* aka_K,
     unsigned int nonce_count, char* result, size_t result_len,
-    unsigned char* out_ck, unsigned char* out_ik)
+    unsigned char* out_ck, unsigned char* out_ik,
+    const char* aka_OPc)
 {
 
     char algo[32] = "MD5";
@@ -199,7 +201,8 @@ int createAuthHeader(
         }
         return createAuthHeaderAKAv1MD5(
             user, aka_OP, aka_AMF, aka_K, method, uri, msgbody, auth,
-            algo, nonce_count, result, result_len, out_ck, out_ik);
+            algo, nonce_count, result, result_len, out_ck, out_ik,
+            aka_OPc);
     } else if (strncasecmp(algo, "SHA-256", 7)==0) {
         return createAuthHeaderSHA256(
             user, password, strlen(password), method, uri, msgbody,
@@ -599,7 +602,8 @@ static int createAuthHeaderAKAv1MD5(
     const char* aka_K, const char* method, const char* uri,
     const char* msgbody, const char* auth, const char* algo,
     unsigned int nonce_count, char* result, size_t result_len,
-    unsigned char* out_ck, unsigned char* out_ik)
+    unsigned char* out_ck, unsigned char* out_ik,
+    const char* aka_OPc)
 {
 
     char tmp[MAX_HEADER_LEN];
@@ -652,10 +656,15 @@ static int createAuthHeaderAKAv1MD5(
     memcpy(mac, nonce + RANDLEN + SQNLEN + AMFLEN, MACLEN);
     memcpy(k, aka_K, KLEN);
     memcpy(amf, aka_AMF, AMFLEN);
-    memcpy(op, aka_OP, OPLEN);
+
+    int is_opc = (aka_OPc && aka_OPc[0]) ? 1 : 0;
+    if (is_opc)
+        memcpy(op, aka_OPc, OPLEN);
+    else
+        memcpy(op, aka_OP, OPLEN);
 
     /* Compute the AK, response and keys CK IK */
-    f2345(k, rnd, res, ck, ik, ak, op);
+    f2345(k, rnd, res, ck, ik, ak, op, is_opc);
     res[RESLEN] = '\0';
 
     /* Export CK and IK for IPSec SA establishment */
@@ -669,7 +678,7 @@ static int createAuthHeaderAKAv1MD5(
         sqn[i] = sqnxoraka[i] ^ ak[i];
 
     /* compute XMAC */
-    f1(k, rnd, sqn, (unsigned char *) aka_AMF, xmac, op);
+    f1(k, rnd, sqn, (unsigned char *) aka_AMF, xmac, op, is_opc);
     if (memcmp(mac, xmac, MACLEN) != 0) {
         free(nonce);
         snprintf(
@@ -698,10 +707,10 @@ static int createAuthHeaderAKAv1MD5(
         }
     } else {
         sqn_ms[5] = sqn_he[5] + 1;
-        f5star(k, rnd, ak, op);
+        f5star(k, rnd, ak, op, is_opc);
         for(i=0; i<SQNLEN; i++)
             auts_bin[i]=sqn_ms[i]^ak[i];
-        f1star(k, rnd, sqn_ms, amf, (unsigned char * ) (auts_bin+SQNLEN), op);
+        f1star(k, rnd, sqn_ms, amf, (unsigned char * ) (auts_bin+SQNLEN), op, is_opc);
         has_auts = 1;
         /* When re-synchronisation occurs an empty password has to be used */
         /* to compute MD5 response (Cf. rfc 3310 section 3.2) */

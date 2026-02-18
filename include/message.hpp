@@ -182,6 +182,7 @@ struct MessageComponent {
             SendingMessage *auth_user;
             SendingMessage *auth_pass;
             SendingMessage *aka_OP;
+            SendingMessage *aka_OPc;
             SendingMessage *aka_AMF;
             SendingMessage *aka_K;
         } auth_param;

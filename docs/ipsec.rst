@@ -226,11 +226,23 @@ Running the example::
         -key aka_AMF 0x8000 \
         192.168.1.1:5060
 
+If OPc is pre-computed or provisioned directly, use ``aka_OPc``
+instead of ``aka_OP``::
+
+    sudo ./sipp -sf sipp_scenarios/volte_register.xml \
+        -ipsec \
+        -au 001010000000001 \
+        -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+        -key aka_OPc 0xE8ED289DEBA952E4283B54E88E6183CA \
+        -key aka_AMF 0x8000 \
+        192.168.1.1:5060
+
 
 .. note::
-   The AKA keys (K, OP, AMF) must match the values stored in the HSS
-   for the subscriber being tested. These are typically provisioned
-   when setting up the test environment.
+   The AKA keys (K, OP or OPc, AMF) must match the values stored in
+   the HSS for the subscriber being tested. These are typically
+   provisioned when setting up the test environment. Provide exactly
+   one of ``aka_OP`` or ``aka_OPc``.
 
 
 Future: VoWiFi support

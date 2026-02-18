@@ -26,13 +26,14 @@ extern "C"
 #endif
 
 void f1(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
-        uint8_t mac_a[8], uint8_t op[16]);
+        uint8_t mac_a[8], uint8_t op[16], int is_opc);
 void f2345(uint8_t k[16], uint8_t rand[16],
-           uint8_t res[8], uint8_t ck[16], uint8_t ik[16], uint8_t ak[6], uint8_t op[16]);
+           uint8_t res[8], uint8_t ck[16], uint8_t ik[16], uint8_t ak[6],
+           uint8_t op[16], int is_opc);
 void f1star(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
-            uint8_t mac_s[8], uint8_t op[16]);
+            uint8_t mac_s[8], uint8_t op[16], int is_opc);
 void f5star(uint8_t k[16], uint8_t rand[16],
-            uint8_t ak[6], uint8_t op[16]);
+            uint8_t ak[6], uint8_t op[16], int is_opc);
 
 #ifdef __cplusplus
 }  /* end extern "C" */

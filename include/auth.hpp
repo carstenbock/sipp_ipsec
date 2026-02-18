@@ -29,7 +29,8 @@ int createAuthHeader(const char *user,
                      char *result,
                      size_t result_len,
                      unsigned char *out_ck = nullptr,
-                     unsigned char *out_ik = nullptr);
+                     unsigned char *out_ik = nullptr,
+                     const char *aka_OPc = nullptr);
 int verifyAuthHeader(const char *user, const char *password,
                      const char *method, const char *auth,
                      const char *msgbody);

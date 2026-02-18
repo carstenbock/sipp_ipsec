@@ -18,6 +18,7 @@
 #include "milenage.h"
 
 #include <stdint.h>
+#include <string.h>
 
 #if defined(USE_OPENSSL)
 #include <openssl/evp.h>
@@ -62,7 +63,7 @@ static void ComputeOPc(const uint8_t k[16], uint8_t op_c[16], uint8_t op[16])
  *-----------------------------------------------------------------*/
 
 void f1(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
-        uint8_t mac_a[8], uint8_t op[16])
+        uint8_t mac_a[8], uint8_t op[16], int is_opc)
 {
     uint8_t op_c[16];
     uint8_t temp[16];
@@ -71,7 +72,10 @@ void f1(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
     uint8_t rijndaelInput[16];
     uint8_t i;
 
-    ComputeOPc(k, op_c, op);
+    if (is_opc)
+        memcpy(op_c, op, 16);
+    else
+        ComputeOPc(k, op_c, op);
 
     for (i=0; i<16; i++)
         rijndaelInput[i] = rand[i] ^ op_c[i];
@@ -117,7 +121,8 @@ void f1(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
  *-----------------------------------------------------------------*/
 
 void f2345(uint8_t k[16], uint8_t rand[16],
-           uint8_t res[8], uint8_t ck[16], uint8_t ik[16], uint8_t ak[6], uint8_t op[16])
+           uint8_t res[8], uint8_t ck[16], uint8_t ik[16], uint8_t ak[6],
+           uint8_t op[16], int is_opc)
 {
     uint8_t op_c[16];
     uint8_t temp[16];
@@ -125,7 +130,10 @@ void f2345(uint8_t k[16], uint8_t rand[16],
     uint8_t rijndaelInput[16];
     uint8_t i;
 
-    ComputeOPc(k, op_c, op);
+    if (is_opc)
+        memcpy(op_c, op, 16);
+    else
+        ComputeOPc(k, op_c, op);
 
     for (i=0; i<16; i++)
         rijndaelInput[i] = rand[i] ^ op_c[i];
@@ -193,7 +201,7 @@ void f2345(uint8_t k[16], uint8_t rand[16],
  *-----------------------------------------------------------------*/
 
 void f1star(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
-            uint8_t mac_s[8], uint8_t op[16])
+            uint8_t mac_s[8], uint8_t op[16], int is_opc)
 {
     uint8_t op_c[16];
     uint8_t temp[16];
@@ -202,7 +210,10 @@ void f1star(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
     uint8_t rijndaelInput[16];
     uint8_t i;
 
-    ComputeOPc(k, op_c, op);
+    if (is_opc)
+        memcpy(op_c, op, 16);
+    else
+        ComputeOPc(k, op_c, op);
 
     for (i=0; i<16; i++)
         rijndaelInput[i] = rand[i] ^ op_c[i];
@@ -249,7 +260,7 @@ void f1star(uint8_t k[16], uint8_t rand[16], uint8_t sqn[6], uint8_t amf[2],
  *-----------------------------------------------------------------*/
 
 void f5star(uint8_t k[16], uint8_t rand[16],
-            uint8_t ak[6], uint8_t op[16])
+            uint8_t ak[6], uint8_t op[16], int is_opc)
 {
     uint8_t op_c[16];
     uint8_t temp[16];
@@ -257,7 +268,10 @@ void f5star(uint8_t k[16], uint8_t rand[16],
     uint8_t rijndaelInput[16];
     uint8_t i;
 
-    ComputeOPc(k, op_c, op);
+    if (is_opc)
+        memcpy(op_c, op, 16);
+    else
+        ComputeOPc(k, op_c, op);
 
     for (i=0; i<16; i++)
         rijndaelInput[i] = rand[i] ^ op_c[i];

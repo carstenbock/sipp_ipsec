@@ -584,6 +584,8 @@ void SendingMessage::parseAuthenticationKeyword(scenario *msg_scenario, struct M
 
     getKeywordParam(keyword, "aka_OP=", my_aka);
     dst->comp_param.auth_param.aka_OP = new SendingMessage(msg_scenario, my_aka, true);
+    getKeywordParam(keyword, "aka_OPc=", my_aka);
+    dst->comp_param.auth_param.aka_OPc = new SendingMessage(msg_scenario, my_aka, true);
     getKeywordParam(keyword, "aka_AMF=", my_aka);
     dst->comp_param.auth_param.aka_AMF = new SendingMessage(msg_scenario, my_aka, true);
 }
@@ -606,6 +608,9 @@ void SendingMessage::freeMessageComponent(struct MessageComponent *comp)
         }
         if (comp->comp_param.auth_param.aka_OP) {
             delete comp->comp_param.auth_param.aka_OP;
+        }
+        if (comp->comp_param.auth_param.aka_OPc) {
+            delete comp->comp_param.auth_param.aka_OPc;
         }
     } else if (comp->type == E_Message_Injection) {
         free(comp->comp_param.field_param.filename);

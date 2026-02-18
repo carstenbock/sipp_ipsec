@@ -30,12 +30,21 @@ authentication keyword:
   aka_OP=0xCDC202D5123E20F62B6D676AC72CB318
   aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC aka_AMF=0xB9B9])
 
+  Or with a pre-computed OPc instead of OP: (example: [authentication
+  username=HappyFeet
+  aka_OPc=0xE8ED289DEBA952E4283B54E88E6183CA
+  aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC aka_AMF=0xB9B9])
+
     + username : username: if no username is specified, the username is
       taken from the '-au' (authentication username) or '-s' (service)
       command line parameter
     + aka_K : Permanent secret key. If no aka_K is provided, the
       "password" attributed is used as aka_K.
-    + aka_OP : OPerator variant key
+    + aka_OP : OPerator variant key. Exactly one of aka_OP or aka_OPc
+      must be provided.
+    + aka_OPc : Derived operator key (OPc = AES_K(OP) XOR OP). Use
+      this instead of aka_OP when OPc is pre-computed or provisioned
+      directly. Exactly one of aka_OP or aka_OPc must be provided.
     + aka_AMF : Authentication Management Field (indicates the algorithm
       and key in use)
 
