@@ -232,9 +232,28 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
             key = quoted_strchr(src, ']');
 
             if ((tsrc) && (tsrc<key)) {
-                memcpy(keyword, src-1,  tsrc - src + 1);
-                src=tsrc+1;
-                dest += sprintf(dest, "%s", keyword);
+                /*
+                 * Nested brackets detected. For keywords that accept
+                 * sub-keywords as parameters (authentication, tdmmap),
+                 * find the matching outer ']' by tracking depth so the
+                 * entire construct is parsed as one keyword.
+                 */
+                if (!strncmp(src, "authentication", strlen("authentication")) ||
+                    !strncmp(src, "tdmmap", strlen("tdmmap"))) {
+                    int depth = 1;
+                    const char *p = src;
+                    while (*p && depth > 0) {
+                        if (*p == '[') depth++;
+                        else if (*p == ']') depth--;
+                        if (depth > 0) p++;
+                    }
+                    if (depth == 0)
+                        key = (char *)p;
+                } else {
+                    memcpy(keyword, src-1,  tsrc - src + 1);
+                    src=tsrc+1;
+                    dest += sprintf(dest, "%s", keyword);
+                }
             }
 
             if((!key) || ((key - src) > KEYWORD_SIZE) || (!(key - src))) {
@@ -532,10 +551,19 @@ void SendingMessage::getKeywordParam(char * src, const char * param, char * outp
             key++;
             getQuotedParam(output, key, &len);
         } else {
+            int depth = 0;
             while (*key) {
                 if (((key - src) > KEYWORD_SIZE) || (!(key - src))) {
                     ERROR("Syntax error parsing '%s' parameter", param);
-                } else if (*key == ']' || *key < 33 || *key > 126) {
+                }
+                if (*key == '[') {
+                    depth++;
+                } else if (*key == ']') {
+                    if (depth > 0)
+                        depth--;
+                    else
+                        break;
+                } else if (depth == 0 && (*key < 33 || *key > 126)) {
                     break;
                 }
                 key++;
@@ -546,6 +574,38 @@ void SendingMessage::getKeywordParam(char * src, const char * param, char * outp
     } else {
         output[0] = '\0';
     }
+}
+
+/*
+ * Look up a -key generic value and hex-decode it if it starts with 0x.
+ * Returns true if found.
+ */
+static bool getGenericAkaParam(const char *name, char *output, int max_len)
+{
+    auto gen = generic.find(name);
+    if (gen == generic.end())
+        return false;
+
+    const std::string &val = gen->second;
+    if (val.size() >= 2 && val[0] == '0' && (val[1] == 'x' || val[1] == 'X')) {
+        const char *hex = val.c_str() + 2;
+        int len = 0;
+        while (isxdigit(hex[0]) && len < max_len) {
+            int hi = isdigit(hex[0]) ? hex[0] - '0' : tolower(hex[0]) - 'a' + 10;
+            int lo = 0;
+            hex++;
+            if (isxdigit(hex[0])) {
+                lo = isdigit(hex[0]) ? hex[0] - '0' : tolower(hex[0]) - 'a' + 10;
+                hex++;
+            }
+            output[len++] = (char)((hi << 4) | lo);
+        }
+        output[len] = '\0';
+    } else {
+        strncpy(output, val.c_str(), max_len - 1);
+        output[max_len - 1] = '\0';
+    }
+    return true;
 }
 
 void SendingMessage::parseAuthenticationKeyword(scenario *msg_scenario, struct MessageComponent *dst, char *keyword)
@@ -574,19 +634,29 @@ void SendingMessage::parseAuthenticationKeyword(scenario *msg_scenario, struct M
     dst->comp_param.auth_param.auth_user = new SendingMessage(msg_scenario, my_auth_user, true /* skip sanity */);
     dst->comp_param.auth_param.auth_pass = new SendingMessage(msg_scenario, my_auth_pass, true);
 
-    /* add aka_OP, aka_AMF, aka_K */
+    /* add aka_OP, aka_AMF, aka_K -- check inline params first, then -key fallback */
     getKeywordParam(keyword, "aka_K=", my_aka);
-    if (my_aka[0]==0) {
-        memcpy(my_aka,my_auth_pass,16);
-        my_aka[16]=0;
+    if (my_aka[0] == 0)
+        getGenericAkaParam("aka_K", my_aka, KEYWORD_SIZE);
+    if (my_aka[0] == 0) {
+        memcpy(my_aka, my_auth_pass, 16);
+        my_aka[16] = 0;
     }
     dst->comp_param.auth_param.aka_K = new SendingMessage(msg_scenario, my_aka, true);
 
     getKeywordParam(keyword, "aka_OP=", my_aka);
+    if (my_aka[0] == 0)
+        getGenericAkaParam("aka_OP", my_aka, KEYWORD_SIZE);
     dst->comp_param.auth_param.aka_OP = new SendingMessage(msg_scenario, my_aka, true);
+
     getKeywordParam(keyword, "aka_OPc=", my_aka);
+    if (my_aka[0] == 0)
+        getGenericAkaParam("aka_OPc", my_aka, KEYWORD_SIZE);
     dst->comp_param.auth_param.aka_OPc = new SendingMessage(msg_scenario, my_aka, true);
+
     getKeywordParam(keyword, "aka_AMF=", my_aka);
+    if (my_aka[0] == 0)
+        getGenericAkaParam("aka_AMF", my_aka, KEYWORD_SIZE);
     dst->comp_param.auth_param.aka_AMF = new SendingMessage(msg_scenario, my_aka, true);
 }
 

@@ -216,6 +216,7 @@ protected:
     SIPpSocket    *ipsec_socket;
 
     int  ipsec_setup_sas(const char *msg);
+    int  ipsec_activate_sas();
     void ipsec_teardown_sas();
     int  ipsec_rebind_socket();
 #endif

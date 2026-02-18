@@ -3851,6 +3851,15 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             break;
 #ifdef USE_IPSEC
         case E_Message_Security_Client: {
+            if (ipsec_params.state < IPSEC_STATE_PARAMS_ALLOCATED && ipsec_enabled) {
+                if (!ipsec_manager) {
+                    ipsec_manager = new IPSecManager();
+                    ipsec_manager->init();
+                }
+                if (ipsec_manager) {
+                    ipsec_manager->allocate_local_params(ipsec_params);
+                }
+            }
             char sec_client_buf[512];
             if (ipsec_params.state >= IPSEC_STATE_PARAMS_ALLOCATED) {
                 int len = build_security_client_header(ipsec_params, sec_client_buf, sizeof(sec_client_buf));
@@ -4099,6 +4108,9 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         if (ipsec_enabled && ck_ptr && ik_ptr) {
             if (ipsec_manager) {
                 ipsec_manager->set_keys(ipsec_params, out_ck, out_ik);
+                if (ipsec_params.state == IPSEC_STATE_PARAMS_ALLOCATED) {
+                    ipsec_activate_sas();
+                }
             }
         }
 #endif
@@ -6948,14 +6960,11 @@ TEST(sdp, good_remote_media_addr_v6) {
 
 #ifdef USE_IPSEC
 /*
- * IPSec SA setup triggered by the <ipsec_setup/> action.
- * This is called when the 401 response with Security-Server is received.
+ * Phase 1: Parse the 401 response and store Security-Server parameters.
+ * Triggered by the <ipsec_setup/> action on receiving the 401.
  *
- * The flow:
- * 1. Extract Security-Server header from the 401 message
- * 2. Parse P-CSCF's SPIs and ports
- * 3. Set up 4 XFRM SAs and 4 policies
- * 4. Create a new socket bound to the protected client port
+ * Actual SA creation is deferred to ipsec_activate_sas() which runs
+ * after the AKA authentication derives CK/IK.
  */
 int call::ipsec_setup_sas(const char *msg)
 {
@@ -7026,19 +7035,40 @@ int call::ipsec_setup_sas(const char *msg)
 #pragma GCC diagnostic pop
     ipsec_params.proto = (transport == T_TCP) ? IPPROTO_TCP : IPPROTO_UDP;
 
-    /* Set up the 4 SAs and 4 policies */
+    LOG_MSG("IPSec params parsed: remote spi-c=%u spi-s=%u port-c=%u port-s=%u "
+            "(SA creation deferred until AKA key derivation)\n",
+            ipsec_params.spi_pc, ipsec_params.spi_ps,
+            ipsec_params.port_pc, ipsec_params.port_ps);
+
+    return 0;
+}
+
+/*
+ * Phase 2: Create XFRM SAs and rebind the socket.
+ * Called after set_keys() populates CK/IK from AKA authentication.
+ */
+int call::ipsec_activate_sas()
+{
+    if (!ipsec_manager) {
+        WARNING("ipsec_activate_sas called but no IPSec manager");
+        return -1;
+    }
+
+    if (ipsec_params.state >= IPSEC_STATE_SA_ESTABLISHED) {
+        return 0;
+    }
+
     if (ipsec_manager->setup_security_associations(ipsec_params) < 0) {
         WARNING("Failed to set up IPSec Security Associations");
         return -1;
     }
 
-    /* Rebind to the protected client port for subsequent SIP traffic */
     if (ipsec_rebind_socket() < 0) {
         WARNING("Failed to rebind socket to IPSec protected port");
         return -1;
     }
 
-    LOG_MSG("IPSec setup complete: sending from port %d to P-CSCF port %d\n",
+    LOG_MSG("IPSec SAs activated: sending from port %d to P-CSCF port %d\n",
             ipsec_params.port_uc, ipsec_params.port_ps);
 
     return 0;

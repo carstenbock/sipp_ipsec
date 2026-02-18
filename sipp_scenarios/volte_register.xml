@@ -59,7 +59,8 @@
 
   <!-- Step 2: Receive 401 with AKA challenge + Security-Server -->
   <!-- The auth="true" flag saves the WWW-Authenticate header.
-       The ipsec_setup action parses Security-Server and creates XFRM SAs. -->
+       The ipsec_setup action parses Security-Server and stores P-CSCF params.
+       Actual XFRM SA creation is deferred until [authentication] derives CK/IK. -->
   <recv response="401" auth="true">
     <action>
       <ipsec_setup />
@@ -67,8 +68,8 @@
   </recv>
 
   <!-- Step 3: Re-REGISTER over IPSec-protected path -->
-  <!-- After ipsec_setup, the socket is rebound to the protected client port.
-       Traffic is now ESP-encapsulated by the kernel XFRM subsystem. -->
+  <!-- The [authentication] keyword runs AKA, derives CK/IK, then automatically
+       creates the XFRM SAs and rebinds the socket before this message is sent. -->
   <send retrans="500">
     <![CDATA[
 

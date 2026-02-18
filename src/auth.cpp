@@ -653,9 +653,9 @@ static int createAuthHeaderAKAv1MD5(
     }
     memcpy(rnd, nonce, RANDLEN);
     memcpy(sqnxoraka, nonce + RANDLEN, SQNLEN);
+    memcpy(amf, nonce + RANDLEN + SQNLEN, AMFLEN);
     memcpy(mac, nonce + RANDLEN + SQNLEN + AMFLEN, MACLEN);
     memcpy(k, aka_K, KLEN);
-    memcpy(amf, aka_AMF, AMFLEN);
 
     int is_opc = (aka_OPc && aka_OPc[0]) ? 1 : 0;
     if (is_opc)
@@ -677,8 +677,8 @@ static int createAuthHeaderAKAv1MD5(
     for (i=0; i < SQNLEN; i++)
         sqn[i] = sqnxoraka[i] ^ ak[i];
 
-    /* compute XMAC */
-    f1(k, rnd, sqn, (unsigned char *) aka_AMF, xmac, op, is_opc);
+    /* Per 3GPP TS 33.102 sec 6.3.3: use AMF from AUTN for XMAC verification */
+    f1(k, rnd, sqn, amf, xmac, op, is_opc);
     if (memcmp(mac, xmac, MACLEN) != 0) {
         free(nonce);
         snprintf(
