@@ -2631,7 +2631,14 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             dest += snprintf(dest, left, "%s", remote_host);
             break;
         case E_Message_Remote_Port:
-            dest += snprintf(dest, left, "%d", remote_port + comp->offset);
+#ifdef USE_IPSEC
+            if (ipsec_params.state >= IPSEC_STATE_ACTIVE && ipsec_params.port_ps != 0) {
+                dest += snprintf(dest, left, "%d", ipsec_params.port_ps + comp->offset);
+            } else
+#endif
+            {
+                dest += snprintf(dest, left, "%d", remote_port + comp->offset);
+            }
             break;
         case E_Message_Local_IP:
             dest += snprintf(dest, left, "%s", local_ip_w_brackets);
@@ -4109,7 +4116,9 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             if (ipsec_manager) {
                 ipsec_manager->set_keys(ipsec_params, out_ck, out_ik);
                 if (ipsec_params.state == IPSEC_STATE_PARAMS_ALLOCATED) {
-                    ipsec_activate_sas();
+                    if (ipsec_activate_sas() < 0) {
+                        WARNING("IPSec SA activation failed during authentication");
+                    }
                 }
             }
         }
@@ -7087,43 +7096,48 @@ void call::ipsec_teardown_sas()
 
 int call::ipsec_rebind_socket()
 {
-    /* Create a new UDP/TCP socket bound to the protected client port */
-    ipsec_socket = SIPpSocket::new_sipp_ipsec_socket(
-        use_ipv6, transport, ipsec_params.port_uc);
+    /*
+     * If the current socket is already bound to port_uc (the common case when
+     * IPSEC_DEFAULT_PORT_C == local SIPp port), reuse it instead of trying to
+     * create a second socket on the same port (which would fail with EADDRINUSE
+     * on UDP where SO_REUSEADDR is not set).
+     */
+    if (call_socket && call_socket->ss_port == ipsec_params.port_uc) {
+        ipsec_socket = call_socket;
+    } else {
+        /* Need a new socket on a different port */
+        if (call_socket) {
+            call_socket->close();
+        }
 
-    if (!ipsec_socket) {
-        WARNING("Failed to create IPSec socket on port %d", ipsec_params.port_uc);
-        return -1;
-    }
+        ipsec_socket = SIPpSocket::new_sipp_ipsec_socket(
+            use_ipv6, transport, ipsec_params.port_uc);
 
-    /* Update the destination to P-CSCF's protected server port */
-    struct sockaddr_storage ipsec_dest;
-    memcpy(&ipsec_dest, &call_peer, sizeof(ipsec_dest));
-    sockaddr_update_port(&ipsec_dest, ipsec_params.port_ps);
-    memcpy(&ipsec_socket->ss_dest, &ipsec_dest, sizeof(ipsec_dest));
-
-    /* For TCP, connect to the P-CSCF's protected port */
-    if (transport == T_TCP) {
-        if (ipsec_socket->connect(&ipsec_dest) < 0) {
-            WARNING("Failed to connect IPSec TCP socket to P-CSCF port %d",
-                    ipsec_params.port_ps);
-            ipsec_socket->close();
-            ipsec_socket = nullptr;
+        if (!ipsec_socket) {
+            WARNING("Failed to create IPSec socket on port %d", ipsec_params.port_uc);
             return -1;
         }
+
+        /* For TCP, connect to the P-CSCF's protected port */
+        if (transport == T_TCP) {
+            struct sockaddr_storage ipsec_dest;
+            memcpy(&ipsec_dest, &call_peer, sizeof(ipsec_dest));
+            sockaddr_update_port(&ipsec_dest, ipsec_params.port_ps);
+            if (ipsec_socket->connect(&ipsec_dest) < 0) {
+                WARNING("Failed to connect IPSec TCP socket to P-CSCF port %d",
+                        ipsec_params.port_ps);
+                ipsec_socket->close();
+                ipsec_socket = nullptr;
+                return -1;
+            }
+        }
+
+        associate_socket(ipsec_socket);
     }
 
-    /*
-     * Replace the current call_socket with the IPSec-protected one.
-     * The old socket is released (reference count decremented).
-     */
-    if (call_socket) {
-        call_socket->close();
-    }
-    associate_socket(ipsec_socket);
-
-    /* Update the peer address to use the protected port */
+    /* Update the peer address to P-CSCF's protected server port */
     sockaddr_update_port(&call_peer, ipsec_params.port_ps);
+    call_port = ipsec_params.port_uc;
 
     ipsec_params.state = IPSEC_STATE_ACTIVE;
     return 0;

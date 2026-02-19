@@ -1,0 +1,14 @@
+# Changelog Policy
+
+ALWAYS ensure that:
+- Every user-visible change updates CHANGELOG.md
+- Entries go into [Unreleased]
+- Use Keep-a-Changelog format
+- Classify changes as:
+  - Added
+  - Changed
+  - Fixed
+  - Breaking
+
+If changes are missing, update CHANGELOG.md automatically.
+

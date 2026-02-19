@@ -113,7 +113,7 @@ int build_security_client_header(const IPSecParams &params,
                                  char *result, size_t result_len)
 {
     int written = snprintf(result, result_len,
-        "ipsec-3gpp; alg=%s; ealg=%s; spi-c=%u; spi-s=%u; port-c=%u; port-s=%u",
+        "ipsec-3gpp;alg=%s;ealg=%s;prot=esp;mod=trans;spi-c=%u;spi-s=%u;port-c=%u;port-s=%u",
         params.algos.aalg,
         params.algos.ealg,
         params.spi_uc,

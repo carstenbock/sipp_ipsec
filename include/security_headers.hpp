@@ -29,9 +29,9 @@
  * Build a Security-Client header value for the initial REGISTER.
  *
  * Format per 3GPP TS 33.203:
- *   ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc;
- *     spi-c=<spi_uc>; spi-s=<spi_us>;
- *     port-c=<port_uc>; port-s=<port_us>
+ *   ipsec-3gpp;alg=<aalg>;ealg=<ealg>;prot=esp;mod=trans;
+ *     spi-c=<spi_uc>;spi-s=<spi_us>;
+ *     port-c=<port_uc>;port-s=<port_us>
  *
  * @param params   IPSecParams with local SPIs and ports allocated
  * @param result   Output buffer
