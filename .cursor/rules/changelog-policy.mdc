@@ -1,0 +1,37 @@
+---
+description: Ensure every user-visible change updates CHANGELOG.md using Keep-a-Changelog format
+alwaysApply: true
+---
+
+# Changelog Policy
+
+Every user-visible change MUST update `CHANGELOG.md` under the `[Unreleased]` section.
+
+## Format
+
+Use [Keep a Changelog](https://keepachangelog.com/) format with these categories:
+
+- **Added** – new features or capabilities
+- **Changed** – modifications to existing behavior
+- **Fixed** – bug fixes
+- **Breaking** – changes that break backward compatibility
+
+## Example Entry
+
+```markdown
+## [Unreleased]
+
+### Added
+- Support for SIP REGISTER authentication
+
+### Fixed
+- Incorrect SDP payload in re-INVITE scenarios
+```
+
+## Rules
+
+- If `CHANGELOG.md` does not have an `[Unreleased]` section, create one at the top
+- Place entries under the correct category, creating the category heading if missing
+- Keep entries concise (one line per change)
+- If a change spans multiple commits, consolidate into a single entry
+- If the changelog update is missing after making changes, add it automatically
