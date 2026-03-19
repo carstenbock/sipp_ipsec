@@ -43,6 +43,8 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 #ifdef __APPLE__
 /* Provide OSX version of extern char **environ; */
@@ -2148,7 +2150,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    sipp_usleep(sleeptime * 1000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleeptime));
 
     /* Create the statistics reporting task. */
     stattask::initialize();
