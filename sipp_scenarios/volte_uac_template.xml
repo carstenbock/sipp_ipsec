@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  VoLTE MO Call UAC Template (3GPP TS 24.229 / RFC 3261)
+
+  Simulates a VoLTE UE placing a Mobile-Originated call via the IMS P-CSCF.
+  SIP headers are derived from a real iOS 26.3.1 iPhone trace (mo-call-1.pcap).
+
+  Handles all IMS provisional response variants:
+    - 180 Ringing only            (simple/fast GW, no preconditions)
+    - 183 Session Progress + PRACK (100rel precondition negotiation)
+    - 183 + 180 + 200 OK           (full QoS precondition flow)
+
+  The __SDP_OFFER__ and __PCAP_FILE__ markers are replaced at runtime by
+  the scenario generator (apps/test-runner/scenario_generator/generator.py).
+  For standalone use, defaults to EVS primary (PT=116) + PCMU fallback.
+
+  Usage (standalone):
+    sudo ./sipp -sf volte_uac_template.xml \
+      -ipsec \
+      -s <calling_msisdn> \
+      -key domain ims.mnc001.mcc001.3gppnetwork.org \
+      -key target_uri "tel:+4989200011251" \
+      -key call_duration_ms 10000 \
+      -key pcap_file /scenarios/media/evs-ue-side.pcap \
+      -au <imsi> -ap <password> \
+      -key aka_K <hex_K> -key aka_OP <hex_OP> -key aka_AMF <hex_AMF> \
+      <pcscf_ip>:<pcscf_port>
+
+  The -ipsec flag enables IPSec SA management (requires root / CAP_NET_ADMIN).
+-->
+
+<scenario name="VoLTE MO Call UAC">
+
+  <!-- ===== INVITE ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE [key:target_uri] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <[key:target_uri]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.mid-call;+g.3gpp.ps2cs-srvcc-orig-pre-alerting;+g.3gpp.srvcc-alerting;audio
+      Accept: application/3gpp-ims+xml,application/sdp
+      Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+      P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
+      P-Preferred-Identity: <sip:[service]@[key:domain]>
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
+      P-Early-Media: supported
+      Session-ID: [call_id]
+      Supported: 100rel,path,precondition,replaces,timer
+      Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
+      Max-Forwards: 70
+      User-Agent: SIPp-VoLTE/1.0 (iOS/26.3.1 compatible)
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+__SDP_OFFER__
+
+    ]]>
+  </send>
+
+  <!-- ===== 100 Trying (optional, not forwarded to UE) ===== -->
+  <recv response="100" optional="true"/>
+
+  <!-- ===== 183 Session Progress (optional, triggers PRACK if Require: 100rel) ===== -->
+  <!-- If received, jump to the PRACK flow; otherwise fall through to 180/200 -->
+  <recv response="183" optional="true" next="prack_flow"/>
+
+  <!-- ===== 180 Ringing (optional, may come without prior 183) ===== -->
+  <recv response="180" optional="true"/>
+
+  <!-- ===== 200 OK — direct path (no PRACK) ===== -->
+  <recv response="200" rrs="true" rtd="true">
+    <action>
+      <exec play_pcap_audio="__PCAP_FILE__"/>
+    </action>
+  </recv>
+
+  <!-- ACK -->
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Max-Forwards: 70
+      Supported: 100rel,path,replaces
+      User-Agent: SIPp-VoLTE/1.0 (iOS/26.3.1 compatible)
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Call active — play media for configured duration -->
+  <pause milliseconds="[key:call_duration_ms]"/>
+
+  <!-- BYE -->
+  <send retrans="500">
+    <![CDATA[
+
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Reason: SIP;cause=200;text="User Triggered"
+      P-Preferred-Identity: <sip:[service]@[key:domain]>
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
+      Max-Forwards: 70
+      Supported: 100rel,path,replaces
+      User-Agent: SIPp-VoLTE/1.0 (iOS/26.3.1 compatible)
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <!-- ===== End of direct (no-PRACK) path ===== -->
+
+  <!-- ===== PRACK FLOW ===== -->
+  <!-- Entered when a 183 Session Progress with Require: 100rel was received -->
+  <label id="prack_flow"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      PRACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 2 PRACK
+      RAck: [last_rseq] 1 INVITE
+      Max-Forwards: 70
+      User-Agent: SIPp-VoLTE/1.0 (iOS/26.3.1 compatible)
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 200 OK for PRACK -->
+  <recv response="200"/>
+
+  <!-- 180 Ringing may follow the precondition exchange -->
+  <recv response="180" optional="true"/>
+
+  <!-- Final 200 OK for INVITE (PRACK path) -->
+  <recv response="200" rrs="true" rtd="true">
+    <action>
+      <exec play_pcap_audio="__PCAP_FILE__"/>
+    </action>
+  </recv>
+
+  <!-- ACK (PRACK path) -->
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Max-Forwards: 70
+      Supported: 100rel,path,replaces
+      User-Agent: SIPp-VoLTE/1.0 (iOS/26.3.1 compatible)
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Call active (PRACK path) -->
+  <pause milliseconds="[key:call_duration_ms]"/>
+
+  <!-- BYE (PRACK path) -->
+  <send retrans="500">
+    <![CDATA[
+
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 3 BYE
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Reason: SIP;cause=200;text="User Triggered"
+      P-Preferred-Identity: <sip:[service]@[key:domain]>
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
+      Max-Forwards: 70
+      Supported: 100rel,path,replaces
+      User-Agent: SIPp-VoLTE/1.0 (iOS/26.3.1 compatible)
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <!-- Response time and call length repartition tables -->
+  <ResponseTimeRepartition value="100, 200, 300, 500, 1000, 2000, 5000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000"/>
+
+</scenario>

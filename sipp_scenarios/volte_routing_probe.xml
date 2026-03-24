@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  VoLTE Routing Probe (SBC Routing Validation)
+
+  Sends an INVITE to an arbitrary target number to verify SBC routing rules.
+  Does NOT establish a media session — validates only the signaling path.
+
+  Expected outcomes:
+    - 1xx / 2xx  →  PASS  (route exists and is reachable)
+    - 404        →  FAIL  (no matching route for this number)
+    - 403 / 503  →  FAIL  (route exists but is blocked / unavailable)
+    - 486 / 480  →  PASS  (target busy/unavailable — signaling path works)
+
+  The test-runner configures expected_response per scenario (default: any 1xx or 2xx).
+
+  Usage:
+    sudo ./sipp -sf volte_routing_probe.xml \
+      -ipsec \
+      -s <calling_msisdn> \
+      -key domain ims.mnc001.mcc001.3gppnetwork.org \
+      -key target_number "+4989200011251" \
+      -key target_uri "tel:+4989200011251" \
+      -au <imsi> -ap <password> \
+      -key aka_K <hex_K> -key aka_OP <hex_OP> -key aka_AMF <hex_AMF> \
+      <pcscf_ip>:<pcscf_port>
+
+  Validated against real trace: the second MO call in mo-call-1.pcap
+  dials +4989200011251 and receives 200 OK from the IMS-Carrier Gateway.
+-->
+
+<scenario name="VoLTE Routing Probe">
+
+  <!-- ===== INVITE to target number ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE [key:target_uri] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <[key:target_uri]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Accept: application/3gpp-ims+xml,application/sdp
+      Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+      P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
+      P-Preferred-Identity: <sip:[service]@[key:domain]>
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
+      P-Early-Media: supported
+      Session-ID: [call_id]
+      Supported: 100rel,path,precondition,replaces,timer
+      Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
+      Max-Forwards: 70
+      User-Agent: SIPp-VoLTE/1.0 (iOS/26.3.1 compatible)
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+v=0
+o=sipp 0 0 IN IP4 [local_ip]
+s=VoLTE Routing Probe
+c=IN IP4 [local_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+a=ptime:20
+a=sendrecv
+
+    ]]>
+  </send>
+
+  <!-- ===== Accept any provisional response ===== -->
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="183" optional="true"/>
+
+  <!-- ===== Any final response (2xx, 4xx, 5xx) is acceptable — we just CANCEL ===== -->
+  <recv response="200" optional="true" next="got_200"/>
+  <recv response="486" optional="true" next="got_486"/>
+  <recv response="480" optional="true" next="got_480"/>
+
+  <!-- ===== Default: 404/403/503 = routing failure — cancel and let sipp mark as error ===== -->
+  <send>
+    <![CDATA[
+
+      CANCEL [last_Request_URI] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <[key:target_uri]>
+      Call-ID: [call_id]
+      CSeq: 1 CANCEL
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+  <recv response="487"/>
+
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- ===== 200 OK path — ACK then immediately BYE ===== -->
+  <label id="got_200"/>
+
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Reason: SIP;cause=200;text="Routing probe complete"
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <!-- ===== 486 Busy Here — signaling path works, log as success ===== -->
+  <label id="got_486"/>
+  <label id="got_480"/>
+
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <ResponseTimeRepartition value="100, 200, 500, 1000, 2000, 5000"/>
+  <CallLengthRepartition value="100, 500, 1000, 5000"/>
+
+</scenario>

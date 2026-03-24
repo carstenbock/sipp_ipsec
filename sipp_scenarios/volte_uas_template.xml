@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  VoLTE MT Call UAS Template (3GPP TS 24.229 / RFC 3261)
+
+  Simulates a VoLTE UE receiving a Mobile-Terminated call via the IMS P-CSCF.
+  Used for GW→UE and UE→UE (called side) scenarios.
+
+  Flow: receive INVITE → 100 Trying → 180 Ringing → 200 OK → ACK → RTP echo → BYE → 200 OK
+
+  RTP is handled with -rtp_echo (loops back received RTP), which validates that
+  the media path through RTPEngine is active without requiring a PCAP file.
+
+  The __SDP_ANSWER__ marker is replaced at runtime by the scenario generator.
+  For standalone use, defaults to EVS primary (PT=116) + PCMU fallback.
+
+  Usage (standalone — listen for incoming calls):
+    sudo ./sipp -sf volte_uas_template.xml \
+      -ipsec \
+      -s <called_msisdn> \
+      -key domain ims.mnc001.mcc001.3gppnetwork.org \
+      -key call_duration_ms 10000 \
+      -au <imsi> -ap <password> \
+      -key aka_K <hex_K> -key aka_OP <hex_OP> -key aka_AMF <hex_AMF> \
+      -p <listen_port> \
+      <pcscf_ip>:<pcscf_port>
+-->
+
+<scenario name="VoLTE MT Call UAS">
+
+  <!-- ===== Receive INVITE ===== -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <!-- Echo back any received RTP to validate media path -->
+      <exec rtp_echo="true"/>
+    </action>
+  </recv>
+
+  <!-- ===== 100 Trying ===== -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 100 Trying
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Short pause to simulate alerting -->
+  <pause milliseconds="2000"/>
+
+  <!-- ===== 180 Ringing ===== -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_From:]
+      To: [last_To:];tag=[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>
+      Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Simulate ring duration before answering -->
+  <pause milliseconds="3000"/>
+
+  <!-- ===== 200 OK ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      To: [last_To:];tag=[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
+      Supported: 100rel,path,precondition,replaces,timer
+      User-Agent: SIPp-VoLTE/1.0
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+__SDP_ANSWER__
+
+    ]]>
+  </send>
+
+  <!-- ===== Receive ACK ===== -->
+  <recv request="ACK"/>
+
+  <!-- ===== Call active — RTP echo for configured duration ===== -->
+  <pause milliseconds="[key:call_duration_ms]"/>
+
+  <!-- ===== Receive BYE (caller hangs up) ===== -->
+  <recv request="BYE"/>
+
+  <!-- ===== 200 OK for BYE ===== -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Response time and call length repartition tables -->
+  <ResponseTimeRepartition value="100, 200, 300, 500, 1000, 2000, 5000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000"/>
+
+</scenario>

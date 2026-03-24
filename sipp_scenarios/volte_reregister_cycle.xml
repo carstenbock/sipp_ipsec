@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  VoLTE Re-REGISTER Cycle (Load / Storm Test)
+
+  Performs a rapid REGISTER → 200 OK → REGISTER (refresh) cycle for load testing.
+  Uses IPSec (same as volte_register.xml) but skips the initial 401/AKA challenge
+  on subsequent registrations — models the re-registration refresh pattern.
+
+  Useful for:
+    - Registrar load testing (how many simultaneous registrations?)
+    - P-CSCF / S-CSCF stress testing
+    - Testing registration expiry handling
+
+  Usage:
+    sudo ./sipp -sf volte_reregister_cycle.xml \
+      -ipsec \
+      -s <imsi> \
+      -key domain ims.mnc001.mcc001.3gppnetwork.org \
+      -key expires 600 \
+      -key refresh_count 5 \
+      -au <imsi> -ap <password> \
+      -key aka_K <hex_K> -key aka_OP <hex_OP> -key aka_AMF <hex_AMF> \
+      -l 50 -r 10 \
+      <pcscf_ip>:<pcscf_port>
+-->
+
+<scenario name="VoLTE Re-REGISTER Cycle">
+
+  <!-- ===== Step 1: Initial REGISTER (unprotected) ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=[key:expires];+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Authorization: Digest username="[service]@[key:domain]",realm="[key:domain]",uri="sip:[key:domain]",nonce="",response=""
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: [key:expires]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- ===== Step 2: 401 Unauthorized with AKA challenge ===== -->
+  <recv response="401" auth="true">
+    <action>
+      <ipsec_setup/>
+    </action>
+  </recv>
+
+  <!-- ===== Step 3: Authenticated REGISTER over IPSec ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=[key:expires];+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[service]@[key:domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: [key:expires]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- ===== Step 4: 200 OK for initial registration ===== -->
+  <recv response="200"/>
+
+  <!-- ===== Re-registration refresh loop ===== -->
+  <!-- Pause to simulate time before re-registration (half the expiry) -->
+  <pause milliseconds="2000"/>
+
+  <!-- ===== Re-REGISTER (refresh — no new AKA challenge) ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]
+      CSeq: 3 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=[key:expires];+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[service]@[key:domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: [key:expires]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 401 may or may not come on refresh (depends on P-CSCF policy) -->
+  <recv response="401" optional="true" auth="true">
+    <action>
+      <ipsec_setup/>
+    </action>
+  </recv>
+
+  <!-- Re-authenticate if challenged -->
+  <send retrans="500" optional="true">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]
+      CSeq: 4 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=[key:expires];+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[service]@[key:domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: [key:expires]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <!-- ===== De-REGISTER at end ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]
+      CSeq: 5 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=0
+      [authentication username=[service]@[key:domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200">
+    <action>
+      <ipsec_teardown/>
+    </action>
+  </recv>
+
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200"/>
+  <CallLengthRepartition value="100, 500, 1000, 5000, 10000"/>
+
+</scenario>

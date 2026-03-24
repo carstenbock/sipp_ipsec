@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  VoLTE Mixed Load Scenario (CSV-Driven)
+
+  CSV-driven composite scenario that runs multiple scenario types concurrently.
+  Each CSV row defines one call attempt with its parameters.
+
+  CSV format (no header, fields 0-7):
+    [scenario],[target_uri],[domain],[calling_msisdn],[ue_codec_pt],[gw_codec_pt],[call_duration_ms],[imsi]
+
+  Example CSV row:
+    ue_to_gw,tel:+4989200011251,ims.mnc001.mcc001.3gppnetwork.org,494034927217,116,9,8000,001019999900001
+
+  Scenarios dispatched via field0:
+    ue_to_gw    →  MO call from UE to GW (uses volte_uac_template.xml logic inline)
+    gw_to_ue    →  MT call to UE (uses volte_uas_template.xml logic inline)
+    register    →  Registration cycle
+
+  Usage:
+    sudo ./sipp -sf volte_mixed_load.xml \
+      -ipsec \
+      -inf mixed_load.csv \
+      -au <imsi> -ap <password> \
+      -key aka_K <hex_K> -key aka_OP <hex_OP> -key aka_AMF <hex_AMF> \
+      -l 100 -r 5 \
+      <pcscf_ip>:<pcscf_port>
+
+  Note: The scenario generator creates the CSV file alongside this XML when
+  a mixed load run is requested from the GUI.
+-->
+
+<scenario name="VoLTE Mixed Load">
+
+  <!-- ===== INVITE (MO call path) ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      INVITE [field1] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[field3]@[field2]>;tag=[call_number]
+      To: <[field1]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:[field3]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Accept: application/3gpp-ims+xml,application/sdp
+      Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
+      P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
+      P-Preferred-Identity: <sip:[field3]@[field2]>
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
+      P-Early-Media: supported
+      Supported: 100rel,path,precondition,replaces,timer
+      Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
+      Max-Forwards: 70
+      User-Agent: SIPp-VoLTE/1.0
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Verify: [security_verify]
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+v=0
+o=sipp 0 0 IN IP4 [local_ip]
+s=VoLTE Mixed Load
+c=IN IP4 [local_ip]
+t=0 0
+m=audio [media_port] RTP/AVP [field4] 0
+a=rtpmap:[field4] EVS/16000
+a=fmtp:[field4] br=13.2; bw=nb-wb
+a=rtpmap:0 PCMU/8000
+a=ptime:20
+a=sendrecv
+
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="183" optional="true" next="mixed_prack"/>
+  <recv response="180" optional="true"/>
+
+  <recv response="200" rrs="true" rtd="true">
+    <action>
+      <exec play_pcap_audio="/scenarios/media/evs-ue-side.pcap"/>
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[field3]@[field2]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="[field6]"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[field3]@[field2]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 2 BYE
+      Reason: SIP;cause=200;text="User Triggered"
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <!-- ===== PRACK path ===== -->
+  <label id="mixed_prack"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      PRACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[field3]@[field2]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 2 PRACK
+      RAck: [last_rseq] 1 INVITE
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+  <recv response="180" optional="true"/>
+
+  <recv response="200" rrs="true" rtd="true">
+    <action>
+      <exec play_pcap_audio="/scenarios/media/evs-ue-side.pcap"/>
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+
+      ACK [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[field3]@[field2]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <pause milliseconds="[field6]"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      BYE [next_url] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: [route_header]
+      From: <sip:[field3]@[field2]>;tag=[call_number]
+      To: [last_To]
+      Call-ID: [call_id]
+      CSeq: 3 BYE
+      Reason: SIP;cause=200;text="User Triggered"
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <ResponseTimeRepartition value="100, 200, 300, 500, 1000, 2000, 5000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000"/>
+
+</scenario>

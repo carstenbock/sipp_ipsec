@@ -5,6 +5,7 @@
 FROM alpine:3.20 AS build
 
 ARG FULL=''
+ARG USE_IPSEC=''
 
 RUN apk add --no-cache \
   binutils \
@@ -22,7 +23,8 @@ RUN apk add --no-cache \
   ninja \
   openssl-dev \
   openssl-libs-static \
-  ${FULL:+linux-headers lksctp-tools-dev lksctp-tools-static}
+  ${FULL:+linux-headers lksctp-tools-dev lksctp-tools-static} \
+  ${USE_IPSEC:+linux-headers}
 
 WORKDIR /sipp
 COPY CMakeLists.txt ./
@@ -41,6 +43,7 @@ RUN --mount=type=bind,target=.git,source=.git \
     -DUSE_GSL=1 \
     ${DEBUG:+-DDEBUG=1} \
     ${FULL:+-DUSE_SCTP=1} \
+    ${USE_IPSEC:+-DUSE_IPSEC=1} \
   && ninja
 RUN help2man --output=sipp.1 -v -v --no-info \
   --name='SIP testing tool and traffic generator' ./sipp
@@ -49,5 +52,7 @@ FROM scratch AS bin
 COPY --from=build /sipp/sipp /sipp/sipp.1 /sipp/version.h /
 
 FROM alpine:3.20
+# iproute2 provides 'ip xfrm' for IPSec SA/SP management at runtime (USE_IPSEC=1 builds)
+RUN apk add --no-cache iproute2
 CMD ["sipp"]
 COPY --from=build /sipp/sipp /usr/local/bin/sipp
