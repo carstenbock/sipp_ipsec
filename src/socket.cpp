@@ -1412,6 +1412,13 @@ SIPpSocket* SIPpSocket::new_sipp_ipsec_socket(bool use_ipv6, int transport, uint
 
     sock->ss_port = local_port;
     sock->ss_bind_port = local_port;
+
+#ifdef SO_BINDTODEVICE
+    if (bind_to_device_name) {
+        sock->bind_to_device(bind_to_device_name);
+    }
+#endif
+
     return sock;
 }
 #endif

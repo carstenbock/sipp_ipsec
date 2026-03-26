@@ -3867,7 +3867,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
                     ipsec_manager->allocate_local_params(ipsec_params);
                 }
             }
-            char sec_client_buf[512];
+            char sec_client_buf[1024];
             if (ipsec_params.state >= IPSEC_STATE_PARAMS_ALLOCATED) {
                 int len = build_security_client_header(ipsec_params, sec_client_buf, sizeof(sec_client_buf));
                 if (len > 0)
@@ -7097,10 +7097,10 @@ void call::ipsec_teardown_sas()
 int call::ipsec_rebind_socket()
 {
     /*
-     * If the current socket is already bound to port_uc (the common case when
-     * IPSEC_DEFAULT_PORT_C == local SIPp port), reuse it instead of trying to
-     * create a second socket on the same port (which would fail with EADDRINUSE
-     * on UDP where SO_REUSEADDR is not set).
+     * If the current socket happens to be bound to port_uc already, reuse it
+     * instead of creating a second socket on the same port (which would fail
+     * with EADDRINUSE on UDP where SO_REUSEADDR is not set).
+     * With ephemeral port allocation this branch is rarely taken.
      */
     if (call_socket && call_socket->ss_port == ipsec_params.port_uc) {
         ipsec_socket = call_socket;

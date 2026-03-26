@@ -109,23 +109,57 @@ static void extract_string(const char *header, const char *name, char *out, size
     out[len] = '\0';
 }
 
+/*
+ * All algorithm combinations offered in Security-Client per 3GPP TS 33.203.
+ * Real UEs (e.g. iOS) list every supported {aalg, ealg} pair so the P-CSCF
+ * can pick its preferred one.  The CLI-preferred pair is emitted first.
+ */
+static const char *all_aalgs[] = { "hmac-md5-96", "hmac-sha-1-96" };
+static const char *all_ealgs[] = { "aes-cbc", "null" };
+#define NUM_AALGS (sizeof(all_aalgs) / sizeof(all_aalgs[0]))
+#define NUM_EALGS (sizeof(all_ealgs) / sizeof(all_ealgs[0]))
+
 int build_security_client_header(const IPSecParams &params,
                                  char *result, size_t result_len)
 {
-    int written = snprintf(result, result_len,
-        "ipsec-3gpp;alg=%s;ealg=%s;prot=esp;mod=trans;spi-c=%u;spi-s=%u;port-c=%u;port-s=%u",
-        params.algos.aalg,
-        params.algos.ealg,
-        params.spi_uc,
-        params.spi_us,
-        params.port_uc,
-        params.port_us);
+    char *p = result;
+    size_t left = result_len;
+    bool first = true;
 
-    if (written < 0 || (size_t)written >= result_len) {
-        WARNING("Security-Client header too long");
-        return 0;
+    /*
+     * Pass 1: emit the CLI-preferred combination first.
+     * Pass 2: emit all remaining combinations.
+     */
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t ai = 0; ai < NUM_AALGS; ai++) {
+            for (size_t ei = 0; ei < NUM_EALGS; ei++) {
+                bool is_preferred =
+                    strcasecmp(all_aalgs[ai], params.algos.aalg) == 0 &&
+                    strcasecmp(all_ealgs[ei], params.algos.ealg) == 0;
+
+                if ((pass == 0) != is_preferred)
+                    continue;
+
+                int n = snprintf(p, left, "%sipsec-3gpp;alg=%s;ealg=%s;"
+                    "mod=trans;port-c=%u;port-s=%u;prot=esp;"
+                    "spi-c=%u;spi-s=%u",
+                    first ? "" : ",",
+                    all_aalgs[ai], all_ealgs[ei],
+                    params.port_uc, params.port_us,
+                    params.spi_uc, params.spi_us);
+
+                if (n < 0 || (size_t)n >= left) {
+                    WARNING("Security-Client header too long");
+                    return 0;
+                }
+                p += n;
+                left -= (size_t)n;
+                first = false;
+            }
+        }
     }
-    return written;
+
+    return (int)(p - result);
 }
 
 int parse_security_server_header(const char *header, IPSecParams &params)

@@ -28,13 +28,13 @@
 /**
  * Build a Security-Client header value for the initial REGISTER.
  *
- * Format per 3GPP TS 33.203:
- *   ipsec-3gpp;alg=<aalg>;ealg=<ealg>;prot=esp;mod=trans;
- *     spi-c=<spi_uc>;spi-s=<spi_us>;
- *     port-c=<port_uc>;port-s=<port_us>
+ * Emits all supported {aalg, ealg} combinations as comma-separated
+ * ipsec-3gpp entries per 3GPP TS 33.203 section 7.1, with the
+ * CLI-preferred pair listed first.  All entries share the same
+ * spi-c, spi-s, port-c, port-s.
  *
  * @param params   IPSecParams with local SPIs and ports allocated
- * @param result   Output buffer
+ * @param result   Output buffer (should be >= 1024 bytes)
  * @param result_len  Size of output buffer
  * @return Number of bytes written, or 0 on error
  */

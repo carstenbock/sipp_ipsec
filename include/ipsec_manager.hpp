@@ -26,9 +26,9 @@
 #include <stdint.h>
 #include <string>
 
-/* Default protected port range for UE */
-#define IPSEC_DEFAULT_PORT_C  5060
-#define IPSEC_DEFAULT_PORT_S  5061
+/* Ephemeral port range for UE protected ports (matches Linux default) */
+#define IPSEC_EPHEMERAL_PORT_MIN  32768
+#define IPSEC_EPHEMERAL_PORT_MAX  65535
 
 /* IPSec negotiation state */
 enum IPSecState {

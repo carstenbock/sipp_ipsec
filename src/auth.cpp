@@ -597,6 +597,35 @@ static char* base64_decode_string(const char* buf, unsigned int len, int* newlen
 
 char hexa[17] = "0123456789abcdef";
 
+/* Decode a hex string into a binary buffer.  Returns number of bytes written.
+   If the input is not valid hex or is shorter than expected, copies raw bytes
+   as a fallback (original SIPp behaviour). */
+static int hex_decode_aka(const char *hex, unsigned char *out, int max_len)
+{
+    if (!hex || !hex[0])
+        return 0;
+    int slen = strlen(hex);
+    /* If the string length is exactly 2*max_len and all hex digits, decode */
+    if (slen == 2 * max_len) {
+        int all_hex = 1;
+        for (int i = 0; i < slen; i++) {
+            if (!isxdigit((unsigned char)hex[i])) { all_hex = 0; break; }
+        }
+        if (all_hex) {
+            for (int i = 0; i < max_len; i++) {
+                unsigned int byte;
+                sscanf(hex + 2*i, "%2x", &byte);
+                out[i] = (unsigned char)byte;
+            }
+            return max_len;
+        }
+    }
+    /* Fallback: raw copy (original behaviour for binary-passed keys) */
+    int n = (slen < max_len) ? slen : max_len;
+    memcpy(out, hex, n);
+    return n;
+}
+
 static int createAuthHeaderAKAv1MD5(
     const char* user, const char* aka_OP, const char* aka_AMF,
     const char* aka_K, const char* method, const char* uri,
@@ -655,13 +684,13 @@ static int createAuthHeaderAKAv1MD5(
     memcpy(sqnxoraka, nonce + RANDLEN, SQNLEN);
     memcpy(amf, nonce + RANDLEN + SQNLEN, AMFLEN);
     memcpy(mac, nonce + RANDLEN + SQNLEN + AMFLEN, MACLEN);
-    memcpy(k, aka_K, KLEN);
+    hex_decode_aka(aka_K, k, KLEN);
 
     int is_opc = (aka_OPc && aka_OPc[0]) ? 1 : 0;
     if (is_opc)
-        memcpy(op, aka_OPc, OPLEN);
+        hex_decode_aka(aka_OPc, op, OPLEN);
     else
-        memcpy(op, aka_OP, OPLEN);
+        hex_decode_aka(aka_OP, op, OPLEN);
 
     /* Compute the AK, response and keys CK IK */
     f2345(k, rnd, res, ck, ik, ak, op, is_opc);

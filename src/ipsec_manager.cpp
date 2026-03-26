@@ -64,6 +64,16 @@ uint32_t IPSecManager::generate_spi()
     return (uint32_t)(rand() % 0xFFFF0000) + 256;
 }
 
+static uint16_t generate_ephemeral_port()
+{
+    if (!spi_seeded) {
+        srand(time(nullptr) ^ getpid());
+        spi_seeded = true;
+    }
+    uint16_t range = IPSEC_EPHEMERAL_PORT_MAX - IPSEC_EPHEMERAL_PORT_MIN + 1;
+    return (uint16_t)(IPSEC_EPHEMERAL_PORT_MIN + (rand() % range));
+}
+
 int IPSecManager::allocate_local_params(IPSecParams &params, uint16_t port_c, uint16_t port_s)
 {
     memset(&params, 0, sizeof(params));
@@ -78,13 +88,15 @@ int IPSecManager::allocate_local_params(IPSecParams &params, uint16_t port_c, ui
     if (port_c != 0) {
         params.port_uc = port_c;
     } else {
-        params.port_uc = IPSEC_DEFAULT_PORT_C;
+        params.port_uc = generate_ephemeral_port();
     }
 
     if (port_s != 0) {
         params.port_us = port_s;
     } else {
-        params.port_us = IPSEC_DEFAULT_PORT_S;
+        params.port_us = generate_ephemeral_port();
+        while (params.port_us == params.port_uc)
+            params.port_us = generate_ephemeral_port();
     }
 
     /* Set default algorithms */
