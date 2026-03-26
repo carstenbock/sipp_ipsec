@@ -214,6 +214,7 @@ protected:
     IPSecManager  *ipsec_manager;
     char         * security_server_value;
     SIPpSocket    *ipsec_socket;
+    SIPpSocket    *ipsec_server_socket;
 
     int  ipsec_setup_sas(const char *msg);
     int  ipsec_activate_sas();

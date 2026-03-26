@@ -909,6 +909,7 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     ipsec_manager = nullptr;
     security_server_value = nullptr;
     ipsec_socket = nullptr;
+    ipsec_server_socket = nullptr;
 #endif
 
     //
@@ -1206,6 +1207,10 @@ call::~call()
     ipsec_teardown_sas();
     if (security_server_value) {
         free(security_server_value);
+    }
+    if (ipsec_server_socket) {
+        ipsec_server_socket->close();
+        ipsec_server_socket = nullptr;
     }
     if (ipsec_socket) {
         ipsec_socket->close();
@@ -2645,10 +2650,15 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             break;
         case E_Message_Local_Port:
             int port;
-            if((multisocket) && (sendMode != MODE_SERVER)) {
+#ifdef USE_IPSEC
+            if (ipsec_params.state >= IPSEC_STATE_ACTIVE && ipsec_params.port_uc != 0) {
+                port = ipsec_params.port_uc;
+            } else
+#endif
+            if ((multisocket) && (sendMode != MODE_SERVER)) {
                 port = call_port;
             } else {
-                port =  local_port;
+                port = local_port;
             }
             dest += snprintf(dest, left, "%d", port + comp->offset);
             break;
@@ -7088,6 +7098,10 @@ void call::ipsec_teardown_sas()
     if (ipsec_manager && ipsec_params.state >= IPSEC_STATE_SA_ESTABLISHED) {
         ipsec_manager->teardown_security_associations(ipsec_params);
     }
+    if (ipsec_server_socket) {
+        ipsec_server_socket->close();
+        ipsec_server_socket = nullptr;
+    }
     if (ipsec_manager) {
         delete ipsec_manager;
         ipsec_manager = nullptr;
@@ -7133,6 +7147,20 @@ int call::ipsec_rebind_socket()
         }
 
         associate_socket(ipsec_socket);
+    }
+
+    /*
+     * Create a listening socket on port_us (UE server port).
+     * The P-CSCF sends responses from port_pc to port_us per 3GPP TS 33.203.
+     * The constructor registers with epoll/poll; incoming data is routed
+     * to this call via Call-ID matching in process_message().
+     */
+    ipsec_server_socket = SIPpSocket::new_sipp_ipsec_socket(
+        use_ipv6, transport, ipsec_params.port_us);
+
+    if (!ipsec_server_socket) {
+        WARNING("Failed to create IPSec server socket on port %d", ipsec_params.port_us);
+        return -1;
     }
 
     /* Update the peer address to P-CSCF's protected server port */

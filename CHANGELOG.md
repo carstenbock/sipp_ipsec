@@ -18,5 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - IPSec protected ports (port-c, port-s) now use random ephemeral ports (32768-65535) instead of hardcoded 5060/5061
 
 ### Fixed
+- Create listening socket on UE server port (`port_us`) so P-CSCF responses per 3GPP TS 33.203 are received (fixes ICMP port unreachable)
+- `[local_port]` keyword now resolves to the IPSec client port (`port_uc`) when IPSec is active, so Via/Contact headers advertise the correct protected port
 - IPSec socket now inherits `-bind_to_device` setting; ESP packets no longer go out on the wrong interface
 - Docker build (Dockerfile.ipsec) now copies `third_party` so bundled pugixml is available; fixes "Cannot find source file third_party/pugixml/src/pugixml.cpp"
