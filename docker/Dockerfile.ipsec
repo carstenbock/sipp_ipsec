@@ -49,9 +49,11 @@ COPY gtest gtest
 COPY third_party third_party
 
 ARG DEBUG=''
-RUN --mount=type=bind,target=.git,source=.git \
-  git config --global --add safe.directory /sipp && \
-  cmake . -G Ninja \
+# Create a minimal .git so cmake's `git describe` works inside submodule checkouts
+RUN git init --bare /tmp/fake-git && \
+    git -C /tmp/fake-git tag v0.0.0 $(git -C /tmp/fake-git rev-parse HEAD) 2>/dev/null; \
+    rm -rf .git && ln -s /tmp/fake-git .git
+RUN cmake . -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DUSE_PCAP=1 \
     -DUSE_GSL=1 \

@@ -51,7 +51,7 @@
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
       User-Agent: SIPp-VoLTE/1.0
-      Expires: 600000
+      Expires: 300
       Content-Length: 0
 
     ]]>
@@ -90,7 +90,7 @@
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
       User-Agent: SIPp-VoLTE/1.0
-      Expires: 600000
+      Expires: 300
       Content-Length: 0
 
     ]]>
@@ -101,7 +101,7 @@
   </recv>
 
   <!-- Keep registration alive for a while -->
-  <pause milliseconds="30000"/>
+  <pause milliseconds="3000"/>
 
   <!-- De-REGISTER (IPSec-protected) -->
   <send retrans="500">
