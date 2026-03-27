@@ -2581,6 +2581,19 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
     char *dest = msg_buffer;
     bool suppresscrlf = false;
 
+#ifdef USE_IPSEC
+    struct PortFixup {
+        int offset;
+        int len;
+        bool is_local;
+    };
+    static const int MAX_PORT_FIXUPS = 16;
+    PortFixup port_fixups[MAX_PORT_FIXUPS];
+    int num_port_fixups = 0;
+    int auth_marker_delta = 0;
+    int auth_marker_offset = -1;
+#endif
+
     bool srtp_audio_updated = false;
     bool srtp_video_updated = false;
 
@@ -2639,16 +2652,28 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
 #ifdef USE_IPSEC
             if (ipsec_params.state >= IPSEC_STATE_ACTIVE && ipsec_params.port_ps != 0) {
                 dest += snprintf(dest, left, "%d", ipsec_params.port_ps + comp->offset);
-            } else
-#endif
+            } else {
+                if (ipsec_enabled && num_port_fixups < MAX_PORT_FIXUPS) {
+                    port_fixups[num_port_fixups].offset = dest - msg_buffer;
+                    port_fixups[num_port_fixups].is_local = false;
+                }
+                int written = snprintf(dest, left, "%d", remote_port + comp->offset);
+                if (ipsec_enabled && num_port_fixups < MAX_PORT_FIXUPS) {
+                    port_fixups[num_port_fixups].len = written;
+                    num_port_fixups++;
+                }
+                dest += written;
+            }
+#else
             {
                 dest += snprintf(dest, left, "%d", remote_port + comp->offset);
             }
+#endif
             break;
         case E_Message_Local_IP:
             dest += snprintf(dest, left, "%s", local_ip_w_brackets);
             break;
-        case E_Message_Local_Port:
+        case E_Message_Local_Port: {
             int port;
 #ifdef USE_IPSEC
             if (ipsec_params.state >= IPSEC_STATE_ACTIVE && ipsec_params.port_uc != 0) {
@@ -2660,8 +2685,24 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             } else {
                 port = local_port;
             }
-            dest += snprintf(dest, left, "%d", port + comp->offset);
+#ifdef USE_IPSEC
+            if (ipsec_enabled && ipsec_params.state < IPSEC_STATE_ACTIVE
+                    && num_port_fixups < MAX_PORT_FIXUPS) {
+                port_fixups[num_port_fixups].offset = dest - msg_buffer;
+                port_fixups[num_port_fixups].is_local = true;
+            }
+#endif
+            int written = snprintf(dest, left, "%d", port + comp->offset);
+#ifdef USE_IPSEC
+            if (ipsec_enabled && ipsec_params.state < IPSEC_STATE_ACTIVE
+                    && num_port_fixups < MAX_PORT_FIXUPS) {
+                port_fixups[num_port_fixups].len = written;
+                num_port_fixups++;
+            }
+#endif
+            dest += written;
             break;
+        }
         case E_Message_Transport:
             dest += snprintf(dest, left, "%s", TRANSPORT_TO_STRING(transport));
             break;
@@ -4142,7 +4183,49 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         if (msgLen) {
             *msgLen += (authlen -  auth_marker_len);
         }
+#ifdef USE_IPSEC
+        auth_marker_offset = auth_marker - msg_buffer;
+        auth_marker_delta = authlen - auth_marker_len;
+#endif
     }
+
+#ifdef USE_IPSEC
+    /*
+     * If IPSec was just activated by the [authentication] block above,
+     * the [local_port] and [remote_port] expansions in the message still
+     * contain the pre-IPSec values (e.g. 5060).  Patch them in-place
+     * with the correct IPSec ports.  Process back-to-front so earlier
+     * offsets remain valid after each replacement.
+     */
+    if (ipsec_params.state >= IPSEC_STATE_ACTIVE && num_port_fixups > 0) {
+        for (int i = num_port_fixups - 1; i >= 0; i--) {
+            char new_port_str[8];
+            int new_port = port_fixups[i].is_local
+                ? ipsec_params.port_uc
+                : ipsec_params.port_ps;
+            int new_len = snprintf(new_port_str, sizeof(new_port_str), "%d", new_port);
+
+            int adj_offset = port_fixups[i].offset;
+            if (auth_marker_offset >= 0 && adj_offset > auth_marker_offset) {
+                adj_offset += auth_marker_delta;
+            }
+
+            int old_len = port_fixups[i].len;
+            int delta = new_len - old_len;
+
+            if (delta != 0) {
+                memmove(msg_buffer + adj_offset + new_len,
+                        msg_buffer + adj_offset + old_len,
+                        strlen(msg_buffer + adj_offset + old_len) + 1);
+            }
+            memcpy(msg_buffer + adj_offset, new_port_str, new_len);
+
+            if (msgLen) {
+                *msgLen += delta;
+            }
+        }
+    }
+#endif
 
     if (auth_comp_allocated) {
         SendingMessage::freeMessageComponent(auth_comp);
