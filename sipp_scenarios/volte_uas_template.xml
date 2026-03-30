@@ -108,7 +108,8 @@
   <!-- ================================================================== -->
 
   <!-- ===== Receive INVITE ===== -->
-  <recv request="INVITE" crlf="true">
+  <!-- rrs="true" captures Record-Route so responses echo it back (RFC 3261 §12.1.1) -->
+  <recv request="INVITE" crlf="true" rrs="true">
     <action>
       <exec rtp_echo="true"/>
     </action>
@@ -138,6 +139,7 @@
 
       SIP/2.0 180 Ringing
       [last_Via:]
+      [last_Record-Route:]
       [last_From:]
       To: [last_To:];tag=[call_number]
       [last_Call-ID:]
@@ -158,6 +160,7 @@
 
       SIP/2.0 200 OK
       [last_Via:]
+      [last_Record-Route:]
       [last_From:]
       To: [last_To:];tag=[call_number]
       [last_Call-ID:]

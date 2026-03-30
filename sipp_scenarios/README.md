@@ -24,8 +24,15 @@ UE                          P-CSCF / IMS
  |                               |
  |   [Store Service-Route]       |
  |                               |
- |--- INVITE / SUBSCRIBE ------->|   Route: <Service-Route value>
- |   ...call/service flow...     |
+ |--- INVITE ------------------->|   Route: <Service-Route value>
+ |<-- 200 OK --------------------|   Record-Route: <sip:scscf;lr>,<sip:pcscf;lr>
+ |                               |
+ |   [Build dialog route set     |
+ |    from Record-Route]         |
+ |                               |
+ |--- ACK ---------------------->|   Route: <Record-Route set (reversed)>
+ |   ...media...                 |
+ |--- BYE ---------------------->|   Route: <Record-Route set (reversed)>
  |                               |
  |--- REGISTER (Expires: 0) ---->|   De-registration
  |<-- 200 OK --------------------|
@@ -33,9 +40,13 @@ UE                          P-CSCF / IMS
 ```
 
 The `Service-Route` header returned in the REGISTER 200 OK is extracted
-and used as a preloaded `Route` header in all subsequent originated
-requests (INVITE, PRACK, ACK, BYE, SUBSCRIBE, etc.), per RFC 3608
-Section 6.1.
+and used as a preloaded `Route` header in the initial INVITE, per
+RFC 3608 Section 6.1. Once the INVITE dialog is established, in-dialog
+requests (ACK, BYE) use the `Record-Route` set from the INVITE 200 OK
+response instead, per RFC 3261 Section 12.1.2. SIPp's `rrs="true"`
+attribute on `<recv>` captures the Record-Route headers, and the
+`[routes]` keyword expands to the reversed route set in subsequent
+`<send>` steps.
 
 ## Scenarios
 
@@ -172,6 +183,7 @@ This directory also contains non-VoLTE scenarios:
 
 ## References
 
+- [RFC 3261 -- SIP: Session Initiation Protocol](https://datatracker.ietf.org/doc/html/rfc3261) (Section 12.1.2: dialog route set from Record-Route)
 - [RFC 3608 -- Service-Route Discovery During Registration](https://datatracker.ietf.org/doc/html/rfc3608)
 - [RFC 3329 -- Security Mechanism Agreement for SIP](https://datatracker.ietf.org/doc/html/rfc3329)
 - [3GPP TS 33.203 -- Access security for IP-based services](https://www.3gpp.org/DynaReport/33203.htm)

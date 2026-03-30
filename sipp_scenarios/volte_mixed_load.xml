@@ -176,7 +176,7 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -194,7 +194,7 @@ a=sendrecv
 
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -244,7 +244,7 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -262,7 +262,7 @@ a=sendrecv
 
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]

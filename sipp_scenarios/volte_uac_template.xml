@@ -91,7 +91,8 @@
 
   <!-- 200 OK for REGISTER — IPsec tunnel is now established -->
   <!-- Extract Service-Route per RFC 3608 for use as preloaded Route in
-       subsequent originated requests (INVITE, PRACK, ACK, BYE). -->
+       the initial INVITE. In-dialog requests (ACK, BYE) use the
+       Record-Route set from the INVITE 200 OK instead (RFC 3261 §12.1.2). -->
   <recv response="200">
     <action>
       <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
@@ -146,7 +147,8 @@ __SDP_OFFER__
   <recv response="180" optional="true"/>
 
   <!-- ===== 200 OK for INVITE — direct path (no PRACK) ===== -->
-  <recv response="200" rtd="true">
+  <!-- rrs="true" captures Record-Route for dialog route set (RFC 3261 §12.1.2) -->
+  <recv response="200" rrs="true" rtd="true">
     <action>
       <ereg regexp=".*" search_in="hdr" header="To:" check_it="true" assign_to="peer_to" />
     </action>
@@ -156,9 +158,9 @@ __SDP_OFFER__
   <send>
     <![CDATA[
 
-      ACK sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
+      ACK [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
@@ -185,9 +187,9 @@ __SDP_OFFER__
   <send retrans="500">
     <![CDATA[
 
-      BYE sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
+      BYE [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
@@ -217,7 +219,7 @@ __SDP_OFFER__
   <send retrans="500">
     <![CDATA[
 
-      PRACK sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
+      PRACK [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
@@ -239,7 +241,8 @@ __SDP_OFFER__
   <recv response="180" optional="true"/>
 
   <!-- Final 200 OK for INVITE (PRACK path) -->
-  <recv response="200" rtd="true">
+  <!-- rrs="true" captures Record-Route for dialog route set (RFC 3261 §12.1.2) -->
+  <recv response="200" rrs="true" rtd="true">
     <action>
       <ereg regexp=".*" search_in="hdr" header="To:" check_it="true" assign_to="peer_to" />
     </action>
@@ -249,9 +252,9 @@ __SDP_OFFER__
   <send>
     <![CDATA[
 
-      ACK sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
+      ACK [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
@@ -278,9 +281,9 @@ __SDP_OFFER__
   <send retrans="500">
     <![CDATA[
 
-      BYE sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
+      BYE [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]

@@ -161,7 +161,8 @@ a=sendrecv
   <recv response="183" optional="true"/>
 
   <!-- ===== Any final response (2xx, 4xx, 5xx) is acceptable — we just CANCEL ===== -->
-  <recv response="200" optional="true" next="got_200"/>
+  <!-- rrs="true" captures Record-Route for dialog route set (RFC 3261 §12.1.2) -->
+  <recv response="200" rrs="true" optional="true" next="got_200"/>
   <recv response="486" optional="true" next="got_486"/>
   <recv response="480" optional="true" next="got_480"/>
 
@@ -211,7 +212,7 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -227,7 +228,7 @@ a=sendrecv
 
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [$service_route]
+      [routes]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
