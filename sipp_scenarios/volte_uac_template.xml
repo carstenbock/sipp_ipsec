@@ -114,7 +114,7 @@
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: <__TARGET_URI__>
-      Call-ID: [call_id]-inv
+      Call-ID: inv///[call_id]
       CSeq: 1 INVITE
       Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
       Accept: application/3gpp-ims+xml,application/sdp
@@ -161,7 +161,7 @@ __SDP_OFFER__
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
-      Call-ID: [call_id]-inv
+      Call-ID: inv///[call_id]
       CSeq: 1 ACK
       Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
       Max-Forwards: 70
@@ -190,7 +190,7 @@ __SDP_OFFER__
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
-      Call-ID: [call_id]-inv
+      Call-ID: inv///[call_id]
       CSeq: 2 BYE
       Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
@@ -222,7 +222,7 @@ __SDP_OFFER__
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [last_To]
-      Call-ID: [call_id]-inv
+      Call-ID: inv///[call_id]
       CSeq: 2 PRACK
       Max-Forwards: 70
       User-Agent: SIPp-VoLTE/1.0
@@ -254,7 +254,7 @@ __SDP_OFFER__
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
-      Call-ID: [call_id]-inv
+      Call-ID: inv///[call_id]
       CSeq: 1 ACK
       Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
       Max-Forwards: 70
@@ -283,7 +283,7 @@ __SDP_OFFER__
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
-      Call-ID: [call_id]-inv
+      Call-ID: inv///[call_id]
       CSeq: 3 BYE
       Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"

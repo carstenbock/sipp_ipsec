@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - IPSec protected ports (port-c, port-s) now use random ephemeral ports (32768-65535) instead of hardcoded 5060/5061
 
 ### Fixed
+- VoLTE scenarios: use `///` prefix instead of `-suffix` for multi-dialog Call-IDs so SIPp's listener lookup matches responses (fixes INVITE 200 OK and REGISTER responses silently discarded as out-of-call messages)
 - Create listening socket on UE server port (`port_us`) so P-CSCF responses per 3GPP TS 33.203 are received (fixes ICMP port unreachable)
 - `[local_port]` keyword now resolves to the IPSec client port (`port_uc`) when IPSec is active, so Via/Contact headers advertise the correct protected port
 - First IPSec-protected REGISTER (same `<send>` as `[authentication]`) now uses correct IPSec ports in Via/Contact/Route instead of the pre-activation port (e.g. 5060)

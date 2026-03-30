@@ -55,7 +55,7 @@
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[service]@[field2]>;tag=[call_number]
       To: <sip:[service]@[field2]>
-      Call-ID: [call_id]-reg
+      Call-ID: reg///[call_id]
       CSeq: 1 REGISTER
       Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       Supported: path, gruu, sec-agree
@@ -88,7 +88,7 @@
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[service]@[field2]>;tag=[call_number]
       To: <sip:[service]@[field2]>
-      Call-ID: [call_id]-reg
+      Call-ID: reg///[call_id]
       CSeq: 2 REGISTER
       Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       [authentication username=[service]@[field2]]
@@ -289,7 +289,7 @@ a=sendrecv
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[service]@[field2]>;tag=[call_number]
       To: <sip:[service]@[field2]>
-      Call-ID: [call_id]-reg
+      Call-ID: reg///[call_id]
       CSeq: 3 REGISTER
       Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=0
       [authentication username=[service]@[field2]]
