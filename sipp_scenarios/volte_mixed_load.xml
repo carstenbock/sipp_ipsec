@@ -7,6 +7,14 @@
   CSV-driven composite scenario that runs multiple scenario types concurrently.
   Each CSV row defines one call attempt with its parameters.
 
+  Flow:
+    1. IMS REGISTER with IPSec sec-agree (401 challenge -> AKA -> IPSec SA)
+    2. Extract Service-Route from 200 OK per RFC 3608
+    3. INVITE over the IPSec tunnel using Service-Route as preloaded Route
+    4. Media exchange (play_pcap_audio)
+    5. BYE
+    6. De-REGISTER (Expires: 0) + IPSec teardown
+
   CSV format (no header, fields 0-7):
     [scenario],[target_uri],[domain],[calling_msisdn],[ue_codec_pt],[gw_codec_pt],[call_duration_ms],[imsi]
 
@@ -14,14 +22,15 @@
     ue_to_gw,tel:+4989200011251,ims.mnc001.mcc001.3gppnetwork.org,494034927217,116,9,8000,001019999900001
 
   Scenarios dispatched via field0:
-    ue_to_gw    →  MO call from UE to GW (uses volte_uac_template.xml logic inline)
-    gw_to_ue    →  MT call to UE (uses volte_uas_template.xml logic inline)
-    register    →  Registration cycle
+    ue_to_gw    ->  MO call from UE to GW (uses volte_uac_template.xml logic inline)
+    gw_to_ue    ->  MT call to UE (uses volte_uas_template.xml logic inline)
+    register    ->  Registration cycle
 
   Usage:
     sudo ./sipp -sf volte_mixed_load.xml \
       -ipsec \
       -inf mixed_load.csv \
+      -s <imsi> \
       -au <imsi> -ap <password> \
       -key aka_K <hex_K> -key aka_OP <hex_OP> -key aka_AMF <hex_AMF> \
       -l 100 -r 5 \
@@ -33,13 +42,89 @@
 
 <scenario name="VoLTE Mixed Load">
 
-  <!-- ===== INVITE (MO call path) ===== -->
+  <!-- ================================================================== -->
+  <!-- Phase 1: IMS REGISTER with IPSec sec-agree                         -->
+  <!-- ================================================================== -->
+
+  <!-- Initial REGISTER (unprotected) with Security-Client -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[field2] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[field2]>;tag=[call_number]
+      To: <sip:[service]@[field2]>
+      Call-ID: [call_id]-reg
+      CSeq: 1 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Authorization: Digest username="[service]@[field2]",realm="[field2]",uri="sip:[field2]",nonce="",response=""
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 401 Unauthorized with AKA challenge + Security-Server -->
+  <recv response="401" auth="true">
+    <action>
+      <ipsec_setup />
+    </action>
+  </recv>
+
+  <!-- Re-REGISTER over IPSec -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[field2] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[field2]>;tag=[call_number]
+      To: <sip:[service]@[field2]>
+      Call-ID: [call_id]-reg
+      CSeq: 2 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[service]@[field2]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 200 OK — extract Service-Route per RFC 3608 -->
+  <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
+  </recv>
+
+  <pause milliseconds="500"/>
+
+  <!-- ================================================================== -->
+  <!-- Phase 2: INVITE (MO call path)                                     -->
+  <!-- ================================================================== -->
+
   <send retrans="500">
     <![CDATA[
 
       INVITE [field1] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: <sip:[remote_ip]:[remote_port];lr>
+      Route: [$service_route]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: <[field1]>
       Call-ID: [call_id]
@@ -91,7 +176,7 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [route_header]
+      Route: [$service_route]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -109,7 +194,7 @@ a=sendrecv
 
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [route_header]
+      Route: [$service_route]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -123,6 +208,8 @@ a=sendrecv
 
   <recv response="200"/>
 
+  <nop next="deregister"/>
+
   <!-- ===== PRACK path ===== -->
   <label id="mixed_prack"/>
 
@@ -131,7 +218,7 @@ a=sendrecv
 
       PRACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [route_header]
+      Route: [$service_route]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -157,7 +244,7 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [route_header]
+      Route: [$service_route]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -175,7 +262,7 @@ a=sendrecv
 
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [route_header]
+      Route: [$service_route]
       From: <sip:[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
@@ -188,6 +275,43 @@ a=sendrecv
   </send>
 
   <recv response="200"/>
+
+  <!-- ================================================================== -->
+  <!-- Phase 3: De-REGISTER (Expires: 0) + IPSec teardown                 -->
+  <!-- ================================================================== -->
+  <label id="deregister"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[field2] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[field2]>;tag=[call_number]
+      To: <sip:[service]@[field2]>
+      Call-ID: [call_id]-reg
+      CSeq: 3 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=0
+      [authentication username=[service]@[field2]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200">
+    <action>
+      <ipsec_teardown />
+    </action>
+  </recv>
 
   <ResponseTimeRepartition value="100, 200, 300, 500, 1000, 2000, 5000"/>
   <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000"/>

@@ -4,22 +4,27 @@
 <!--
   VoLTE Routing Probe (SBC Routing Validation)
 
-  Sends an INVITE to an arbitrary target number to verify SBC routing rules.
-  Does NOT establish a media session — validates only the signaling path.
+  Full IMS flow:
+    1. REGISTER with IPSec sec-agree (401 challenge -> AKA -> IPSec SA)
+    2. Extract Service-Route from 200 OK per RFC 3608
+    3. INVITE to an arbitrary target number using Service-Route as preloaded Route
+    4. Validate signaling path (does NOT establish a media session)
+    5. De-REGISTER (Expires: 0) + IPSec teardown
 
   Expected outcomes:
-    - 1xx / 2xx  →  PASS  (route exists and is reachable)
-    - 404        →  FAIL  (no matching route for this number)
-    - 403 / 503  →  FAIL  (route exists but is blocked / unavailable)
-    - 486 / 480  →  PASS  (target busy/unavailable — signaling path works)
+    - 1xx / 2xx  ->  PASS  (route exists and is reachable)
+    - 404        ->  FAIL  (no matching route for this number)
+    - 403 / 503  ->  FAIL  (route exists but is blocked / unavailable)
+    - 486 / 480  ->  PASS  (target busy/unavailable — signaling path works)
 
   The test-runner configures expected_response per scenario (default: any 1xx or 2xx).
 
   Usage:
     sudo ./sipp -sf volte_routing_probe.xml \
       -ipsec \
-      -s <calling_msisdn> \
+      -s <imsi> \
       -key domain ims.mnc001.mcc001.3gppnetwork.org \
+      -key msisdn <calling_msisdn> \
       -key target_number "+4989200011251" \
       -key target_uri "tel:+4989200011251" \
       -au <imsi> -ap <password> \
@@ -32,22 +37,98 @@
 
 <scenario name="VoLTE Routing Probe">
 
-  <!-- ===== INVITE to target number ===== -->
+  <!-- ================================================================== -->
+  <!-- Phase 1: IMS REGISTER with IPSec sec-agree                         -->
+  <!-- ================================================================== -->
+
+  <!-- Initial REGISTER (unprotected) with Security-Client -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]-reg
+      CSeq: 1 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Authorization: Digest username="[service]@[key:domain]",realm="[key:domain]",uri="sip:[key:domain]",nonce="",response=""
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 401 Unauthorized with AKA challenge + Security-Server -->
+  <recv response="401" auth="true">
+    <action>
+      <ipsec_setup />
+    </action>
+  </recv>
+
+  <!-- Re-REGISTER over IPSec -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]-reg
+      CSeq: 2 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[service]@[key:domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 200 OK — extract Service-Route per RFC 3608 -->
+  <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
+  </recv>
+
+  <pause milliseconds="500"/>
+
+  <!-- ================================================================== -->
+  <!-- Phase 2: INVITE to target number (routing probe)                   -->
+  <!-- ================================================================== -->
+
   <send retrans="500">
     <![CDATA[
 
       INVITE [key:target_uri] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: <sip:[remote_ip]:[remote_port];lr>
-      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      Route: [$service_route]
+      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: <[key:target_uri]>
       Call-ID: [call_id]
       CSeq: 1 INVITE
-      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Contact: <sip:[key:msisdn]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
       Accept: application/3gpp-ims+xml,application/sdp
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-      P-Preferred-Identity: <sip:[service]@[key:domain]>
+      P-Preferred-Identity: <sip:[key:msisdn]@[key:domain]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
       P-Early-Media: supported
       Session-ID: [call_id]
@@ -90,8 +171,8 @@ a=sendrecv
 
       CANCEL [last_Request_URI] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: <sip:[remote_ip]:[remote_port];lr>
-      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      Route: [$service_route]
+      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: <[key:target_uri]>
       Call-ID: [call_id]
       CSeq: 1 CANCEL
@@ -109,7 +190,8 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      Route: [$service_route]
+      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK
@@ -119,6 +201,8 @@ a=sendrecv
     ]]>
   </send>
 
+  <nop next="deregister"/>
+
   <!-- ===== 200 OK path — ACK then immediately BYE ===== -->
   <label id="got_200"/>
 
@@ -127,8 +211,8 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [route_header]
-      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      Route: [$service_route]
+      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK
@@ -143,8 +227,8 @@ a=sendrecv
 
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      Route: [route_header]
-      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      Route: [$service_route]
+      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 2 BYE
@@ -157,7 +241,9 @@ a=sendrecv
 
   <recv response="200"/>
 
-  <!-- ===== 486 Busy Here — signaling path works, log as success ===== -->
+  <nop next="deregister"/>
+
+  <!-- ===== 486 Busy Here / 480 — signaling path works, log as success ===== -->
   <label id="got_486"/>
   <label id="got_480"/>
 
@@ -166,7 +252,8 @@ a=sendrecv
 
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
-      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      Route: [$service_route]
+      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK
@@ -175,6 +262,43 @@ a=sendrecv
 
     ]]>
   </send>
+
+  <!-- ================================================================== -->
+  <!-- Phase 3: De-REGISTER (Expires: 0) + IPSec teardown                 -->
+  <!-- ================================================================== -->
+  <label id="deregister"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[key:domain] SIP/2.0
+      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[service]@[key:domain]>;tag=[call_number]
+      To: <sip:[service]@[key:domain]>
+      Call-ID: [call_id]-reg
+      CSeq: 3 REGISTER
+      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=0
+      [authentication username=[service]@[key:domain]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoLTE/1.0
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200">
+    <action>
+      <ipsec_teardown />
+    </action>
+  </recv>
 
   <ResponseTimeRepartition value="100, 200, 500, 1000, 2000, 5000"/>
   <CallLengthRepartition value="100, 500, 1000, 5000"/>

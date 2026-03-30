@@ -19,6 +19,7 @@ Welcome to SIPp reference documentation!
    controlling
    transport
    ipsec
+   volte_scenarios
    media
    statistics
    error

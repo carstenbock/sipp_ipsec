@@ -97,7 +97,12 @@
   </send>
 
   <!-- Step 4: Receive 200 OK (IPSec-protected) -->
+  <!-- Extract Service-Route per RFC 3608 — the registrar returns the route
+       vector that the UA must use as a preloaded Route in originated requests. -->
   <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
   </recv>
 
   <!-- Keep registration alive for a while -->

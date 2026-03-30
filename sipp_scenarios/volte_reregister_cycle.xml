@@ -89,7 +89,12 @@
   </send>
 
   <!-- ===== Step 4: 200 OK for initial registration ===== -->
-  <recv response="200"/>
+  <!-- Extract Service-Route per RFC 3608 -->
+  <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
+  </recv>
 
   <!-- ===== Re-registration refresh loop ===== -->
   <!-- Pause to simulate time before re-registration (half the expiry) -->
@@ -156,7 +161,12 @@
     ]]>
   </send>
 
-  <recv response="200"/>
+  <!-- Update Service-Route in case the registrar changed it on refresh -->
+  <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
+  </recv>
 
   <!-- ===== De-REGISTER at end ===== -->
   <send retrans="500">

@@ -90,7 +90,12 @@
   </send>
 
   <!-- 200 OK for REGISTER — IPsec tunnel is now established -->
+  <!-- Extract Service-Route per RFC 3608 for use as preloaded Route in
+       subsequent originated requests (INVITE, PRACK, ACK, BYE). -->
   <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
   </recv>
 
   <!-- Small pause before INVITE (let registration propagate to S-CSCF) -->
@@ -106,6 +111,7 @@
 
       INVITE __TARGET_URI__ SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: <__TARGET_URI__>
       Call-ID: [call_id]-inv
@@ -152,6 +158,7 @@ __SDP_OFFER__
 
       ACK sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: [call_id]-inv
@@ -180,6 +187,7 @@ __SDP_OFFER__
 
       BYE sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: [call_id]-inv
@@ -211,6 +219,7 @@ __SDP_OFFER__
 
       PRACK sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]-inv
@@ -242,6 +251,7 @@ __SDP_OFFER__
 
       ACK sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: [call_id]-inv
@@ -270,6 +280,7 @@ __SDP_OFFER__
 
       BYE sip:__MSISDN__@[remote_ip]:[remote_port] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: [call_id]-inv
