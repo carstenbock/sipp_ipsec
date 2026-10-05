@@ -1216,6 +1216,9 @@ call::~call()
         ipsec_socket->close();
         ipsec_socket = nullptr;
     }
+    /* Only now are both protected ports unbound; releasing earlier would let
+     * the next call get a port that is still in use. */
+    IPSecManager::release_local_ports(ipsec_params);
 #endif
 
     if (use_tdmmap) {

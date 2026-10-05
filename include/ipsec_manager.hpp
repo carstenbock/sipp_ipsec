@@ -26,10 +26,6 @@
 #include <stdint.h>
 #include <string>
 
-/* Ephemeral port range for UE protected ports (matches Linux default) */
-#define IPSEC_EPHEMERAL_PORT_MIN  32768
-#define IPSEC_EPHEMERAL_PORT_MAX  65535
-
 /* IPSec negotiation state */
 enum IPSecState {
     IPSEC_STATE_IDLE = 0,
@@ -52,6 +48,8 @@ struct IPSecParams {
     uint32_t spi_us;            /* SPI for UE server (inbound to port_us) */
     uint16_t port_uc;           /* UE protected client port */
     uint16_t port_us;           /* UE protected server port */
+    bool     pooled_uc;         /* port_uc came from the port pool */
+    bool     pooled_us;         /* port_us came from the port pool */
 
     /* P-CSCF (remote) side -- filled from Security-Server header */
     uint32_t spi_pc;            /* SPI for P-CSCF client */
@@ -94,11 +92,18 @@ public:
      * Called before sending the initial REGISTER (to populate Security-Client).
      *
      * @param params  Output: filled with spi_uc, spi_us, port_uc, port_us
-     * @param port_c  Local client port to use (0 for random ephemeral)
-     * @param port_s  Local server port to use (0 for random ephemeral)
-     * @return 0 on success
+     * @param port_c  Local client port to use (0 to take one from the port pool)
+     * @param port_s  Local server port to use (0 to take one from the port pool)
+     * @return 0 on success, -1 when the port pool is exhausted
      */
     int allocate_local_params(IPSecParams &params, uint16_t port_c = 0, uint16_t port_s = 0);
+
+    /**
+     * Return pooled ports to the port pool. Static because the call deletes its
+     * IPSecManager in ipsec_teardown_sas(), before its sockets are closed.
+     * Call only after both protected sockets are closed.
+     */
+    static void release_local_ports(IPSecParams &params);
 
     /**
      * Set the crypto keys derived from AKA authentication.

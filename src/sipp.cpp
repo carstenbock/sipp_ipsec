@@ -248,6 +248,10 @@ struct sipp_option options_table[] = {
      "Supported: hmac-sha-1-96, hmac-md5-96", SIPP_OPTION_STRING, &ipsec_aalg, 1},
     {"ipsec_ealg", "Set the IPSec encryption algorithm. Default is 'aes-cbc'.\n"
      "Supported: aes-cbc, des-ede3-cbc, null", SIPP_OPTION_STRING, &ipsec_ealg, 1},
+    {"ipsec_port_min", "Set the lowest UE protected port (port-c/port-s). Default is 32768.\n"
+     "Each concurrent UE uses two ports, so the range caps UEs per source IP.\n"
+     "Keep it clear of net.ipv4.ip_local_port_range.", SIPP_OPTION_INT, &ipsec_port_min, 1},
+    {"ipsec_port_max", "Set the highest UE protected port (port-c/port-s). Default is 65535.", SIPP_OPTION_INT, &ipsec_port_max, 1},
 #endif
     {"s", "Set the username part of the request URI. Default is 'service'.", SIPP_OPTION_STRING, &service, 1},
     {"default_behaviors", "Set the default behaviors that SIPp will use.  Possible values are:\n"

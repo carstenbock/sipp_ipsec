@@ -20,6 +20,7 @@
 
 #include "sipp.hpp"
 #include "ipsec_manager.hpp"
+#include "ipsec_port_pool.hpp"
 #include "xfrm_netlink.hpp"
 
 #include <cstring>
@@ -64,14 +65,20 @@ uint32_t IPSecManager::generate_spi()
     return (uint32_t)(rand() % 0xFFFF0000) + 256;
 }
 
-static uint16_t generate_ephemeral_port()
+/* One pool per process: all calls of this SIPp instance share the source IP
+ * set by -i, so their protected ports must not overlap. */
+static IPSecPortPool *port_pool = nullptr;
+
+static IPSecPortPool &ipsec_port_pool()
 {
-    if (!spi_seeded) {
-        srand(time(nullptr) ^ getpid());
-        spi_seeded = true;
+    if (!port_pool) {
+        if (ipsec_port_min < 1 || ipsec_port_max > 65535 || ipsec_port_min >= ipsec_port_max) {
+            ERROR("Invalid IPSec port range %d-%d (need 1 <= ipsec_port_min < ipsec_port_max <= 65535)",
+                  ipsec_port_min, ipsec_port_max);
+        }
+        port_pool = new IPSecPortPool((uint16_t)ipsec_port_min, (uint16_t)ipsec_port_max);
     }
-    uint16_t range = IPSEC_EPHEMERAL_PORT_MAX - IPSEC_EPHEMERAL_PORT_MIN + 1;
-    return (uint16_t)(IPSEC_EPHEMERAL_PORT_MIN + (rand() % range));
+    return *port_pool;
 }
 
 int IPSecManager::allocate_local_params(IPSecParams &params, uint16_t port_c, uint16_t port_s)
@@ -88,15 +95,22 @@ int IPSecManager::allocate_local_params(IPSecParams &params, uint16_t port_c, ui
     if (port_c != 0) {
         params.port_uc = port_c;
     } else {
-        params.port_uc = generate_ephemeral_port();
+        params.port_uc = ipsec_port_pool().acquire();
+        params.pooled_uc = true;
     }
 
     if (port_s != 0) {
         params.port_us = port_s;
     } else {
-        params.port_us = generate_ephemeral_port();
-        while (params.port_us == params.port_uc)
-            params.port_us = generate_ephemeral_port();
+        params.port_us = ipsec_port_pool().acquire();
+        params.pooled_us = true;
+    }
+
+    if (params.port_uc == 0 || params.port_us == 0) {
+        WARNING("IPSec port pool %d-%d exhausted (%zu ports in use)",
+                ipsec_port_min, ipsec_port_max, ipsec_port_pool().in_use());
+        release_local_ports(params);
+        return -1;
     }
 
     /* Set default algorithms */
@@ -105,6 +119,16 @@ int IPSecManager::allocate_local_params(IPSecParams &params, uint16_t port_c, ui
 
     params.state = IPSEC_STATE_PARAMS_ALLOCATED;
     return 0;
+}
+
+void IPSecManager::release_local_ports(IPSecParams &params)
+{
+    if (params.pooled_uc && params.port_uc != 0)
+        ipsec_port_pool().release(params.port_uc);
+    if (params.pooled_us && params.port_us != 0)
+        ipsec_port_pool().release(params.port_us);
+    params.pooled_uc = false;
+    params.pooled_us = false;
 }
 
 void IPSecManager::set_keys(IPSecParams &params, const unsigned char *ck, const unsigned char *ik)

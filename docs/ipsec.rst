@@ -70,6 +70,16 @@ Command-line options
     - ``des-ede3-cbc``
     - ``null`` (no encryption, integrity only)
 
+``-ipsec_port_min <port>`` / ``-ipsec_port_max <port>``
+    Range for the UE protected ports (port-c, port-s). Default is
+    ``32768``-``65535``. Each concurrent UE takes two ports from a
+    per-process pool and returns them when its call ends, so the range
+    caps the number of UEs one SIPp process can register from its
+    source IP (half the range size). Processes sharing one source IP
+    need disjoint ranges, and the range should not overlap
+    ``net.ipv4.ip_local_port_range``, or the kernel may hand one of
+    these ports to another socket first.
+
 
 Scenario keywords
 `````````````````

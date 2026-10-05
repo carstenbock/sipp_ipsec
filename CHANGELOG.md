@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `-ipsec_port_min` / `-ipsec_port_max` set the range for UE protected ports (port-c/port-s, TS 33.203); each concurrent UE uses two ports, so the range caps UEs per source IP (default 32768-65535)
 - RFC 3608 Service-Route extraction in all VoLTE scenarios: `Service-Route` from REGISTER 200 OK is captured and used as preloaded `Route` in subsequent originated requests (INVITE, PRACK, ACK, BYE)
 - Full IMS REGISTER/401/IPSec/REGISTER/200 phase added to `volte_uas_template.xml`, `volte_mixed_load.xml`, and `volte_routing_probe.xml` (previously started without registration)
 - De-REGISTER (`Expires: 0`) + `ipsec_teardown` appended to `volte_uas_template.xml`, `volte_mixed_load.xml`, and `volte_routing_probe.xml`
@@ -25,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - IPSec protected ports (port-c, port-s) now use random ephemeral ports (32768-65535) instead of hardcoded 5060/5061
 
 ### Fixed
+- IPSec protected ports are taken from a per-process pool and returned when the call ends, instead of drawn at random with no in-use check; two UEs on one source IP could get the same port and the second UE's protected socket failed to bind (a generator-side failure from a few hundred UEs per IP upward)
 - VoLTE scenarios: in-dialog requests (ACK, BYE) now use the Record-Route set from INVITE responses (`rrs="true"` + `[routes]`) instead of the Service-Route from registration, per RFC 3261 §12.1.2; Request-URI uses `[next_url]` (remote Contact) instead of hardcoded addresses; UAS template echoes `[last_Record-Route:]` in 180/200 responses
 - VoLTE scenarios: use `///` prefix instead of `-suffix` for multi-dialog Call-IDs so SIPp's listener lookup matches responses (fixes INVITE 200 OK and REGISTER responses silently discarded as out-of-call messages)
 - Create listening socket on UE server port (`port_us`) so P-CSCF responses per 3GPP TS 33.203 are received (fixes ICMP port unreachable)
