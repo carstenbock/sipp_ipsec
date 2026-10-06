@@ -1213,6 +1213,13 @@ call::~call()
         ipsec_server_socket = nullptr;
     }
     if (ipsec_socket) {
+        /* The protected client socket is also this call's call_socket (see
+         * ipsec_rebind_socket()). Give it up here, or ~socketowner() closes
+         * the socket a second time after this close() has deleted it, which
+         * corrupted the heap as soon as the first IPSec call ended. */
+        if (ipsec_socket == call_socket) {
+            dissociate_socket();
+        }
         ipsec_socket->close();
         ipsec_socket = nullptr;
     }
@@ -7205,9 +7212,11 @@ int call::ipsec_rebind_socket()
     if (call_socket && call_socket->ss_port == ipsec_params.port_uc) {
         ipsec_socket = call_socket;
     } else {
-        /* Need a new socket on a different port */
+        /* Need a new socket on a different port. Dissociate first: closing
+         * alone left this call in the old socket's owner list, a dangling
+         * pointer once the call is gone. */
         if (call_socket) {
-            call_socket->close();
+            dissociate_socket()->close();
         }
 
         ipsec_socket = SIPpSocket::new_sipp_ipsec_socket(

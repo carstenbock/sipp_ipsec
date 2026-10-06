@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - IPSec protected ports (port-c, port-s) now use random ephemeral ports (32768-65535) instead of hardcoded 5060/5061
 
 ### Fixed
+- IPSec: a call's protected client socket was closed twice when the call ended (once by `~call`, once by `~socketowner`, after the first close had deleted it), which aborted SIPp with `malloc(): unaligned tcache chunk detected` as soon as the first IPSec call failed or de-registered. The call now gives the socket up before closing it, and the switch to the protected socket removes the call from the old socket's owner list
 - IPSec protected ports are taken from a per-process pool and returned when the call ends, instead of drawn at random with no in-use check; two UEs on one source IP could get the same port and the second UE's protected socket failed to bind (a generator-side failure from a few hundred UEs per IP upward)
 - VoLTE scenarios: in-dialog requests (ACK, BYE) now use the Record-Route set from INVITE responses (`rrs="true"` + `[routes]`) instead of the Service-Route from registration, per RFC 3261 §12.1.2; Request-URI uses `[next_url]` (remote Contact) instead of hardcoded addresses; UAS template echoes `[last_Record-Route:]` in 180/200 responses
 - VoLTE scenarios: use `///` prefix instead of `-suffix` for multi-dialog Call-IDs so SIPp's listener lookup matches responses (fixes INVITE 200 OK and REGISTER responses silently discarded as out-of-call messages)
