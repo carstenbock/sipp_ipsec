@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!-- The HSS cancels the location while the UE has its PDN connection: the
+     scenario waits for the Cancel Location Request and detaches the UE, as
+     an MME does. No Purge UE after a cancellation. -->
+<scenario name="S6a cancel location">
+  <nop><action><s6a_auth imsi="[field0]"/></action></nop>
+  <nop><action><s6a_update_location/></action></nop>
+  <nop><action><s8_create_session imsi="[field0]" msisdn="[s6a_msisdn]" apn="ims"/></action></nop>
+  <nop><action><s6a_wait_cancel timeout="TIMEOUT" assign_to="type"/></action></nop>
+  <nop><action><log message="cancelled, Cancellation-Type [$type]"/></action></nop>
+  <nop><action><s8_delete_session/></action></nop>
+</scenario>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!-- The HSS refuses the location update: roaming not allowed (5004). With
+     EXPECT = 5004 the call passes, with the default (2001) it fails. No PDN
+     connection is opened in either case. -->
+<scenario name="S6a roaming not allowed">
+  <nop><action><s6a_auth imsi="[field0]"/></action></nop>
+  <nop><action><s6a_update_location expect="EXPECT" assign_to="rc"/></action></nop>
+  <nop><action><log message="ULR result [$rc] / [s6a_result]"/></action></nop>
+</scenario>

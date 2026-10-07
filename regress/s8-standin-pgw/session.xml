@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="S8 loopback test">
+  <nop><action><s8_create_session imsi="[field0]" msisdn="[field1]" apn="[field2]" tac="4660" eci="0x15ee001" assign_to="cause"/></action></nop>
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:test.invalid SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@test.invalid>;tag=[call_number]
+      To: <sip:[field0]@test.invalid>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      X-Info: cause=[$cause] s8_cause=[s8_cause] pgw_c=[s8_pgw_c_ip]/[s8_pgw_c_teid] pgw_u=[s8_pgw_u_ip]/[s8_pgw_u_teid] pcscf=[remote_ip]
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200"/>
+  <nop><action><s8_delete_session/></action></nop>
+</scenario>

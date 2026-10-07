@@ -99,6 +99,15 @@ public:
         E_AT_SWU_ATTACH,
         E_AT_SWU_DETACH,
 #endif
+#ifdef USE_S8
+        E_AT_S8_CREATE_SESSION,
+        E_AT_S8_DELETE_SESSION,
+        E_AT_S8_WAIT_BEARER,
+        E_AT_S6A_AUTH,
+        E_AT_S6A_UPDATE_LOCATION,
+        E_AT_S6A_PURGE,
+        E_AT_S6A_WAIT_CANCEL,
+#endif
         E_AT_NB_ACTION
     };
 

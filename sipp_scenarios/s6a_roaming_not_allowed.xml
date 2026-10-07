@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  S8 home-routed roaming: the home HSS refuses a roaming UE (3GPP TS 29.272
+  clauses 5.2.3.1.3 and 5.2.1.1.3, DIAMETER_ERROR_ROAMING_NOT_ALLOWED)
+
+  SIPp is the visited network's MME. Each call is one UE that must NOT get
+  service in the visited PLMN given with -visited_plmn:
+    1. Authentication-Information-Request. An HSS may refuse here already.
+    2. Otherwise Update-Location-Request, which has to be refused.
+  The call passes when the HSS answers 5004 to one of them, and fails on
+  success or on any other result. No PDN connection is opened and nothing
+  is sent to the PGW or the P-CSCF.
+
+  Usage:
+    ./sipp -sf s6a_roaming_not_allowed.xml \
+      -s6a_peer <dra_or_hss> -s6a_dest_realm epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
+      -visited_plmn 00101 -t un -inf barred.csv <any address>
+
+  barred.csv, one UE per line:  <imsi>
+  The same scenario with another PLMN in -visited_plmn shows that the
+  refusal depends on the visited network. S6a alone needs no privileges.
+-->
+
+<scenario name="S8HR roaming not allowed">
+
+  <nop>
+    <action>
+      <s6a_auth imsi="[field0]" expect="any" assign_to="air"/>
+    </action>
+  </nop>
+  <nop>
+    <action>
+      <test assign_to="refused_at_air" variable="air" compare="equal" value="5004"/>
+    </action>
+  </nop>
+  <nop next="refused" test="refused_at_air"/>
+
+  <!-- Authenticated: the refusal has to come with the location update.
+       expect="5004" fails the call on anything else, success included. -->
+  <nop>
+    <action>
+      <s6a_update_location expect="5004"/>
+    </action>
+  </nop>
+
+  <label id="refused"/>
+  <nop>
+    <action>
+      <log message="S6a [field0]: roaming not allowed (AIR [$air], last result [s6a_result])"/>
+    </action>
+  </nop>
+
+</scenario>

@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  S8 home-routed roaming: IMS registration of a roaming UE (3GPP TS 23.401,
+  TS 29.274, TS 29.281, TS 33.203)
+
+  SIPp plays the visited network's SGW (and the UE behind it) toward the
+  home PGW. Each call is one roaming UE:
+    0. Create Session Request to the home PGW (default bearer, QCI 5, APN
+       "ims"); the PGW assigns the UE address and names the P-CSCF
+    1. Initial REGISTER (unprotected), as UE IP packets inside GTP-U
+    2. 401 with AKA challenge + Security-Server
+    3. REGISTER over the IMS IPSec SAs, still inside GTP-U
+    4. 200 OK, pause, de-REGISTER, 200 OK
+    5. Delete Session Request
+
+  Usage:
+    sudo ./sipp -sf s8hr_register.xml \
+      -s8_pgw <pgw_c_ip> -s8_local_ip <our_s8_ip> -visited_plmn 00101 \
+      -ipsec -t un -inf users.csv \
+      -key domain ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
+      -key tac 1 -key eci 0x15ee001 \
+      -key cell_id 00101000115ee001 \
+      <pcscf_ip>:5060
+
+  users.csv, one UE per line:  <imsi>;<K hex>;<OPc hex>;<MSISDN>
+  <pcscf_ip> is only used when the PGW names no P-CSCF; the port always applies.
+  cell_id is the P-Access-Network-Info value: PLMN, TAC (4 hex digits) and
+  ECI (7 hex digits), matching -visited_plmn, tac and eci.
+  Requires root or CAP_NET_ADMIN, and /dev/net/tun.
+-->
+
+<scenario name="S8HR IMS Registration via the home PGW">
+
+  <!-- Step 0: S8 Create Session. The call waits here until the PGW has
+       answered; from then on [local_ip] is the UE address it assigned and
+       [remote_ip] the P-CSCF from its PCO. Any cause but 16 fails the call. -->
+  <nop>
+    <action>
+      <s8_create_session imsi="[field0]" msisdn="[field3]" apn="ims" tac="[tac]" eci="[eci]"/>
+    </action>
+  </nop>
+
+  <!-- Step 1: Initial REGISTER (unprotected) with Security-Client -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[field0]@[domain]>;tag=[call_number]
+      To: <sip:[field0]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Authorization: Digest username="[field0]@[domain]",realm="[domain]",uri="sip:[domain]",nonce="",response=""
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-S8HR/1.0
+      Expires: 300
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Step 2: Receive 401 with AKA challenge + Security-Server -->
+  <!-- The auth="true" flag saves the WWW-Authenticate header.
+       The ipsec_setup action parses Security-Server and stores P-CSCF params.
+       Actual XFRM SA creation is deferred until [authentication] derives CK/IK. -->
+  <recv response="401" auth="true">
+    <action>
+      <ipsec_setup />
+    </action>
+  </recv>
+
+  <!-- Step 3: Re-REGISTER over IPSec-protected path -->
+  <!-- The [authentication] keyword runs AKA, derives CK/IK, then automatically
+       creates the XFRM SAs and rebinds the socket before this message is sent. -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[field0]@[domain]>;tag=[call_number]
+      To: <sip:[field0]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-S8HR/1.0
+      Expires: 300
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Step 4: Receive 200 OK (IPSec-protected) -->
+  <!-- Extract Service-Route per RFC 3608 — the registrar returns the route
+       vector that the UA must use as a preloaded Route in originated requests. -->
+  <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
+  </recv>
+
+  <!-- Keep registration alive for a while -->
+  <pause milliseconds="3000"/>
+
+  <!-- De-REGISTER (IPSec-protected) -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[field0]@[domain]>;tag=[call_number]
+      To: <sip:[field0]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 3 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=0
+      [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-S8HR/1.0
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Receive 200 OK for de-registration -->
+  <recv response="200">
+    <action>
+      <ipsec_teardown />
+    </action>
+  </recv>
+
+  <!-- Step 5: S8 Delete Session; the call waits for the PGW's answer -->
+  <nop>
+    <action>
+      <s8_delete_session/>
+    </action>
+  </nop>
+
+  <!-- service_route is captured for scenarios built on this one; SIPp
+       refuses to start when a variable is assigned but never used. -->
+  <Reference variables="service_route"/>
+
+  <!-- Definition of the response time repartition table (unit is ms) -->
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200"/>
+
+  <!-- Definition of the call length repartition table (unit is ms) -->
+  <CallLengthRepartition value="10, 50, 100, 500, 1000, 5000, 10000"/>
+
+</scenario>

@@ -2,40 +2,39 @@
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 
 <!--
-  VoWiFi MT call via an ePDG (3GPP TS 24.302, TS 33.203, TS 24.229)
+  S8 home-routed roaming: MT call to a roaming UE (3GPP TS 29.274,
+  TS 29.281, TS 33.203, TS 24.229; GSMA IR.65 / IR.88 S8HR)
 
-  Each call is one UE on untrusted WLAN access:
-    0. SWu attach to the ePDG (IKEv2, EAP-AKA' or EAP-AKA)
-    1. IMS registration with IPSec, nested inside the SWu tunnel
+  SIPp is the visited network's SGW toward the home PGW. Each call is one UE:
+    0. Create Session Request (default bearer, QCI 5, APN "ims")
+    1. IMS registration with IPSec, inside GTP-U
     2. Waits for an INVITE, answers it (100/180/200) with a PCMA SDP
-    3. Echoes the RTP it receives (-rtp_echo) from the UE's inner address
-    4. Answers the BYE, de-registers, SWu detach
+    3. The PGW's Create Bearer Request for the voice bearer (QCI 1) is
+       accepted; the RTP it receives is echoed (-rtp_echo) on that bearer
+    4. Answers the BYE, de-registers, Delete Session Request
 
   Usage:
-    sudo ./sipp -sf vowifi_uas.xml \
-      -swu_epdg <epdg_ip> -ipsec -t un -rtp_echo \
-      -inf callees.csv \
-      -key eap_prefix 6 \
+    sudo ./sipp -sf s8hr_uas.xml \
+      -s8_pgw <pgw_c_ip> -s8_local_ip <our_s8_ip> -visited_plmn 00101 \
+      -ipsec -t un -rtp_echo -inf callees.csv \
       -key domain ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
-      -key nai_realm nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
-      -key wlan_node_id 001122334455 \
+      -key tac 1 -key eci 0x15ee001 \
+      -key cell_id 00101000115ee001 \
       <pcscf_ip>:5060
 
   callees.csv, one UE per line:  <imsi>;<K hex>;<OPc hex>;<own MSISDN>
 
-  With -swu_epdg the RTP echo socket listens on every address and answers
+  With -s8_pgw the RTP echo socket listens on every address and answers
   from the one a packet arrived on, so all UEs share one media port, each on
-  its own inner address.
+  its own address.
 -->
 
-<scenario name="VoWiFi MT call via ePDG">
+<scenario name="S8HR MT call via the home PGW">
 
-  <!-- ================================================================== -->
-  <!-- Phase 0: SWu attach (see vowifi_register.xml / docs/swu.rst)        -->
-  <!-- ================================================================== -->
+  <!-- Step 0: S8 Create Session (see s8hr_register.xml / docs/s8hr.rst) -->
   <nop>
     <action>
-      <swu_attach identity="[eap_prefix][field0]@[nai_realm]" k="[field1]" opc="[field2]" apn="ims"/>
+      <s8_create_session imsi="[field0]" msisdn="[field3]" apn="ims" tac="[tac]" eci="[eci]"/>
     </action>
   </nop>
 
@@ -62,7 +61,7 @@
       Authorization: Digest username="[field0]@[domain]",realm="[domain]",uri="sip:[domain]",nonce="",response=""
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Expires: 600000
       Content-Length: 0
 
@@ -96,7 +95,7 @@
       Security-Verify: [security_verify]
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Expires: 600000
       Content-Length: 0
 
@@ -171,7 +170,7 @@
       Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
       Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
       Supported: 100rel,path,precondition,replaces,timer
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Content-Type: application/sdp
       Content-Length: [len]
 
@@ -192,6 +191,22 @@
 
   <!-- ===== Receive ACK ===== -->
   <recv request="ACK"/>
+
+  <!-- The network sets up the voice bearer (QCI 1) with a Create Bearer
+       Request once the SDP answer is known. SIPp answers it by itself; here
+       the scenario waits until it is there, so the RTP that follows leaves
+       on its TEID. optional: a core without PCC still gets its call, on the
+       default bearer; [$ebi] is then 0. -->
+  <nop>
+    <action>
+      <s8_wait_bearer qci="1" timeout="3000" optional="true" assign_to="ebi"/>
+    </action>
+  </nop>
+  <nop>
+    <action>
+      <log message="S8 [field0]: voice bearer EBI [$ebi] (0 = none, media on the default bearer)"/>
+    </action>
+  </nop>
 
   <!-- The caller decides how long the call lasts: wait for its BYE -->
   <!-- ===== Receive BYE (caller hangs up) ===== -->
@@ -235,7 +250,7 @@
       Security-Verify: [security_verify]
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Expires: 0
       Content-Length: 0
 
@@ -250,10 +265,10 @@
   </recv>
 
   <!-- Response time and call length repartition tables -->
-  <!-- SWu detach (IKE Delete); the call waits for the ePDG's answer -->
+  <!-- Delete Session Request; the call waits for the PGW's answer -->
   <nop>
     <action>
-      <swu_detach/>
+      <s8_delete_session/>
     </action>
   </nop>
 

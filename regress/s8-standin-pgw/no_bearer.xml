@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!-- No bearer request comes: <s8_wait_bearer> has to fail the call, unless
+     the scenario says the bearer is optional. -->
+<scenario name="S8 dedicated bearer that never comes">
+  <nop><action><s8_create_session imsi="[field0]" apn="ims"/></action></nop>
+  <nop><action><s8_wait_bearer timeout="500" optional="OPTIONAL"/></action></nop>
+  <nop><action><s8_delete_session/></action></nop>
+</scenario>

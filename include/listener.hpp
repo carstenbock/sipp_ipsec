@@ -37,6 +37,9 @@ public:
     char *getId();
     virtual bool process_incoming(const char* msg, const struct sockaddr_storage* src) = 0;
     virtual bool process_twinSippCom(char* msg) = 0;
+    /* Also receive the messages of another Call-ID (a dialog the peer
+     * starts toward a call that exists, e.g. an INVITE to a registered UE) */
+    void addAlias(const char *other_id);
 
 protected:
     void startListening();
@@ -44,6 +47,7 @@ protected:
 
     char *id;
     bool listening;
+    std::list<std::string> aliases;
 };
 
 typedef std::map<std::string, listener *> listener_map;

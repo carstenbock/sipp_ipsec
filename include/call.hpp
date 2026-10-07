@@ -37,6 +37,10 @@
 #ifdef USE_SWU
 #include "swu.hpp"
 #endif
+#ifdef USE_S8
+#include "gtpc.hpp"
+#include "s6a.hpp"
+#endif
 #ifdef USE_IPSEC
 #include "ipsec_manager.hpp"
 #endif
@@ -223,8 +227,41 @@ protected:
     int  ipsec_activate_sas();
     void ipsec_teardown_sas();
     int  ipsec_rebind_socket();
-    /* This call's own source address inside its SWu tunnel, or nullptr */
+    /* This call's own source address inside its tunnel (SWu inner address,
+     * or the UE address of its S8 PDN connection), or nullptr */
     const char *tunnel_ip();
+    /* The P-CSCF the access network named for it, or nullptr */
+    const char *tunnel_pcscf();
+#endif
+#ifdef USE_S8
+    /* S8 home-routed roaming: the call's PDN connection at the home PGW */
+    S8Session     *s8;
+    bool           s8_wait;         /* create or delete in progress */
+    bool           s8_deleting;
+    unsigned int   s8_wake;
+    std::string    s8_expect;       /* GTP cause the scenario expects, or "any" */
+    int            s8_var;          /* variable for the cause, or -1 */
+    S8Result       s8_result;       /* outlives the session, for the keywords */
+    /* S6a: the call's registration at the home HSS, as its MME */
+    S6aSession    *s6a;
+    bool           s6a_wait;        /* a request is waiting for its answer */
+    std::string    s6a_expect;      /* result code the scenario expects, or "any" */
+    int            s6a_var;         /* variable for the result code, or -1 */
+    int            s6a_result;      /* of the last answer, for [s6a_result] */
+    S6aSubscription s6a_sub;        /* from the Update Location Answer */
+    /* <s6a_wait_cancel>: wait for the HSS's Cancel Location Request */
+    bool           s6a_cancel_wait;
+    bool           s6a_cancel_optional;
+    int            s6a_cancel_var;
+    unsigned int   s6a_cancel_deadline;
+    /* <s8_wait_bearer>: wait for a dedicated bearer to come or go */
+    bool           s8_bearer_wait;
+    bool           s8_bearer_released;
+    bool           s8_bearer_optional;
+    int            s8_bearer_qci;   /* 0: any */
+    int            s8_bearer_var;
+    unsigned int   s8_bearer_deadline;
+    bool           s8_settle();
 #endif
 #ifdef USE_SWU
     /* VoWiFi: the call's tunnel to the ePDG */

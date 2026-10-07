@@ -58,6 +58,10 @@ attribute on `<recv>` captures the Record-Route headers, and the
 | `volte_mixed_load.xml` | CSV-driven load test | REGISTER + INVITE (from CSV) + media + BYE + de-REGISTER |
 | `volte_reregister_cycle.xml` | Registration refresh stress test | REGISTER + re-REGISTER cycle + de-REGISTER |
 | `volte_routing_probe.xml` | SBC routing validation | REGISTER + INVITE (no media) + CANCEL/BYE + de-REGISTER |
+| `s8hr_register.xml` | IMS registration of a roaming UE (S8 home-routed) | S8 Create Session at the home PGW + REGISTER/401/IPSec/REGISTER/200 through GTP-U + de-REGISTER + Delete Session |
+| `s6a_s8hr_register.xml` | Attach and IMS registration of a roaming UE, SIPp as visited MME and SGW | S6a AIR + ULR at the home HSS, S8 Create Session with the subscribed MSISDN/QoS/APN-AMBR, REGISTER/401/IPSec/REGISTER/200 through GTP-U, de-REGISTER, Delete Session, S6a PUR |
+| `s8hr_uac.xml` | MO call of a roaming UE (S8 home-routed) | S8 Create Session + IMS registration with IPSec + INVITE + RTP on the dedicated voice bearer the PGW creates + BYE + de-REGISTER + Delete Session |
+| `s8hr_uas.xml` | MT call to a roaming UE (S8 home-routed) | Same access and registration, answers an INVITE and echoes RTP (`-rtp_echo`) on the voice bearer |
 | `vowifi_uac.xml` | VoWiFi MO call | SWu attach + REGISTER + INVITE (PRACK when the 183 is reliable) + PCAP audio from the UE's inner address + BYE + de-REGISTER + SWu detach |
 | `vowifi_uas.xml` | VoWiFi MT call | SWu attach + REGISTER + wait for INVITE + answer + RTP echo from the UE's inner address + BYE + de-REGISTER + SWu detach |
 | `vowifi_register.xml` | IMS registration over untrusted WLAN | SWu attach to the ePDG (IKEv2, EAP-AKA' or EAP-AKA) + REGISTER/401/IPSec/REGISTER/200 + de-REGISTER + SWu detach |

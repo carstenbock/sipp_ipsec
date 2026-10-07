@@ -105,7 +105,9 @@ Limitations
 ```````````
 
 * IPv4 only, for the outer and the inner address.
-* SIP over UDP only.
+* SIP over UDP only. The IMS IPSec SAs cover TCP too, so a P-CSCF that
+  tries TCP toward the UE's protected server port is refused by the
+  kernel and can fall back to UDP; SIPp does not accept such a connection.
 * No rekeying: a ``CREATE_CHILD_SA`` from the ePDG is refused, so a
   call cannot outlive the SA lifetime. No MOBIKE, no NAT keepalives.
 * The ``rtp_stream`` actions (SIPp's built-in RTP streaming) are not

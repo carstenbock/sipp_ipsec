@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!-- Dedicated bearer test with the stand-in PGW (see README.md). The
+     X-Bearer header tells the stand-in which bearer procedure to start once
+     it has answered; it logs the bearer each REGISTER arrived on. -->
+<scenario name="S8 dedicated bearer test">
+  <nop><action><s8_create_session imsi="[field0]" msisdn="[field1]" apn="[field2]" assign_to="cause"/></action></nop>
+
+  <!-- 1: on the default bearer; asks for a dedicated bearer whose uplink
+       filter is "UDP to the P-CSCF, port 5060" -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:test.invalid SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@test.invalid>;tag=[call_number]
+      To: <sip:[field0]@test.invalid>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      X-Info: cause=[$cause]
+      X-Bearer: create
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200"/>
+  <nop><action><s8_wait_bearer qci="1" assign_to="ebi"/></action></nop>
+
+  <!-- 2: meets the filter, so it has to leave on the dedicated bearer; asks
+       for the filter to be replaced by one that SIP does not meet -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:test.invalid SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@test.invalid>;tag=[call_number]
+      To: <sip:[field0]@test.invalid>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      X-Info: cause=[$cause] ebi=[$ebi]
+      X-Bearer: update
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200"/>
+  <pause milliseconds="300"/>
+
+  <!-- 3: back on the default bearer; asks for the bearer to be deleted -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:test.invalid SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@test.invalid>;tag=[call_number]
+      To: <sip:[field0]@test.invalid>
+      Call-ID: [call_id]
+      CSeq: 3 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      X-Info: cause=[$cause] ebi=[$ebi]
+      X-Bearer: delete
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200"/>
+  <nop><action><s8_wait_bearer released="true"/></action></nop>
+
+  <!-- 4: default bearer, the only one left -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:test.invalid SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@test.invalid>;tag=[call_number]
+      To: <sip:[field0]@test.invalid>
+      Call-ID: [call_id]
+      CSeq: 4 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      X-Info: cause=[$cause] ebi=[$ebi]
+      X-Bearer: none
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200"/>
+  <nop><action><s8_delete_session/></action></nop>
+</scenario>

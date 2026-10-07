@@ -20,6 +20,7 @@ Welcome to SIPp reference documentation!
    transport
    ipsec
    swu
+   s8hr
    volte_scenarios
    media
    statistics

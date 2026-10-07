@@ -246,6 +246,19 @@ else()
   list(REMOVE_ITEM all_SRCS "${PROJECT_SOURCE_DIR}/src/swu.cpp")
 endif()
 
+# S8 (GTPv2-C/GTP-U toward a home PGW, for S8 home-routed roaming tests)
+# needs rtnetlink (libmnl, as IPSec) and a Linux TUN device; no new library.
+# S6a (Diameter toward the home HSS, the MME side of the same tests) is built
+# with it and needs kernel headers only (linux/sctp.h)
+if(USE_IPSEC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_definitions("-DUSE_S8")
+  message(STATUS "S8 (roaming, visited SGW) support enabled")
+else()
+  list(REMOVE_ITEM all_SRCS "${PROJECT_SOURCE_DIR}/src/gtpc.cpp"
+                            "${PROJECT_SOURCE_DIR}/src/gtpu.cpp"
+                            "${PROJECT_SOURCE_DIR}/src/s6a.cpp")
+endif()
+
 # Find all libraries before creating targets
 if(PKG_CONFIG_FOUND)
   pkg_search_module(CURSES_LIBRARY ncursesw cursesw ncurses curses)

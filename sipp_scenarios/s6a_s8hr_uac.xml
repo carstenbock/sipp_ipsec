@@ -2,24 +2,27 @@
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 
 <!--
-  VoWiFi MO call via an ePDG (3GPP TS 24.302, TS 33.203, TS 24.229)
+  S8 home-routed roaming: MO call of a roaming UE (3GPP TS 29.272, TS 29.274,
+  TS 29.281, TS 33.203, TS 24.229; GSMA IR.65 / IR.88 S8HR)
 
-  Each call is one UE on untrusted WLAN access:
-    0. SWu attach to the ePDG (IKEv2, EAP-AKA' or EAP-AKA)
-    1. IMS registration with IPSec, nested inside the SWu tunnel
+  SIPp is the visited network's MME and SGW. Each call is one UE:
+    0. S6a at the home HSS (AIR, ULR with the visited PLMN), then the Create
+       Session Request with the subscribed MSISDN, QoS and APN-AMBR
+    1. IMS registration with IPSec, inside GTP-U
     2. INVITE to the called party, with 183/PRACK when the network uses it
-    3. RTP from media/pcma_rtp.pcap, sent from the UE's inner address through
-       the tunnel, for the call duration (-d, in ms)
-    4. BYE, de-registration, SWu detach
+    3. The PGW's Create Bearer Request for the voice bearer (QCI 1) is
+       accepted; RTP from media/pcma_rtp.pcap leaves on that bearer's TEID
+       for the call duration (-d, in ms)
+    4. BYE, de-registration, Delete Session Request, Purge UE
 
   Usage:
-    sudo ./sipp -sf vowifi_uac.xml \
-      -swu_epdg <epdg_ip> -ipsec -t un -d 10000 \
-      -inf callers.csv \
-      -key eap_prefix 6 \
+    sudo ./sipp -sf s6a_s8hr_uac.xml \
+      -s6a_peer <dra_or_hss> -s6a_dest_realm epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
+      -s8_pgw <pgw_c_ip> -s8_local_ip <our_s8_ip> -visited_plmn 00101 \
+      -ipsec -t un -d 10000 -inf callers.csv \
       -key domain ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
-      -key nai_realm nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
-      -key wlan_node_id 001122334455 \
+      -key tac 1 -key eci 0x15ee001 \
+      -key cell_id 00101000115ee001 \
       <pcscf_ip>:5060
 
   callers.csv, one UE per line:
@@ -30,14 +33,25 @@
   CAP_NET_ADMIN. The SDP offers PCMA only, matching the PCAP.
 -->
 
-<scenario name="VoWiFi MO call via ePDG">
+<scenario name="S8HR MO call with S6a attach">
 
-  <!-- ================================================================== -->
-  <!-- Phase 0: SWu attach (see vowifi_register.xml / docs/swu.rst)        -->
-  <!-- ================================================================== -->
+  <!-- Step 0a: S6a at the home HSS, as the visited MME. Each action waits
+       for the answer; any result but 2001 fails the call. -->
   <nop>
     <action>
-      <swu_attach identity="[eap_prefix][field0]@[nai_realm]" k="[field1]" opc="[field2]" apn="ims"/>
+      <s6a_auth imsi="[field0]"/>
+    </action>
+  </nop>
+  <nop>
+    <action>
+      <s6a_update_location apn="ims" mei="3560920407905401"/>
+    </action>
+  </nop>
+
+  <!-- Step 0: S8 Create Session (see s8hr_register.xml / docs/s8hr.rst) -->
+  <nop>
+    <action>
+      <s8_create_session imsi="[field0]" msisdn="[s6a_msisdn]" apn="ims" qci="[s6a_qci]" arp="[s6a_arp]" ambr_ul="[s6a_apn_ambr_ul]" ambr_dl="[s6a_apn_ambr_dl]" tac="[tac]" eci="[eci]"/>
     </action>
   </nop>
 
@@ -63,7 +77,7 @@
       Authorization: Digest username="[field0]@[domain]",realm="[domain]",uri="sip:[domain]",nonce="",response=""
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Expires: 600000
       Content-Length: 0
 
@@ -96,7 +110,7 @@
       Security-Verify: [security_verify]
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Expires: 600000
       Content-Length: 0
 
@@ -136,12 +150,12 @@
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
       P-Preferred-Identity: <sip:[field3]@[domain]>
-      P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=[wlan_node_id]
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
       P-Early-Media: supported
       Supported: 100rel,path,precondition,replaces,timer
       Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
       Max-Forwards: 70
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
       Content-Type: application/sdp
       Content-Length: [len]
@@ -198,12 +212,28 @@
       CSeq: 1 ACK
       Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
       Max-Forwards: 70
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
       Content-Length: 0
 
     ]]>
   </send>
+
+  <!-- The network sets up the voice bearer (QCI 1) with a Create Bearer
+       Request once the SDP answer is known. SIPp answers it by itself; here
+       the scenario waits until it is there, so the RTP that follows leaves
+       on its TEID. optional: a core without PCC still gets its call, on the
+       default bearer; [$ebi] is then 0. -->
+  <nop>
+    <action>
+      <s8_wait_bearer qci="1" timeout="3000" optional="true" assign_to="ebi"/>
+    </action>
+  </nop>
+  <nop>
+    <action>
+      <log message="S8 [field0]: voice bearer EBI [$ebi] (0 = none, media on the default bearer)"/>
+    </action>
+  </nop>
 
   <!-- Call active — play media for configured duration -->
   <nop>
@@ -228,9 +258,9 @@
       Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
       P-Preferred-Identity: <sip:[field3]@[domain]>
-      P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=[wlan_node_id]
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
       Max-Forwards: 70
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
       Content-Length: 0
 
@@ -259,7 +289,7 @@
       CSeq: 2 PRACK
       RAck: [$rseq] 1 INVITE
       Max-Forwards: 70
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
       Content-Length: 0
 
@@ -293,12 +323,28 @@
       CSeq: 1 ACK
       Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
       Max-Forwards: 70
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
       Content-Length: 0
 
     ]]>
   </send>
+
+  <!-- The network sets up the voice bearer (QCI 1) with a Create Bearer
+       Request once the SDP answer is known. SIPp answers it by itself; here
+       the scenario waits until it is there, so the RTP that follows leaves
+       on its TEID. optional: a core without PCC still gets its call, on the
+       default bearer; [$ebi] is then 0. -->
+  <nop>
+    <action>
+      <s8_wait_bearer qci="1" timeout="3000" optional="true" assign_to="ebi"/>
+    </action>
+  </nop>
+  <nop>
+    <action>
+      <log message="S8 [field0]: voice bearer EBI [$ebi] (0 = none, media on the default bearer)"/>
+    </action>
+  </nop>
 
   <!-- Call active (PRACK path) -->
   <nop>
@@ -323,9 +369,9 @@
       Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
       P-Preferred-Identity: <sip:[field3]@[domain]>
-      P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=[wlan_node_id]
+      P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
       Max-Forwards: 70
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
       Content-Length: 0
 
@@ -357,7 +403,7 @@
       Security-Verify: [security_verify]
       Max-Forwards: 70
       Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
-      User-Agent: SIPp-VoWiFi/1.0
+      User-Agent: SIPp-S8HR/1.0
       Expires: 0
       Content-Length: 0
 
@@ -371,10 +417,17 @@
     </action>
   </recv>
 
-  <!-- SWu detach (IKE Delete); the call waits for the ePDG's answer -->
+  <!-- Delete Session Request; the call waits for the PGW's answer -->
   <nop>
     <action>
-      <swu_detach/>
+      <s8_delete_session/>
+    </action>
+  </nop>
+
+  <!-- The UE has detached: Purge UE at the HSS (TS 29.272 clause 5.2.1.3) -->
+  <nop>
+    <action>
+      <s6a_purge/>
     </action>
   </nop>
 

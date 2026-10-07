@@ -693,6 +693,10 @@ void scenario::checkOptionalRecv(char *elem, unsigned int scenario_file_cursor)
     last_recv_optional = false;
 }
 
+/* Set when the scenario contains an access action (SWu attach, S8 Create
+ * Session); see the creation mode decision in the scenario constructor. */
+static bool access_action_found = false;
+
 scenario::scenario(char * filename, int deflt)
 {
     char * elem;
@@ -1335,6 +1339,16 @@ void scenario::computeSippMode()
             break;
         }
     }
+    if (creationMode == -1 && access_action_found) {
+        /* No SIP message at all, but an access procedure (<swu_attach>,
+         * <s8_create_session>): a test of that procedure alone, e.g. one
+         * that expects the PGW to reject the session. SIPp starts the
+         * calls, as a client does. */
+        creationMode = MODE_CLIENT;
+        if (sendMode == -1) {
+            sendMode = MODE_CLIENT;
+        }
+    }
     if(creationMode == -1)
         ERROR("Unable to determine creation mode of the tool (server, client)");
     if(sendMode == -1)
@@ -1608,6 +1622,7 @@ void scenario::parseAction(CActions *actions)
 #endif
 #ifdef USE_SWU
         } else if(!strcmp(actionElem, "swu_attach")) {
+            access_action_found = true;
             tmpAction->setMessage(xp_get_string("identity", actionElem), 0);
             tmpAction->setMessage(xp_get_string("k", actionElem), 1);
             tmpAction->setMessage(xp_get_string("opc", actionElem), 2);
@@ -1615,6 +1630,71 @@ void scenario::parseAction(CActions *actions)
             tmpAction->setActionType(CAction::E_AT_SWU_ATTACH);
         } else if(!strcmp(actionElem, "swu_detach")) {
             tmpAction->setActionType(CAction::E_AT_SWU_DETACH);
+#endif
+#ifdef USE_S8
+        } else if(!strcmp(actionElem, "s8_create_session") ||
+                  !strcmp(actionElem, "s8_delete_session")) {
+            /* All attributes travel in one text slot as "name=value" lines,
+             * so each may contain keywords ([field0], [$var]) and new ones
+             * need no further slot. Slot 1: the expected GTP cause. */
+            access_action_found = true;
+            static const char *names[] = { "imsi", "msisdn", "mei", "apn", "plmn",
+                                           "qci", "arp", "ambr_ul", "ambr_dl",
+                                           "tac", "eci", nullptr };
+            std::string attrs;
+            bool create = !strcmp(actionElem, "s8_create_session");
+            for (int i = 0; create && names[i]; i++) {
+                const char *v = xp_get_value(names[i]);
+                if (v) {
+                    attrs += std::string(names[i]) + "=" + v + "\n";
+                }
+            }
+            if (create && !xp_get_value("imsi")) {
+                ERROR("<s8_create_session> needs an imsi attribute");
+            }
+            const char *expect = xp_get_value("expect");
+            tmpAction->setMessage(attrs.c_str(), 0);
+            tmpAction->setMessage(expect ? expect : "16", 1);
+            /* assign_to is optional: -1 for "no variable" */
+            tmpAction->setVarId(xp_get_value("assign_to") ?
+                                xp_get_var("assign_to", actionElem) : -1);
+            tmpAction->setActionType(create ? CAction::E_AT_S8_CREATE_SESSION
+                                            : CAction::E_AT_S8_DELETE_SESSION);
+        } else if(!strcmp(actionElem, "s8_wait_bearer")) {
+            /* Same packing as above: the attributes as "name=value" lines */
+            static const char *names[] = { "qci", "released", "timeout", "optional", nullptr };
+            std::string attrs;
+            for (int i = 0; names[i]; i++) {
+                const char *v = xp_get_value(names[i]);
+                if (v) {
+                    attrs += std::string(names[i]) + "=" + v + "\n";
+                }
+            }
+            tmpAction->setMessage(attrs.c_str(), 0);
+            tmpAction->setVarId(xp_get_value("assign_to") ?
+                                xp_get_var("assign_to", actionElem) : -1);
+            tmpAction->setActionType(CAction::E_AT_S8_WAIT_BEARER);
+        } else if(!strcmp(actionElem, "s6a_auth") || !strcmp(actionElem, "s6a_update_location") ||
+                  !strcmp(actionElem, "s6a_purge") || !strcmp(actionElem, "s6a_wait_cancel")) {
+            /* Packed like the S8 actions. Slot 1: the expected result code. */
+            access_action_found = true;
+            static const char *names[] = { "imsi", "apn", "mei", "timeout", "optional", nullptr };
+            std::string attrs;
+            for (int i = 0; names[i]; i++) {
+                const char *v = xp_get_value(names[i]);
+                if (v) {
+                    attrs += std::string(names[i]) + "=" + v + "\n";
+                }
+            }
+            const char *expect = xp_get_value("expect");
+            tmpAction->setMessage(attrs.c_str(), 0);
+            tmpAction->setMessage(expect ? expect : "2001", 1);
+            tmpAction->setVarId(xp_get_value("assign_to") ?
+                                xp_get_var("assign_to", actionElem) : -1);
+            tmpAction->setActionType(!strcmp(actionElem, "s6a_auth") ? CAction::E_AT_S6A_AUTH :
+                                     !strcmp(actionElem, "s6a_update_location") ? CAction::E_AT_S6A_UPDATE_LOCATION :
+                                     !strcmp(actionElem, "s6a_purge") ? CAction::E_AT_S6A_PURGE :
+                                                                        CAction::E_AT_S6A_WAIT_CANCEL);
 #endif
         } else if(!strcmp(actionElem, "strcmp")) {
             if (xp_get_value("check_it")) {

@@ -106,6 +106,10 @@ public:
 #endif
 
     int ss_count = 1;           /* How many users are there of this socket? */
+    /* The call a request with an unknown Call-ID belongs to when it arrives
+     * here: set on a UE's protected server port (3GPP TS 33.203), where the
+     * P-CSCF sends the requests for that UE and for nobody else. */
+    class listener *ss_owner = nullptr;
     bool ss_ipv6 = false;
     int ss_transport = 0;       /* T_TCP, T_UDP, or T_TLS. */
     bool ss_control = false;    /* Is this a control socket? */

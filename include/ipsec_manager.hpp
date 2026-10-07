@@ -74,7 +74,7 @@ struct IPSecParams {
     uint32_t tun_reqid;
 
     /* Upper-layer protocol */
-    int proto;                  /* IPPROTO_UDP or IPPROTO_TCP */
+    int proto;                  /* 0: any (UDP and TCP), or one IPPROTO_* */
 
     /* State tracking */
     IPSecState state;

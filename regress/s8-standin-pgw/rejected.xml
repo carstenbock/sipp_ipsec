@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<scenario name="S8 rejection test">
+  <nop><action><s8_create_session imsi="[field0]" apn="nosuchapn" expect="93" assign_to="cause"/></action></nop>
+  <nop><action><log message="rejected as expected: cause [$cause], keyword [s8_cause]"/></action></nop>
+</scenario>

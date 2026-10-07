@@ -1137,6 +1137,13 @@ void process_message(SIPpSocket *socket, char *msg, ssize_t msg_size, struct soc
                   msg_size, msg);
     }
 
+    if (!listener_ptr && socket->ss_owner && !get_reply_code(msg)) {
+        /* A new dialog toward a registered UE (e.g. an MT INVITE): it is
+         * part of the scenario of the call that owns this server port. */
+        socket->ss_owner->addAlias(call_id);
+        listener_ptr = get_listener(call_id);
+    }
+
     // got as message not relating to a known call
     if (!listener_ptr) {
         if (thirdPartyMode == MODE_3PCC_CONTROLLER_B || thirdPartyMode == MODE_3PCC_A_PASSIVE ||

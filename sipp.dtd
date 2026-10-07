@@ -67,7 +67,7 @@
 <!ELEMENT CallLengthRepartition EMPTY >
 <!ATTLIST CallLengthRepartition value CDATA #REQUIRED >
 
-<!ELEMENT action ( add | assign | assignstr | closecon | divide | ereg | error | exec | gettimeofday | index | insert | ipsec_setup | ipsec_teardown | jump | log | lookup | multiply | pauserestore | replace | rtp_echo | sample | setdest | strcmp | subtract | swu_attach | swu_detach | test | todouble | trim | urldecode | urlencode | verifyauth | warning )+ >
+<!ELEMENT action ( add | assign | assignstr | closecon | divide | ereg | error | exec | gettimeofday | index | insert | ipsec_setup | ipsec_teardown | jump | log | lookup | multiply | pauserestore | replace | rtp_echo | sample | setdest | s6a_auth | s6a_purge | s6a_update_location | s6a_wait_cancel | s8_create_session | s8_delete_session | s8_wait_bearer | strcmp | subtract | swu_attach | swu_detach | test | todouble | trim | urldecode | urlencode | verifyauth | warning )+ >
 
 <!-- BEGIN actions -->
 
@@ -127,6 +127,47 @@
 <!ATTLIST swu_attach opc CDATA #REQUIRED >
 <!ATTLIST swu_attach apn CDATA "ims" >
 <!ELEMENT swu_detach EMPTY >
+
+<!ELEMENT s8_create_session EMPTY >
+<!ATTLIST s8_create_session imsi CDATA #REQUIRED >
+<!ATTLIST s8_create_session msisdn CDATA #IMPLIED >
+<!ATTLIST s8_create_session mei CDATA #IMPLIED >
+<!ATTLIST s8_create_session apn CDATA "ims" >
+<!ATTLIST s8_create_session plmn CDATA #IMPLIED >
+<!ATTLIST s8_create_session qci CDATA "5" >
+<!ATTLIST s8_create_session arp CDATA "9" >
+<!ATTLIST s8_create_session ambr_ul CDATA #IMPLIED >
+<!ATTLIST s8_create_session ambr_dl CDATA #IMPLIED >
+<!ATTLIST s8_create_session tac CDATA "1" >
+<!ATTLIST s8_create_session eci CDATA "1" >
+<!ATTLIST s8_create_session expect CDATA "16" >
+<!ATTLIST s8_create_session assign_to CDATA #IMPLIED >
+<!ELEMENT s8_delete_session EMPTY >
+<!ATTLIST s8_delete_session expect CDATA "16" >
+<!ATTLIST s8_delete_session assign_to CDATA #IMPLIED >
+<!ELEMENT s6a_auth EMPTY >
+<!ATTLIST s6a_auth imsi CDATA #IMPLIED >
+<!ATTLIST s6a_auth expect CDATA "2001" >
+<!ATTLIST s6a_auth assign_to CDATA #IMPLIED >
+<!ELEMENT s6a_update_location EMPTY >
+<!ATTLIST s6a_update_location imsi CDATA #IMPLIED >
+<!ATTLIST s6a_update_location apn CDATA "ims" >
+<!ATTLIST s6a_update_location mei CDATA #IMPLIED >
+<!ATTLIST s6a_update_location expect CDATA "2001" >
+<!ATTLIST s6a_update_location assign_to CDATA #IMPLIED >
+<!ELEMENT s6a_purge EMPTY >
+<!ATTLIST s6a_purge expect CDATA "2001" >
+<!ATTLIST s6a_purge assign_to CDATA #IMPLIED >
+<!ELEMENT s6a_wait_cancel EMPTY >
+<!ATTLIST s6a_wait_cancel timeout CDATA "5000" >
+<!ATTLIST s6a_wait_cancel optional (true|false) "false" >
+<!ATTLIST s6a_wait_cancel assign_to CDATA #IMPLIED >
+<!ELEMENT s8_wait_bearer EMPTY >
+<!ATTLIST s8_wait_bearer qci CDATA #IMPLIED >
+<!ATTLIST s8_wait_bearer released (true|false) "false" >
+<!ATTLIST s8_wait_bearer timeout CDATA "5000" >
+<!ATTLIST s8_wait_bearer optional (true|false) "false" >
+<!ATTLIST s8_wait_bearer assign_to CDATA #IMPLIED >
 
 <!-- END actions -->
 

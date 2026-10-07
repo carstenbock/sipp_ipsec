@@ -292,6 +292,19 @@ MAYBE_EXTERN char             * auth_uri                DEFVAL(0);
 #ifdef USE_IPSEC
 MAYBE_EXTERN bool               ipsec_enabled           DEFVAL(false);
 MAYBE_EXTERN const char       * swu_epdg                DEFVAL(nullptr);
+/* S8 home-routed roaming: SIPp as visited SGW toward the home PGW (gtpc.hpp) */
+MAYBE_EXTERN const char       * s8_pgw                  DEFVAL(nullptr);
+MAYBE_EXTERN const char       * s8_local_ip             DEFVAL(nullptr);
+MAYBE_EXTERN int                s8_t3                   DEFVAL(3000);
+MAYBE_EXTERN int                s8_n3                   DEFVAL(3);
+MAYBE_EXTERN const char       * visited_plmn            DEFVAL(nullptr);
+/* S6a: SIPp as visited MME toward the home HSS or its DRA (s6a.hpp) */
+MAYBE_EXTERN const char       * s6a_peer                DEFVAL(nullptr);
+MAYBE_EXTERN const char       * s6a_transport           DEFVAL("sctp");
+MAYBE_EXTERN const char       * s6a_origin_host         DEFVAL(nullptr);
+MAYBE_EXTERN const char       * s6a_origin_realm        DEFVAL(nullptr);
+MAYBE_EXTERN const char       * s6a_dest_realm          DEFVAL(nullptr);
+MAYBE_EXTERN int                s6a_timeout             DEFVAL(5000);
 MAYBE_EXTERN const char       * ipsec_aalg              DEFVAL("hmac-sha-1-96");
 MAYBE_EXTERN const char       * ipsec_ealg              DEFVAL("aes-cbc");
 MAYBE_EXTERN int                ipsec_port_min          DEFVAL(32768);

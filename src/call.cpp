@@ -68,6 +68,9 @@
 #ifdef USE_SWU
 static bool swu_hex16(const char *hex, uint8_t out[16]);
 #endif
+#ifdef USE_S8
+static std::map<std::string, std::string> s8_attributes(const char *text);
+#endif
 
 template<typename Out>
 void split(const std::string &s, char delim, Out result) {
@@ -172,6 +175,11 @@ unsigned int call::wake()
 #ifdef USE_SWU
     if (swu_wake && (!wake || (swu_wake < wake))) {
         wake = swu_wake;
+    }
+#endif
+#ifdef USE_S8
+    if (s8_wake && (!wake || (s8_wake < wake))) {
+        wake = s8_wake;
     }
 #endif
 
@@ -926,6 +934,21 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     swu_detaching = false;
     swu_wake = 0;
 #endif
+#ifdef USE_S8
+    s8 = nullptr;
+    s8_wait = false;
+    s8_deleting = false;
+    s8_bearer_wait = false;
+    s6a = nullptr;
+    s6a_wait = false;
+    s6a_var = -1;
+    s6a_result = 0;
+    s6a_cancel_wait = false;
+    s8_wake = 0;
+    s8_var = -1;
+    s8_result = S8Result();
+    s8_result.pgw_c_teid = s8_result.pgw_u_teid = 0;
+#endif
 
     //
     // JLSRTP CLIENT context constants
@@ -1224,6 +1247,7 @@ call::~call()
         free(security_server_value);
     }
     if (ipsec_server_socket) {
+        ipsec_server_socket->ss_owner = nullptr;
         ipsec_server_socket->close();
         ipsec_server_socket = nullptr;
     }
@@ -1244,6 +1268,10 @@ call::~call()
 #endif
 #ifdef USE_SWU
     delete swu;
+#endif
+#ifdef USE_S8
+    delete s8;
+    delete s6a;
 #endif
 
     if (use_tdmmap) {
@@ -2166,6 +2194,88 @@ bool call::run()
     }
 #endif
 
+#ifdef USE_S8
+    if (s8_wait) {
+        if (s8 && s8->busy()) {
+            /* S8Session::poll_all() drives the exchange with the PGW */
+            s8_wake = clock_tick + 10;
+            setPaused();
+            return true;
+        }
+        s8_wake = 0;
+        s8_wait = false;
+        if (!s8_settle()) {
+            /* E_NO_ACTION: counted as one failed call, no further reason */
+            terminate(CStat::E_NO_ACTION);
+            return false;
+        }
+    }
+    if (s6a_wait) {
+        if (s6a && s6a->busy()) {
+            /* S6aSession::poll_all() receives the HSS's answer */
+            s8_wake = clock_tick + 10;
+            setPaused();
+            return true;
+        }
+        s8_wake = 0;
+        s6a_wait = false;
+        s6a_result = s6a ? s6a->result() : -1;
+        if (s6a) {
+            s6a_sub = s6a->subscription();
+        }
+        if (s6a_var >= 0) {
+            M_callVariableTable->getVar(s6a_var)->setDouble(s6a_result);
+        }
+        if (s6a_expect != "any" && s6a_result != atoi(s6a_expect.c_str())) {
+            WARNING("S6a for call %s: result %d, expected %s%s%s", id, s6a_result, s6a_expect.c_str(),
+                    s6a && *s6a->error() ? ": " : "", s6a ? s6a->error() : ": no imsi given");
+            terminate(CStat::E_NO_ACTION);
+            return false;
+        }
+    }
+    if (s6a_cancel_wait) {
+        bool met = s6a && s6a->cancelled();
+        if (!met && s6a && clock_tick < s6a_cancel_deadline) {
+            s8_wake = clock_tick + 10;
+            setPaused();
+            return true;
+        }
+        s8_wake = 0;
+        s6a_cancel_wait = false;
+        if (s6a_cancel_var >= 0) {
+            M_callVariableTable->getVar(s6a_cancel_var)->setDouble(met ? s6a->cancellation_type() : -1);
+        }
+        if (!met && !s6a_cancel_optional) {
+            WARNING("S6a for call %s: no Cancel Location Request from the HSS in time", id);
+            terminate(CStat::E_NO_ACTION);
+            return false;
+        }
+    }
+    if (s8_bearer_wait) {
+        /* The PGW's Create and Delete Bearer Requests are answered by
+         * S8Session::poll_all(); here the scenario only waits for the result */
+        int ebi = s8 ? s8->dedicated_bearer(s8_bearer_qci) : 0;
+        bool met = s8_bearer_released ? ebi == 0 : ebi != 0;
+        if (!met && s8 && s8->state() == S8_ACTIVE && clock_tick < s8_bearer_deadline) {
+            s8_wake = clock_tick + 10;
+            setPaused();
+            return true;
+        }
+        s8_wake = 0;
+        s8_bearer_wait = false;
+        if (s8_bearer_var >= 0) {
+            M_callVariableTable->getVar(s8_bearer_var)->setDouble(ebi);
+        }
+        if (!met && !s8_bearer_optional) {
+            WARNING("S8 for call %s: dedicated bearer%s was not %s in time", id,
+                    s8_bearer_qci ? " with the awaited QCI" : "",
+                    s8_bearer_released ? "released" : "created");
+            terminate(CStat::E_NO_ACTION);
+            return false;
+        }
+    }
+#endif
+
     message *curmsg;
     if (initCall) {
         if(msg_index >= (int)call_scenario->initmessages.size()) {
@@ -2695,9 +2805,9 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             }
             break;
         case E_Message_Remote_IP:
-#ifdef USE_SWU
-            if (tunnel_ip() && *swu->pcscf()) {
-                dest += snprintf(dest, left, "%s", swu->pcscf());
+#ifdef USE_IPSEC
+            if (tunnel_pcscf()) {
+                dest += snprintf(dest, left, "%s", tunnel_pcscf());
                 break;
             }
 #endif
@@ -2797,6 +2907,59 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             dest += snprintf(dest, left, "%s", address);
         }
         break;
+#ifdef USE_S8
+        case E_Message_S8_Cause:
+            dest += snprintf(dest, left, "%d", s8_result.cause);
+            break;
+        case E_Message_S8_PGW_C_IP:
+            dest += snprintf(dest, left, "%s", s8_result.pgw_c_ip.c_str());
+            break;
+        case E_Message_S8_PGW_C_TEID:
+            dest += snprintf(dest, left, "%u", s8_result.pgw_c_teid);
+            break;
+        case E_Message_S8_PGW_U_IP:
+            dest += snprintf(dest, left, "%s", s8_result.pgw_u_ip.c_str());
+            break;
+        case E_Message_S8_PGW_U_TEID:
+            dest += snprintf(dest, left, "%u", s8_result.pgw_u_teid);
+            break;
+        case E_Message_S6A_Result:
+            dest += snprintf(dest, left, "%d", s6a_result);
+            break;
+        case E_Message_S6A_MSISDN:
+            dest += snprintf(dest, left, "%s", s6a_sub.msisdn.c_str());
+            break;
+        case E_Message_S6A_QCI:
+            dest += snprintf(dest, left, "%d", s6a_sub.qci);
+            break;
+        case E_Message_S6A_ARP:
+            dest += snprintf(dest, left, "%d", s6a_sub.arp);
+            break;
+        case E_Message_S6A_APN_AMBR_UL:
+            dest += snprintf(dest, left, "%u", s6a_sub.apn_ambr_ul);
+            break;
+        case E_Message_S6A_APN_AMBR_DL:
+            dest += snprintf(dest, left, "%u", s6a_sub.apn_ambr_dl);
+            break;
+        case E_Message_S6A_PDN_Type:
+            dest += snprintf(dest, left, "%d", s6a_sub.pdn_type);
+            break;
+#else
+        case E_Message_S8_Cause:
+        case E_Message_S8_PGW_C_IP:
+        case E_Message_S8_PGW_C_TEID:
+        case E_Message_S8_PGW_U_IP:
+        case E_Message_S8_PGW_U_TEID:
+        case E_Message_S6A_Result:
+        case E_Message_S6A_MSISDN:
+        case E_Message_S6A_QCI:
+        case E_Message_S6A_ARP:
+        case E_Message_S6A_APN_AMBR_UL:
+        case E_Message_S6A_APN_AMBR_DL:
+        case E_Message_S6A_PDN_Type:
+            ERROR("The [s8_*] and [s6a_*] keywords need S8 support (build with USE_IPSEC on Linux)");
+            break;
+#endif
         case E_Message_Media_IP:
 #ifdef USE_IPSEC
             if (tunnel_ip()) {
@@ -6137,6 +6300,79 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 swu_wait = true;
             }
 #endif
+#ifdef USE_S8
+        } else if (currentAction->getActionType() == CAction::E_AT_S8_CREATE_SESSION) {
+            if (!s8_pgw) {
+                ERROR("<s8_create_session> needs the -s8_pgw option");
+            }
+            if (!multisocket || transport != T_UDP) {
+                ERROR("<s8_create_session> needs one UDP socket per call (-t un)");
+            }
+            if (s8 || call_socket) {
+                ERROR("<s8_create_session> must run once, before the call's first message");
+            }
+            std::map<std::string, std::string> a =
+                s8_attributes(createSendingMessage(currentAction->getMessage(0)));
+            S8Config cfg;
+            cfg.imsi = a["imsi"];
+            cfg.msisdn = a["msisdn"];
+            cfg.mei = a["mei"];
+            cfg.apn = a.count("apn") ? a["apn"] : "ims";
+            cfg.plmn = a.count("plmn") ? a["plmn"] : (visited_plmn ? visited_plmn : "");
+            cfg.qci = a.count("qci") ? atoi(a["qci"].c_str()) : 5;
+            cfg.arp = a.count("arp") ? atoi(a["arp"].c_str()) : 9;
+            cfg.ambr_ul = a.count("ambr_ul") ? strtoul(a["ambr_ul"].c_str(), nullptr, 10) : 1000000;
+            cfg.ambr_dl = a.count("ambr_dl") ? strtoul(a["ambr_dl"].c_str(), nullptr, 10) : 1000000;
+            cfg.tac = a.count("tac") ? atoi(a["tac"].c_str()) : 1;
+            cfg.eci = a.count("eci") ? strtoul(a["eci"].c_str(), nullptr, 0) : 1;
+            s8_expect = createSendingMessage(currentAction->getMessage(1));
+            s8_var = currentAction->getVarId();
+            s8 = new S8Session(cfg);
+            s8->create();
+            s8_wait = true;
+        } else if (currentAction->getActionType() == CAction::E_AT_S8_DELETE_SESSION) {
+            if (s8) {
+                s8_expect = createSendingMessage(currentAction->getMessage(1));
+                s8_var = currentAction->getVarId();
+                s8->remove();
+                s8_deleting = true;
+                s8_wait = true;
+            }
+        } else if (currentAction->getActionType() == CAction::E_AT_S6A_AUTH ||
+                   currentAction->getActionType() == CAction::E_AT_S6A_UPDATE_LOCATION ||
+                   currentAction->getActionType() == CAction::E_AT_S6A_PURGE) {
+            std::map<std::string, std::string> a =
+                s8_attributes(createSendingMessage(currentAction->getMessage(0)));
+            if (!s6a && !a["imsi"].empty()) {
+                s6a = new S6aSession(a["imsi"]);
+            }
+            s6a_expect = createSendingMessage(currentAction->getMessage(1));
+            s6a_var = currentAction->getVarId();
+            if (s6a && currentAction->getActionType() == CAction::E_AT_S6A_AUTH) {
+                s6a->authenticate();
+            } else if (s6a && currentAction->getActionType() == CAction::E_AT_S6A_UPDATE_LOCATION) {
+                s6a->update_location(a.count("apn") ? a["apn"] : "ims", a["mei"]);
+            } else if (s6a) {
+                s6a->purge();
+            }
+            s6a_wait = true;
+        } else if (currentAction->getActionType() == CAction::E_AT_S6A_WAIT_CANCEL) {
+            std::map<std::string, std::string> a =
+                s8_attributes(createSendingMessage(currentAction->getMessage(0)));
+            s6a_cancel_optional = a["optional"] == "true";
+            s6a_cancel_deadline = clock_tick + (a.count("timeout") ? atoi(a["timeout"].c_str()) : 5000);
+            s6a_cancel_var = currentAction->getVarId();
+            s6a_cancel_wait = true;
+        } else if (currentAction->getActionType() == CAction::E_AT_S8_WAIT_BEARER) {
+            std::map<std::string, std::string> a =
+                s8_attributes(createSendingMessage(currentAction->getMessage(0)));
+            s8_bearer_qci = a.count("qci") ? atoi(a["qci"].c_str()) : 0;
+            s8_bearer_released = a["released"] == "true";
+            s8_bearer_optional = a["optional"] == "true";
+            s8_bearer_deadline = clock_tick + (a.count("timeout") ? atoi(a["timeout"].c_str()) : 5000);
+            s8_bearer_var = currentAction->getVarId();
+            s8_bearer_wait = true;
+#endif
         } else if (currentAction->getActionType() == CAction::E_AT_JUMP) {
             double operand = get_rhs(currentAction);
             if (msg_index == ((int)operand)) {
@@ -7183,8 +7419,94 @@ const char *call::tunnel_ip()
         return swu->inner_ip();
     }
 #endif
+#ifdef USE_S8
+    if (s8 && s8->state() == S8_ACTIVE) {
+        return s8->result().ue_ip.c_str();
+    }
+#endif
     return nullptr;
 }
+
+const char *call::tunnel_pcscf()
+{
+#ifdef USE_SWU
+    if (swu && swu->state() == SWU_ESTABLISHED && *swu->pcscf()) {
+        return swu->pcscf();
+    }
+#endif
+#ifdef USE_S8
+    if (s8 && s8->state() == S8_ACTIVE && !s8->result().pcscf.empty()) {
+        return s8->result().pcscf.c_str();
+    }
+#endif
+    return nullptr;
+}
+
+#ifdef USE_S8
+/*
+ * "name=value" lines, as scenario.cpp packs the attributes of an S8 action.
+ * The message code turns every line end into CRLF, as SIP wants it; the CR
+ * is not part of the value.
+ */
+static std::map<std::string, std::string> s8_attributes(const char *text)
+{
+    std::map<std::string, std::string> out;
+    std::string s(text);
+    for (size_t start = 0; start < s.size();) {
+        size_t end = s.find('\n', start);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        size_t stop = end;
+        while (stop > start && s[stop - 1] == '\r') {
+            stop--;
+        }
+        size_t eq = s.find('=', start);
+        if (eq != std::string::npos && eq < stop) {
+            out[s.substr(start, eq - start)] = s.substr(eq + 1, stop - eq - 1);
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+/*
+ * A Create or Delete Session has been answered (or timed out). The GTP cause
+ * goes to the scenario's variable; the call fails unless the cause is the
+ * expected one. After a successful create the call talks from the UE address
+ * the PGW assigned to the P-CSCF it named.
+ */
+bool call::s8_settle()
+{
+    int cause = s8 ? s8->cause() : -1;
+    bool deleting = s8_deleting;
+
+    if (s8) {
+        s8_result = s8->result();
+    }
+    if (s8_var >= 0) {
+        M_callVariableTable->getVar(s8_var)->setDouble(cause);
+    }
+    if (deleting) {
+        s8_deleting = false;
+        delete s8;
+        s8 = nullptr;
+    }
+    if (s8_expect != "any" && cause != atoi(s8_expect.c_str())) {
+        WARNING("S8 %s for call %s: GTP cause %d, expected %s%s%s", deleting ? "delete" : "create",
+                id, cause, s8_expect.c_str(), s8 && *s8->error() ? ": " : "",
+                s8 ? s8->error() : "");
+        return false;
+    }
+    if (!deleting && s8->state() == S8_ACTIVE && tunnel_pcscf() &&
+        gai_getsockaddr(&call_peer, tunnel_pcscf(), (unsigned short)remote_port,
+                        AI_PASSIVE, AF_UNSPEC) != 0) {
+        WARNING("Unusable P-CSCF address '%s' from the PGW", tunnel_pcscf());
+        return false;
+    }
+    return true;
+}
+#endif
 
 #ifdef USE_SWU
 static bool swu_hex16(const char *hex, uint8_t out[16])
@@ -7318,18 +7640,27 @@ int call::ipsec_setup_sas(const char *msg)
         snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", local_ip);
     }
     snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", remote_ip);
+    if (tunnel_pcscf()) {
+        snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", tunnel_pcscf());
+    }
 #ifdef USE_SWU
-    if (tunnel_ip()) {
-        if (*swu->pcscf()) {
-            snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", swu->pcscf());
-        }
+    /* Only SWu needs the IMS SAs nested in a tunnel SA: GTP-U encapsulation
+     * happens after the kernel has applied the transport-mode ESP. */
+    if (swu && tunnel_ip()) {
         snprintf(ipsec_params.tun_local, sizeof(ipsec_params.tun_local), "%s", swu->outer_local());
         snprintf(ipsec_params.tun_remote, sizeof(ipsec_params.tun_remote), "%s", swu->outer_remote());
         ipsec_params.tun_reqid = swu->reqid();
     }
 #endif
 #pragma GCC diagnostic pop
-    ipsec_params.proto = (transport == T_TCP) ? IPPROTO_TCP : IPPROTO_UDP;
+    /* The SAs protect UDP and TCP between the four ports alike (3GPP TS
+     * 33.203 clause 7.1), so the selectors name no transport protocol. A
+     * P-CSCF may open TCP to the protected server port for a request too
+     * large for UDP (RFC 3261 section 18.1.1): with UDP-only selectors its
+     * SYN is dropped unseen and it waits for a timeout, with these the
+     * kernel answers (a reset, as SIPp listens on UDP only) and the P-CSCF
+     * can fall back to UDP at once. */
+    ipsec_params.proto = 0;
 
     LOG_MSG("IPSec params parsed: remote spi-c=%u spi-s=%u port-c=%u port-s=%u "
             "(SA creation deferred until AKA key derivation)\n",
@@ -7376,6 +7707,7 @@ void call::ipsec_teardown_sas()
         ipsec_manager->teardown_security_associations(ipsec_params);
     }
     if (ipsec_server_socket) {
+        ipsec_server_socket->ss_owner = nullptr;
         ipsec_server_socket->close();
         ipsec_server_socket = nullptr;
     }
@@ -7443,6 +7775,7 @@ int call::ipsec_rebind_socket()
         WARNING("Failed to create IPSec server socket on port %d", ipsec_params.port_us);
         return -1;
     }
+    ipsec_server_socket->ss_owner = this;
 
     /* Update the peer address to P-CSCF's protected server port */
     sockaddr_update_port(&call_peer, ipsec_params.port_ps);

@@ -258,6 +258,35 @@ struct sipp_option options_table[] = {
      "(IKEv2 with EAP-AKA' on UDP 4500, 3GPP TS 24.302). IPv4 address or host name.\n"
      "Needs -t un and root or CAP_NET_ADMIN.", SIPP_OPTION_STRING, &swu_epdg, 1},
 #endif
+#ifdef USE_S8
+    {"s8_pgw", "Set the PGW that the <s8_create_session> action opens its PDN connection at\n"
+     "(S8 home-routed roaming: SIPp plays the visited SGW; GTPv2-C on UDP 2123,\n"
+     "3GPP TS 29.274). IPv4 address or host name, optionally with :port.\n"
+     "Needs -t un, root or CAP_NET_ADMIN and /dev/net/tun.", SIPP_OPTION_STRING, &s8_pgw, 1},
+    {"s8_local_ip", "Set the local address for S8: GTP-C (UDP 2123) and GTP-U (UDP 2152) are bound\n"
+     "to it and it is the address in the F-TEIDs sent to the PGW. Default is the -i address.\n"
+     "The PGW must reach it without NAT.", SIPP_OPTION_STRING, &s8_local_ip, 1},
+    {"s8_t3", "Set the GTP-C T3-RESPONSE timer in ms: how long to wait for a response before\n"
+     "the request is sent again. Default is 3000.", SIPP_OPTION_INT, &s8_t3, 1},
+    {"s8_n3", "Set GTP-C N3-REQUESTS: how many times a request is retransmitted before the\n"
+     "PGW counts as not answering. Default is 3.", SIPP_OPTION_INT, &s8_n3, 1},
+    {"visited_plmn", "Set the visited PLMN as <mcc><mnc> (e.g. 00101 or 310410): the Serving Network\n"
+     "and the PLMN of the location (ULI) in the Create Session Request, and the\n"
+     "Visited-PLMN-Id on S6a.", SIPP_OPTION_STRING, &visited_plmn, 1},
+    {"s6a_peer", "Set the Diameter peer for the <s6a_*> actions as host[:port] (default port 3868):\n"
+     "the home network's DRA, or its HSS. SIPp acts as the MME of the visited network.",
+     SIPP_OPTION_STRING, &s6a_peer, 1},
+    {"s6a_transport", "Set the transport to the Diameter peer: sctp (default) or tcp.",
+     SIPP_OPTION_STRING, &s6a_transport, 1},
+    {"s6a_origin_host", "Set the Origin-Host on S6a. Default is the MME name of the visited PLMN,\n"
+     "mmec01.mmegi0001.mme.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org.", SIPP_OPTION_STRING, &s6a_origin_host, 1},
+    {"s6a_origin_realm", "Set the Origin-Realm on S6a. Default is epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org\n"
+     "of the visited PLMN.", SIPP_OPTION_STRING, &s6a_origin_realm, 1},
+    {"s6a_dest_realm", "Set the Destination-Realm on S6a: the realm of the home network's HSS.",
+     SIPP_OPTION_STRING, &s6a_dest_realm, 1},
+    {"s6a_timeout", "Set how long an S6a request waits for its answer, in ms. Default is 5000.",
+     SIPP_OPTION_INT, &s6a_timeout, 1},
+#endif
     {"s", "Set the username part of the request URI. Default is 'service'.", SIPP_OPTION_STRING, &service, 1},
     {"default_behaviors", "Set the default behaviors that SIPp will use.  Possible values are:\n"
      "- all\tUse all default behaviors\n"
@@ -621,6 +650,10 @@ static void traffic_thread(int &rtp_errors, int &echo_errors)
 #ifdef USE_SWU
         SwuSession::poll_all();
 #endif
+#ifdef USE_S8
+        S8Session::poll_all();
+        S6aSession::poll_all();
+#endif
     }
     assert(0);
 }
@@ -654,14 +687,14 @@ static void rtp_echo_thread(void* param)
         WARNING("Cannot set socket timeout. error: %d", errno);
     }
 
-#ifdef USE_SWU
+#ifdef USE_IPSEC
     /* VoWiFi: the socket is bound to every address (see
      * setup_media_sockets()), and each UE has its own. The echo has to leave
      * from the address the packet came in on, or it would carry the outer
      * address as source and miss the UE's tunnel. */
     struct in_addr echo_local;
     char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))];
-    const bool per_ue_addr = swu_epdg != nullptr && !media_ip_is_ipv6;
+    const bool per_ue_addr = (swu_epdg != nullptr || s8_pgw != nullptr) && !media_ip_is_ipv6;
     if (per_ue_addr) {
         int on = 1;
         if (setsockopt(sock, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on)) < 0) {
@@ -672,7 +705,7 @@ static void rtp_echo_thread(void* param)
 
     while (run_echo_thread.load(std::memory_order_relaxed)) {
         len = sizeof(remote_rtp_addr);
-#ifdef USE_SWU
+#ifdef USE_IPSEC
         if (per_ue_addr) {
             struct iovec iov = { msg.data(), (size_t)media_bufsize };
             struct msghdr mh;
@@ -709,7 +742,7 @@ static void rtp_echo_thread(void* param)
         if (!rtp_echo_state) {
             continue;
         }
-#ifdef USE_SWU
+#ifdef USE_IPSEC
         if (per_ue_addr) {
             struct iovec iov = { msg.data(), (size_t)nr };
             struct msghdr mh;
@@ -1203,6 +1236,11 @@ void sipp_exit(int rc, int rtp_errors, int echo_errors)
     /* Calls still alive are not destroyed on exit: release their tunnels. */
     SwuSession::shutdown_all();
 #endif
+#ifdef USE_S8
+    /* Likewise the PDN connections, and the TUN device with its rules. */
+    S8Session::shutdown_all();
+    S6aSession::shutdown_all();
+#endif
 
     screen_exit();
     print_last_stats();
@@ -1383,11 +1421,11 @@ static void setup_media_sockets()
                 try_counter == max_tries || media_port >= (max_rtp_port - 2));
 
             struct sockaddr_storage echo_sockaddr = media_sockaddr;
-#ifdef USE_SWU
+#ifdef USE_IPSEC
             /* VoWiFi: RTP arrives on each UE's inner address, which does not
              * exist yet. Listen on all of them; rtp_echo_thread() answers
              * from the one a packet came in on. */
-            if (swu_epdg && !media_ip_is_ipv6) {
+            if ((swu_epdg || s8_pgw) && !media_ip_is_ipv6) {
                 (_RCAST(struct sockaddr_in*, &echo_sockaddr))->sin_addr.s_addr = INADDR_ANY;
             }
 #endif

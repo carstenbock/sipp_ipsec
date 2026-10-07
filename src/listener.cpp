@@ -55,6 +55,14 @@ void listener::stopListening()
     listening = false;
 }
 
+void listener::addAlias(const char *other_id)
+{
+    if (listeners.find(listener_map::key_type(other_id)) == listeners.end()) {
+        listeners.insert(std::pair<listener_map::key_type,listener *>(listener_map::key_type(other_id),this));
+        aliases.push_back(other_id);
+    }
+}
+
 char *listener::getId()
 {
     return id;
@@ -64,6 +72,9 @@ listener::~listener()
 {
     if (listening) {
         stopListening();
+    }
+    for (std::list<std::string>::iterator it = aliases.begin(); it != aliases.end(); ++it) {
+        listeners.erase(*it);
     }
     free(id);
     id = nullptr;
