@@ -68,6 +68,11 @@ struct IPSecParams {
     char local_ip[64];
     char remote_ip[64];
 
+    /* SWu tunnel these SAs are nested in (VoWiFi); tun_reqid 0 = none */
+    char tun_local[64];
+    char tun_remote[64];
+    uint32_t tun_reqid;
+
     /* Upper-layer protocol */
     int proto;                  /* IPPROTO_UDP or IPPROTO_TCP */
 

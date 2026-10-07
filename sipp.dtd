@@ -67,7 +67,7 @@
 <!ELEMENT CallLengthRepartition EMPTY >
 <!ATTLIST CallLengthRepartition value CDATA #REQUIRED >
 
-<!ELEMENT action ( add | assign | assignstr | closecon | divide | ereg | error | exec | gettimeofday | index | insert | jump | log | lookup | multiply | pauserestore | replace | rtp_echo | sample | setdest | strcmp | subtract | test | todouble | trim | urldecode | urlencode | verifyauth | warning )+ >
+<!ELEMENT action ( add | assign | assignstr | closecon | divide | ereg | error | exec | gettimeofday | index | insert | ipsec_setup | ipsec_teardown | jump | log | lookup | multiply | pauserestore | replace | rtp_echo | sample | setdest | strcmp | subtract | swu_attach | swu_detach | test | todouble | trim | urldecode | urlencode | verifyauth | warning )+ >
 
 <!-- BEGIN actions -->
 
@@ -117,6 +117,16 @@
 
 <!ELEMENT urlencode EMPTY >
 <!ATTLIST urlencode variable CDATA #REQUIRED >
+
+<!ELEMENT ipsec_setup EMPTY >
+<!ELEMENT ipsec_teardown EMPTY >
+
+<!ELEMENT swu_attach EMPTY >
+<!ATTLIST swu_attach identity CDATA #REQUIRED >
+<!ATTLIST swu_attach k CDATA #REQUIRED >
+<!ATTLIST swu_attach opc CDATA #REQUIRED >
+<!ATTLIST swu_attach apn CDATA "ims" >
+<!ELEMENT swu_detach EMPTY >
 
 <!-- END actions -->
 

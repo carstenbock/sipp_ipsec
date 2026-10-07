@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- VoWiFi calls: `sipp_scenarios/vowifi_uac.xml` (MO call with PCAP audio) and `vowifi_uas.xml` (MT call with RTP echo), each with SWu attach, IMS registration, de-registration and detach around the call
+- VoWiFi media: PCAP play (`play_pcap_audio`, `play_pcap_video`, `play_dtmf`) sends from the call's inner address, so the RTP goes through the UE's SWu tunnel. With `-rtp_echo` and `-swu_epdg` the echo sockets listen on all addresses and answer from the one a packet arrived on, so every UE echoes on its own inner address
+- VoWiFi: a call can attach to an ePDG before it registers. The new `<swu_attach identity= k= opc= apn=>` action builds the SWu tunnel (IKEv2 with EAP-AKA' or EAP-AKA, 3GPP TS 24.302 / TS 33.402) to the ePDG given with `-swu_epdg`, `<swu_detach/>` deletes it. After the attach `[local_ip]` and `[media_ip]` are the inner address the ePDG assigned and `[remote_ip]` the P-CSCF it named, and the IMS IPSec SAs are nested inside the tunnel. Needs `-t un`; IPv4 and SIP over UDP only, no rekeying (see `docs/swu.rst`)
+- `sipp_scenarios/vowifi_register.xml`: SWu attach, IMS registration with IPSec, de-registration and SWu detach, one UE per line of the injection file
+- `sipp.dtd` declares the `ipsec_setup`, `ipsec_teardown`, `swu_attach` and `swu_detach` actions
 - `-ipsec_port_min` / `-ipsec_port_max` set the range for UE protected ports (port-c/port-s, TS 33.203); each concurrent UE uses two ports, so the range caps UEs per source IP (default 32768-65535)
 - RFC 3608 Service-Route extraction in all VoLTE scenarios: `Service-Route` from REGISTER 200 OK is captured and used as preloaded `Route` in subsequent originated requests (INVITE, PRACK, ACK, BYE)
 - Full IMS REGISTER/401/IPSec/REGISTER/200 phase added to `volte_uas_template.xml`, `volte_mixed_load.xml`, and `volte_routing_probe.xml` (previously started without registration)
@@ -26,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - IPSec protected ports (port-c, port-s) now use random ephemeral ports (32768-65535) instead of hardcoded 5060/5061
 
 ### Fixed
+- IPSec: policies were left in the kernel at the end of a call, at random (`xfrm netlink response error: No such file or directory`, `Some IPSec SAs/policies could not be removed`). IPv4 addresses were written into the 16-byte selector fields without clearing them, and the kernel finds the policy to delete by comparing the whole selector. A leftover policy makes the next UE on the same address and ports fail
+- IPSec: every call opened the XFRM netlink socket again and the first call to end closed it, after which no other call could remove its SAs and policies (`XFRM netlink not initialized`). The socket is now opened once and kept
+- `volte_register.xml` did not start: `service_route` was assigned but never used, which SIPp rejects (`Variable $service_route is referenced 1 times!`); the scenario now declares it with `<Reference>`
+- IPSec with `-t ui`: the protected sockets (port-c/port-s) and the SAs now use the call's own address from `-ip_field` instead of the process-wide `-i` address, so several UEs with different source IPs can register from one SIPp process
 - IPSec: a call's protected client socket was closed twice when the call ended (once by `~call`, once by `~socketowner`, after the first close had deleted it), which aborted SIPp with `malloc(): unaligned tcache chunk detected` as soon as the first IPSec call failed or de-registered. The call now gives the socket up before closing it, and the switch to the protected socket removes the call from the old socket's owner list
 - IPSec protected ports are taken from a per-process pool and returned when the call ends, instead of drawn at random with no in-use check; two UEs on one source IP could get the same port and the second UE's protected socket failed to bind (a generator-side failure from a few hundred UEs per IP upward)
 - VoLTE scenarios: in-dialog requests (ACK, BYE) now use the Record-Route set from INVITE responses (`rrs="true"` + `[routes]`) instead of the Service-Route from registration, per RFC 3261 §12.1.2; Request-URI uses `[next_url]` (remote Contact) instead of hardcoded addresses; UAS template echoes `[last_Record-Route:]` in 180/200 responses

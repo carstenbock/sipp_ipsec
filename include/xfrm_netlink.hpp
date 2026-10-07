@@ -67,6 +67,38 @@ int xfrm_del_sa(const char *src_ip, const char *dst_ip,
                 uint32_t spi, int proto);
 
 /**
+ * An outer tunnel-mode ESP SA pair (SWu, UE <-> ePDG) that traffic of one
+ * inner address is carried in. Addresses are the outer tunnel endpoints.
+ */
+struct XfrmTunnel {
+    const char *local;      /* our outer address */
+    const char *remote;     /* ePDG address */
+    uint32_t    reqid;      /* ties the policies to this tunnel's SAs */
+};
+
+/**
+ * Add one direction of a tunnel-mode ESP SA with UDP encapsulation
+ * (RFC 3948), AES-CBC and HMAC-SHA2-256-128.
+ *
+ * @param encap_sport/encap_dport  UDP ports of the encapsulation, as seen
+ *                                 in packets of this direction
+ * @return 0 on success, -1 on error
+ */
+int xfrm_add_tunnel_sa(const char *src_ip, const char *dst_ip,
+                       uint32_t spi, uint32_t reqid,
+                       uint16_t encap_sport, uint16_t encap_dport,
+                       const unsigned char *enc_key, int enc_bits,
+                       const unsigned char *auth_key, int auth_bits);
+
+/**
+ * Add / delete the policy that sends everything from (dir out) or to
+ * (dir in) inner_ip through the tunnel. It ranks below the port-specific
+ * IMS policies, which name the tunnel themselves (see xfrm_add_policy).
+ */
+int xfrm_add_tunnel_policy(const char *inner_ip, int dir, const XfrmTunnel *tun);
+int xfrm_del_tunnel_policy(const char *inner_ip, int dir);
+
+/**
  * Add a Security Policy (SP) to the kernel XFRM subsystem.
  *
  * @param src_ip     Source address for selector
@@ -78,12 +110,17 @@ int xfrm_del_sa(const char *src_ip, const char *dst_ip,
  * @param spi        SPI for the SA template
  * @param tmpl_src   Template source IP (tunnel endpoint)
  * @param tmpl_dst   Template destination IP (tunnel endpoint)
+ * @param outer      When set, the transport-mode ESP is carried inside this
+ *                   tunnel: the policy gets a second, tunnel-mode template.
+ *                   Without it the kernel applies only this policy and the
+ *                   packet leaves untunnelled.
  * @return 0 on success, -1 on error
  */
 int xfrm_add_policy(const char *src_ip, const char *dst_ip,
                     uint16_t src_port, uint16_t dst_port, int proto,
                     int dir, uint32_t spi,
-                    const char *tmpl_src, const char *tmpl_dst);
+                    const char *tmpl_src, const char *tmpl_dst,
+                    const struct XfrmTunnel *outer = nullptr);
 
 /**
  * Delete a Security Policy from the kernel.

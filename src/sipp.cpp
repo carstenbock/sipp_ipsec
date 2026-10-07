@@ -253,6 +253,11 @@ struct sipp_option options_table[] = {
      "Keep it clear of net.ipv4.ip_local_port_range.", SIPP_OPTION_INT, &ipsec_port_min, 1},
     {"ipsec_port_max", "Set the highest UE protected port (port-c/port-s). Default is 65535.", SIPP_OPTION_INT, &ipsec_port_max, 1},
 #endif
+#ifdef USE_SWU
+    {"swu_epdg", "Set the ePDG that the <swu_attach> action builds its VoWiFi tunnel to\n"
+     "(IKEv2 with EAP-AKA' on UDP 4500, 3GPP TS 24.302). IPv4 address or host name.\n"
+     "Needs -t un and root or CAP_NET_ADMIN.", SIPP_OPTION_STRING, &swu_epdg, 1},
+#endif
     {"s", "Set the username part of the request URI. Default is 'service'.", SIPP_OPTION_STRING, &service, 1},
     {"default_behaviors", "Set the default behaviors that SIPp will use.  Possible values are:\n"
      "- all\tUse all default behaviors\n"
@@ -613,6 +618,9 @@ static void traffic_thread(int &rtp_errors, int &echo_errors)
         update_clock_tick();
         /* Receive incoming messages */
         SIPpSocket::pollset_process(running_tasks->empty());
+#ifdef USE_SWU
+        SwuSession::poll_all();
+#endif
     }
     assert(0);
 }
@@ -646,8 +654,47 @@ static void rtp_echo_thread(void* param)
         WARNING("Cannot set socket timeout. error: %d", errno);
     }
 
+#ifdef USE_SWU
+    /* VoWiFi: the socket is bound to every address (see
+     * setup_media_sockets()), and each UE has its own. The echo has to leave
+     * from the address the packet came in on, or it would carry the outer
+     * address as source and miss the UE's tunnel. */
+    struct in_addr echo_local;
+    char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    const bool per_ue_addr = swu_epdg != nullptr && !media_ip_is_ipv6;
+    if (per_ue_addr) {
+        int on = 1;
+        if (setsockopt(sock, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on)) < 0) {
+            WARNING("Cannot enable IP_PKTINFO on the RTP echo socket. error: %d", errno);
+        }
+    }
+#endif
+
     while (run_echo_thread.load(std::memory_order_relaxed)) {
         len = sizeof(remote_rtp_addr);
+#ifdef USE_SWU
+        if (per_ue_addr) {
+            struct iovec iov = { msg.data(), (size_t)media_bufsize };
+            struct msghdr mh;
+            memset(&mh, 0, sizeof(mh));
+            mh.msg_name = &remote_rtp_addr;
+            mh.msg_namelen = sizeof(remote_rtp_addr);
+            mh.msg_iov = &iov;
+            mh.msg_iovlen = 1;
+            mh.msg_control = cbuf;
+            mh.msg_controllen = sizeof(cbuf);
+            nr = recvmsg(sock, &mh, 0);
+            len = mh.msg_namelen;
+            echo_local.s_addr = INADDR_ANY;
+            if (nr >= 0) {
+                for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+                    if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO) {
+                        echo_local = ((struct in_pktinfo *)CMSG_DATA(cm))->ipi_addr;
+                    }
+                }
+            }
+        } else
+#endif
         nr = recvfrom(sock, msg.data(), media_bufsize, 0,
                       (sockaddr*)&remote_rtp_addr, &len);
 
@@ -662,6 +709,26 @@ static void rtp_echo_thread(void* param)
         if (!rtp_echo_state) {
             continue;
         }
+#ifdef USE_SWU
+        if (per_ue_addr) {
+            struct iovec iov = { msg.data(), (size_t)nr };
+            struct msghdr mh;
+            memset(&mh, 0, sizeof(mh));
+            memset(cbuf, 0, sizeof(cbuf));
+            mh.msg_name = &remote_rtp_addr;
+            mh.msg_namelen = len;
+            mh.msg_iov = &iov;
+            mh.msg_iovlen = 1;
+            mh.msg_control = cbuf;
+            mh.msg_controllen = sizeof(cbuf);
+            struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+            cm->cmsg_level = IPPROTO_IP;
+            cm->cmsg_type = IP_PKTINFO;
+            cm->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+            ((struct in_pktinfo *)CMSG_DATA(cm))->ipi_spec_dst = echo_local;
+            ns = sendmsg(sock, &mh, 0);
+        } else
+#endif
         ns = sendto(sock, msg.data(), nr, 0,
                     (sockaddr*)&remote_rtp_addr, len);
 
@@ -1132,6 +1199,11 @@ void sipp_exit(int rc, int rtp_errors, int echo_errors)
         already_exited = 1;
     }
 
+#ifdef USE_SWU
+    /* Calls still alive are not destroyed on exit: release their tunnels. */
+    SwuSession::shutdown_all();
+#endif
+
     screen_exit();
     print_last_stats();
     print_errors();
@@ -1310,7 +1382,16 @@ static void setup_media_sockets()
             const bool last_attempt = (
                 try_counter == max_tries || media_port >= (max_rtp_port - 2));
 
-            if (bind_rtp_sockets(&media_sockaddr, media_port, last_attempt) == 0) {
+            struct sockaddr_storage echo_sockaddr = media_sockaddr;
+#ifdef USE_SWU
+            /* VoWiFi: RTP arrives on each UE's inner address, which does not
+             * exist yet. Listen on all of them; rtp_echo_thread() answers
+             * from the one a packet came in on. */
+            if (swu_epdg && !media_ip_is_ipv6) {
+                (_RCAST(struct sockaddr_in*, &echo_sockaddr))->sin_addr.s_addr = INADDR_ANY;
+            }
+#endif
+            if (bind_rtp_sockets(&echo_sockaddr, media_port, last_attempt) == 0) {
                 break;
             }
 

@@ -32,7 +32,7 @@ class CSample;
 #endif
 #include "rtpstream.hpp"
 
-#define MAX_ACTION_MESSAGE 3
+#define MAX_ACTION_MESSAGE 4
 
 class CAction
 {
@@ -94,6 +94,10 @@ public:
 #ifdef USE_IPSEC
         E_AT_IPSEC_SETUP,
         E_AT_IPSEC_TEARDOWN,
+#endif
+#ifdef USE_SWU
+        E_AT_SWU_ATTACH,
+        E_AT_SWU_DETACH,
 #endif
         E_AT_NB_ACTION
     };

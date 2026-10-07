@@ -19,6 +19,7 @@ Welcome to SIPp reference documentation!
    controlling
    transport
    ipsec
+   swu
    volte_scenarios
    media
    statistics

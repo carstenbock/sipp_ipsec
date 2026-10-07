@@ -58,6 +58,9 @@ attribute on `<recv>` captures the Record-Route headers, and the
 | `volte_mixed_load.xml` | CSV-driven load test | REGISTER + INVITE (from CSV) + media + BYE + de-REGISTER |
 | `volte_reregister_cycle.xml` | Registration refresh stress test | REGISTER + re-REGISTER cycle + de-REGISTER |
 | `volte_routing_probe.xml` | SBC routing validation | REGISTER + INVITE (no media) + CANCEL/BYE + de-REGISTER |
+| `vowifi_uac.xml` | VoWiFi MO call | SWu attach + REGISTER + INVITE (PRACK when the 183 is reliable) + PCAP audio from the UE's inner address + BYE + de-REGISTER + SWu detach |
+| `vowifi_uas.xml` | VoWiFi MT call | SWu attach + REGISTER + wait for INVITE + answer + RTP echo from the UE's inner address + BYE + de-REGISTER + SWu detach |
+| `vowifi_register.xml` | IMS registration over untrusted WLAN | SWu attach to the ePDG (IKEv2, EAP-AKA' or EAP-AKA) + REGISTER/401/IPSec/REGISTER/200 + de-REGISTER + SWu detach |
 
 ## Prerequisites
 
@@ -155,6 +158,42 @@ Example row:
 
 ```
 ue_to_gw,tel:+4989200011251,ims.mnc001.mcc001.3gppnetwork.org,494034927217,116,9,8000,001019999900001
+```
+
+### VoWiFi Registration via an ePDG
+
+One UE per line in `users.csv` (`<imsi>;<K hex>;<OPc hex>`). `eap_prefix` selects the EAP method: `6` for EAP-AKA', `0` for EAP-AKA. See `docs/swu.rst`.
+
+```bash
+sudo ./sipp -sf sipp_scenarios/vowifi_register.xml \
+    -swu_epdg <epdg_ip> -ipsec -t un -inf users.csv \
+    -key eap_prefix 6 \
+    -key domain ims.mnc001.mcc001.3gppnetwork.org \
+    -key nai_realm nai.epc.mnc001.mcc001.3gppnetwork.org \
+    -key wlan_node_id 001122334455 \
+    <pcscf_ip>:5060
+```
+
+### VoWiFi Call (MO and MT)
+
+Callee first, in one SIPp; then the caller in another. `callees.csv` holds `<imsi>;<K>;<OPc>;<own MSISDN>`, `callers.csv` additionally `;<target URI>`. `-d` is the call duration in ms.
+
+```bash
+sudo ./sipp -sf sipp_scenarios/vowifi_uas.xml -rtp_echo \
+    -swu_epdg <epdg_ip> -ipsec -t un -inf callees.csv \
+    -key eap_prefix 6 \
+    -key domain ims.mnc001.mcc001.3gppnetwork.org \
+    -key nai_realm nai.epc.mnc001.mcc001.3gppnetwork.org \
+    -key wlan_node_id 001122334455 \
+    <pcscf_ip>:5060
+
+sudo ./sipp -sf sipp_scenarios/vowifi_uac.xml -d 10000 \
+    -swu_epdg <epdg_ip> -ipsec -t un -inf callers.csv \
+    -key eap_prefix 6 \
+    -key domain ims.mnc001.mcc001.3gppnetwork.org \
+    -key nai_realm nai.epc.mnc001.mcc001.3gppnetwork.org \
+    -key wlan_node_id 001122334455 \
+    <pcscf_ip>:5060
 ```
 
 ### Docker

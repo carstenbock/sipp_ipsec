@@ -1390,7 +1390,8 @@ SIPpSocket* SIPpSocket::new_sipp_call_socket(bool use_ipv6, int transport, bool 
 }
 
 #ifdef USE_IPSEC
-SIPpSocket* SIPpSocket::new_sipp_ipsec_socket(bool use_ipv6, int transport, uint16_t local_port) {
+SIPpSocket* SIPpSocket::new_sipp_ipsec_socket(bool use_ipv6, int transport, uint16_t local_port,
+                                              const char *bind_ip) {
     SIPpSocket *sock = new_sipp_socket(use_ipv6, transport);
     if (!sock) {
         WARNING("Could not create IPSec socket");
@@ -1401,6 +1402,13 @@ SIPpSocket* SIPpSocket::new_sipp_ipsec_socket(bool use_ipv6, int transport, uint
     /* Bind to the specific local port for IPSec protected traffic */
     struct sockaddr_storage bind_addr;
     memcpy(&bind_addr, &local_sockaddr, sizeof(bind_addr));
+    /* -t ui: the call has its own source address, not the process-wide one */
+    if (bind_ip && gai_getsockaddr(&bind_addr, bind_ip, local_port,
+                                   AI_PASSIVE, AF_UNSPEC) != 0) {
+        WARNING("Could not resolve IPSec bind address '%s'", bind_ip);
+        sock->close();
+        return nullptr;
+    }
     sockaddr_update_port(&bind_addr, local_port);
 
     int port_val = local_port;

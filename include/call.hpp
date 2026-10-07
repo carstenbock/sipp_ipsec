@@ -34,6 +34,9 @@
 #endif
 #include "rtpstream.hpp"
 #include "srtp_channel.hpp"
+#ifdef USE_SWU
+#include "swu.hpp"
+#endif
 #ifdef USE_IPSEC
 #include "ipsec_manager.hpp"
 #endif
@@ -220,6 +223,16 @@ protected:
     int  ipsec_activate_sas();
     void ipsec_teardown_sas();
     int  ipsec_rebind_socket();
+    /* This call's own source address inside its SWu tunnel, or nullptr */
+    const char *tunnel_ip();
+#endif
+#ifdef USE_SWU
+    /* VoWiFi: the call's tunnel to the ePDG */
+    SwuSession    *swu;
+    bool           swu_wait;        /* attach or detach in progress */
+    bool           swu_detaching;
+    unsigned int   swu_wake;
+    bool           swu_settle();
 #endif
 
     unsigned int   next_retrans;

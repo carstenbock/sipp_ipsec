@@ -39,9 +39,9 @@ IPSecManager::IPSecManager() : initialized_(false) {}
 
 IPSecManager::~IPSecManager()
 {
-    if (initialized_) {
-        xfrm_cleanup();
-    }
+    /* The XFRM netlink socket is shared by all calls and stays open:
+     * closing it here made every other call's teardown fail with "XFRM
+     * netlink not initialized", leaving its SAs and policies in the kernel. */
 }
 
 int IPSecManager::init()
@@ -217,8 +217,10 @@ int IPSecManager::setup_policy_pair(const IPSecParams &params,
                                     uint16_t src_port, uint16_t dst_port,
                                     uint32_t spi, int dir)
 {
+    XfrmTunnel outer = { params.tun_local, params.tun_remote, params.tun_reqid };
     return xfrm_add_policy(src, dst, src_port, dst_port, params.proto,
-                           dir, spi, src, dst);
+                           dir, spi, src, dst,
+                           params.tun_reqid ? &outer : nullptr);
 }
 
 int IPSecManager::setup_security_associations(IPSecParams &params)

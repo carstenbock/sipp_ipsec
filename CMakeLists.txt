@@ -238,6 +238,14 @@ if(USE_IPSEC)
   message(STATUS "IPSec support enabled (using libmnl)")
 endif(USE_IPSEC)
 
+# SWu (VoWiFi tunnel to an ePDG) builds on the IPSec support and OpenSSL
+if(USE_IPSEC AND NOT USE_WOLFSSL)
+  add_definitions("-DUSE_SWU")
+  message(STATUS "SWu (VoWiFi) support enabled")
+else()
+  list(REMOVE_ITEM all_SRCS "${PROJECT_SOURCE_DIR}/src/swu.cpp")
+endif()
+
 # Find all libraries before creating targets
 if(PKG_CONFIG_FOUND)
   pkg_search_module(CURSES_LIBRARY ncursesw cursesw ncurses curses)

@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  VoWiFi MT call via an ePDG (3GPP TS 24.302, TS 33.203, TS 24.229)
+
+  Each call is one UE on untrusted WLAN access:
+    0. SWu attach to the ePDG (IKEv2, EAP-AKA' or EAP-AKA)
+    1. IMS registration with IPSec, nested inside the SWu tunnel
+    2. Waits for an INVITE, answers it (100/180/200) with a PCMA SDP
+    3. Echoes the RTP it receives (-rtp_echo) from the UE's inner address
+    4. Answers the BYE, de-registers, SWu detach
+
+  Usage:
+    sudo ./sipp -sf vowifi_uas.xml \
+      -swu_epdg <epdg_ip> -ipsec -t un -rtp_echo \
+      -inf callees.csv \
+      -key eap_prefix 6 \
+      -key domain ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
+      -key nai_realm nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org \
+      -key wlan_node_id 001122334455 \
+      <pcscf_ip>:5060
+
+  callees.csv, one UE per line:  <imsi>;<K hex>;<OPc hex>;<own MSISDN>
+
+  With -swu_epdg the RTP echo socket listens on every address and answers
+  from the one a packet arrived on, so all UEs share one media port, each on
+  its own inner address.
+-->
+
+<scenario name="VoWiFi MT call via ePDG">
+
+  <!-- ================================================================== -->
+  <!-- Phase 0: SWu attach (see vowifi_register.xml / docs/swu.rst)        -->
+  <!-- ================================================================== -->
+  <nop>
+    <action>
+      <swu_attach identity="[eap_prefix][field0]@[nai_realm]" k="[field1]" opc="[field2]" apn="ims"/>
+    </action>
+  </nop>
+
+  <!-- ================================================================== -->
+  <!-- Phase 1: IMS REGISTER with IPSec sec-agree                         -->
+  <!-- ================================================================== -->
+
+  <!-- Initial REGISTER (unprotected) with Security-Client -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[field0]@[domain]>;tag=[call_number]
+      To: <sip:[field0]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Authorization: Digest username="[field0]@[domain]",realm="[domain]",uri="sip:[domain]",nonce="",response=""
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoWiFi/1.0
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 401 Unauthorized with AKA challenge + Security-Server -->
+  <recv response="401" auth="true">
+    <action>
+      <ipsec_setup />
+    </action>
+  </recv>
+
+  <!-- Re-REGISTER over IPSec (AKA auth derives CK/IK, creates XFRM SAs) -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[field0]@[domain]>;tag=[call_number]
+      To: <sip:[field0]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoWiFi/1.0
+      Expires: 600000
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 200 OK — extract Service-Route per RFC 3608 -->
+  <recv response="200">
+    <action>
+      <ereg regexp=".*" search_in="hdr" header="Service-Route:" check_it="false" assign_to="service_route"/>
+    </action>
+  </recv>
+
+  <!-- ================================================================== -->
+  <!-- Phase 2: Wait for incoming MT call                                  -->
+  <!-- ================================================================== -->
+
+  <!-- ===== Receive INVITE ===== -->
+  <!-- rrs="true" captures Record-Route so responses echo it back (RFC 3261 §12.1.1) -->
+  <recv request="INVITE" crlf="true" rrs="true">
+    <action>
+      <exec rtp_echo="true"/>
+    </action>
+  </recv>
+
+  <!-- ===== 100 Trying ===== -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 100 Trying
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Short pause to simulate alerting -->
+  <pause milliseconds="2000"/>
+
+  <!-- ===== 180 Ringing ===== -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 180 Ringing
+      [last_Via:]
+      [last_Record-Route:]
+      [last_From:]
+      To: [last_To:];tag=[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>
+      Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- Simulate ring duration before answering -->
+  <pause milliseconds="3000"/>
+
+  <!-- ===== 200 OK ===== -->
+  <send retrans="500">
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_Record-Route:]
+      [last_From:]
+      To: [last_To:];tag=[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Allow: ACK,BYE,CANCEL,INFO,INVITE,MESSAGE,NOTIFY,OPTIONS,PRACK,REFER,UPDATE
+      Supported: 100rel,path,precondition,replaces,timer
+      User-Agent: SIPp-VoWiFi/1.0
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=- [call_number] 1 IN IP[local_ip_type] [media_ip]
+      s=-
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 8 101
+      a=rtpmap:8 PCMA/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+      a=ptime:20
+      a=sendrecv
+
+    ]]>
+  </send>
+
+  <!-- ===== Receive ACK ===== -->
+  <recv request="ACK"/>
+
+  <!-- The caller decides how long the call lasts: wait for its BYE -->
+  <!-- ===== Receive BYE (caller hangs up) ===== -->
+  <recv request="BYE"/>
+
+  <!-- ===== 200 OK for BYE ===== -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- ================================================================== -->
+  <!-- Phase 3: De-REGISTER (Expires: 0) + IPSec teardown                 -->
+  <!-- ================================================================== -->
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[domain] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Route: <sip:[remote_ip]:[remote_port];lr>
+      From: <sip:[field0]@[domain]>;tag=[call_number]
+      To: <sip:[field0]@[domain]>
+      Call-ID: [call_id]
+      CSeq: 3 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=0
+      [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
+      Supported: path, gruu, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Security-Verify: [security_verify]
+      Max-Forwards: 70
+      Allow: INVITE, ACK, BYE, CANCEL, UPDATE, PRACK, NOTIFY, MESSAGE, REFER, OPTIONS
+      User-Agent: SIPp-VoWiFi/1.0
+      Expires: 0
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- 200 OK for de-registration — tear down IPSec SAs -->
+  <recv response="200">
+    <action>
+      <ipsec_teardown />
+    </action>
+  </recv>
+
+  <!-- Response time and call length repartition tables -->
+  <!-- SWu detach (IKE Delete); the call waits for the ePDG's answer -->
+  <nop>
+    <action>
+      <swu_detach/>
+    </action>
+  </nop>
+
+  <!-- service_route is captured at registration but an MT-only UE sends no
+       initial request; SIPp refuses to start with an unused variable. -->
+  <Reference variables="service_route"/>
+
+  <ResponseTimeRepartition value="100, 200, 300, 500, 1000, 2000, 5000"/>
+  <CallLengthRepartition value="1000, 5000, 10000, 30000, 60000"/>
+
+</scenario>

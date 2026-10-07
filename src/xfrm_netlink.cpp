@@ -33,6 +33,14 @@
 #include <linux/netlink.h>
 #include <libmnl/libmnl.h>
 
+/* <linux/udp.h> clashes with <netinet/udp.h>, which sipp.hpp pulls in */
+#ifndef UDP_ENCAP
+#define UDP_ENCAP 100
+#endif
+#ifndef UDP_ENCAP_ESPINUDP
+#define UDP_ENCAP_ESPINUDP 2
+#endif
+
 /* Use a fixed buffer size to avoid VLA in C++ */
 #define XFRM_BUF_SIZE 8192
 
@@ -42,6 +50,10 @@ static uint32_t xfrm_portid = 0;
 
 static int parse_ip(const char *ip_str, xfrm_address_t *addr, uint16_t *family)
 {
+    /* An IPv4 address fills 4 of the 16 bytes. The kernel finds a policy by
+     * comparing the whole selector, so leftover stack bytes here made a later
+     * delete miss the policy it was meant for (ENOENT) and leave it behind. */
+    memset(addr, 0, sizeof(*addr));
     if (inet_pton(AF_INET, ip_str, &addr->a4) == 1) {
         *family = AF_INET;
         return 0;
@@ -79,6 +91,10 @@ static int xfrm_send_and_recv(struct nlmsghdr *nlh)
 
 int xfrm_init(void)
 {
+    /* One socket for the process: every call's IPSecManager calls this. */
+    if (xfrm_nl) {
+        return 0;
+    }
     xfrm_nl = mnl_socket_open(NETLINK_XFRM);
     if (!xfrm_nl) {
         WARNING("Failed to open XFRM netlink socket: %s", strerror(errno));
@@ -270,10 +286,196 @@ int xfrm_del_sa(const char *src_ip, const char *dst_ip,
     return xfrm_send_and_recv(nlh);
 }
 
+/* Tunnel-mode template of the SWu SA pair, in the direction of the policy. */
+static int fill_tunnel_tmpl(struct xfrm_user_tmpl *tmpl, const XfrmTunnel *tun, int dir)
+{
+    const char *src = (dir == XFRM_POLICY_OUT) ? tun->local : tun->remote;
+    const char *dst = (dir == XFRM_POLICY_OUT) ? tun->remote : tun->local;
+    uint16_t src_family, dst_family;
+
+    memset(tmpl, 0, sizeof(*tmpl));
+    if (parse_ip(src, &tmpl->saddr, &src_family) < 0 ||
+        parse_ip(dst, &tmpl->id.daddr, &dst_family) < 0 ||
+        src_family != dst_family) {
+        WARNING("Invalid tunnel endpoints: %s / %s", src, dst);
+        return -1;
+    }
+    tmpl->id.proto = IPPROTO_ESP;
+    tmpl->family = src_family;
+    tmpl->mode = XFRM_MODE_TUNNEL;
+    tmpl->reqid = tun->reqid;
+    tmpl->aalgos = ~0u;
+    tmpl->ealgos = ~0u;
+    tmpl->calgos = ~0u;
+    return 0;
+}
+
+int xfrm_add_tunnel_sa(const char *src_ip, const char *dst_ip,
+                       uint32_t spi, uint32_t reqid,
+                       uint16_t encap_sport, uint16_t encap_dport,
+                       const unsigned char *enc_key, int enc_bits,
+                       const unsigned char *auth_key, int auth_bits)
+{
+    char buf[XFRM_BUF_SIZE];
+    struct nlmsghdr *nlh;
+    struct xfrm_usersa_info *sa;
+    xfrm_address_t src_addr, dst_addr;
+    uint16_t src_family, dst_family;
+
+    if (!xfrm_nl) {
+        WARNING("XFRM netlink not initialized");
+        return -1;
+    }
+    if (parse_ip(src_ip, &src_addr, &src_family) < 0 ||
+        parse_ip(dst_ip, &dst_addr, &dst_family) < 0 ||
+        src_family != dst_family) {
+        WARNING("Invalid tunnel SA addresses: %s -> %s", src_ip, dst_ip);
+        return -1;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type = XFRM_MSG_NEWSA;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    nlh->nlmsg_seq = ++xfrm_seq;
+
+    sa = (struct xfrm_usersa_info *)mnl_nlmsg_put_extra_header(nlh, sizeof(*sa));
+    sa->sel.family = src_family;    /* any inner traffic; the policies select */
+    sa->id.daddr = dst_addr;
+    sa->id.spi = htonl(spi);
+    sa->id.proto = IPPROTO_ESP;
+    sa->saddr = src_addr;
+    sa->family = src_family;
+    sa->mode = XFRM_MODE_TUNNEL;
+    sa->replay_window = 32;
+    sa->reqid = reqid;
+    sa->lft.soft_byte_limit = XFRM_INF;
+    sa->lft.hard_byte_limit = XFRM_INF;
+    sa->lft.soft_packet_limit = XFRM_INF;
+    sa->lft.hard_packet_limit = XFRM_INF;
+
+    /* HMAC-SHA2-256 truncated to 128 bits (RFC 4868); plain XFRMA_ALG_AUTH
+     * would give the kernel's 96-bit default and every packet would fail. */
+    {
+        char abuf[sizeof(struct xfrm_algo_auth) + 64];
+        struct xfrm_algo_auth *auth = (struct xfrm_algo_auth *)abuf;
+        int key_bytes = auth_bits / 8;
+        memset(abuf, 0, sizeof(abuf));
+        strncpy(auth->alg_name, "hmac(sha256)", sizeof(auth->alg_name) - 1);
+        auth->alg_key_len = auth_bits;
+        auth->alg_trunc_len = 128;
+        memcpy(auth->alg_key, auth_key, key_bytes);
+        mnl_attr_put(nlh, XFRMA_ALG_AUTH_TRUNC, sizeof(*auth) + key_bytes, auth);
+    }
+    {
+        char ebuf[sizeof(struct xfrm_algo) + 64];
+        struct xfrm_algo *enc = (struct xfrm_algo *)ebuf;
+        int key_bytes = enc_bits / 8;
+        memset(ebuf, 0, sizeof(ebuf));
+        strncpy(enc->alg_name, XFRM_EALG_AES_CBC, sizeof(enc->alg_name) - 1);
+        enc->alg_key_len = enc_bits;
+        memcpy(enc->alg_key, enc_key, key_bytes);
+        mnl_attr_put(nlh, XFRMA_ALG_CRYPT, sizeof(*enc) + key_bytes, enc);
+    }
+    {
+        struct xfrm_encap_tmpl encap;
+        memset(&encap, 0, sizeof(encap));
+        encap.encap_type = UDP_ENCAP_ESPINUDP;
+        encap.encap_sport = htons(encap_sport);
+        encap.encap_dport = htons(encap_dport);
+        mnl_attr_put(nlh, XFRMA_ENCAP, sizeof(encap), &encap);
+    }
+
+    return xfrm_send_and_recv(nlh);
+}
+
+/* Selector "everything from inner_ip" (out) or "everything to inner_ip" (in). */
+static int fill_inner_selector(struct xfrm_selector *sel, const char *inner_ip, int dir)
+{
+    xfrm_address_t addr;
+    uint16_t family;
+
+    if (parse_ip(inner_ip, &addr, &family) < 0) {
+        WARNING("Invalid inner IP: %s", inner_ip);
+        return -1;
+    }
+    sel->family = family;
+    if (dir == XFRM_POLICY_OUT) {
+        sel->saddr = addr;
+        sel->prefixlen_s = (family == AF_INET) ? 32 : 128;
+    } else {
+        sel->daddr = addr;
+        sel->prefixlen_d = (family == AF_INET) ? 32 : 128;
+    }
+    return 0;
+}
+
+int xfrm_add_tunnel_policy(const char *inner_ip, int dir, const XfrmTunnel *tun)
+{
+    char buf[XFRM_BUF_SIZE];
+    struct nlmsghdr *nlh;
+    struct xfrm_userpolicy_info *pol;
+    struct xfrm_user_tmpl tmpl;
+
+    if (!xfrm_nl) {
+        WARNING("XFRM netlink not initialized");
+        return -1;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type = XFRM_MSG_NEWPOLICY;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    nlh->nlmsg_seq = ++xfrm_seq;
+
+    pol = (struct xfrm_userpolicy_info *)mnl_nlmsg_put_extra_header(nlh, sizeof(*pol));
+    if (fill_inner_selector(&pol->sel, inner_ip, dir) < 0 ||
+        fill_tunnel_tmpl(&tmpl, tun, dir) < 0) {
+        return -1;
+    }
+    pol->dir = dir;
+    pol->action = XFRM_POLICY_ALLOW;
+    pol->priority = 3000;   /* after the IMS policies (2000) */
+    pol->lft.soft_byte_limit = XFRM_INF;
+    pol->lft.hard_byte_limit = XFRM_INF;
+    pol->lft.soft_packet_limit = XFRM_INF;
+    pol->lft.hard_packet_limit = XFRM_INF;
+    mnl_attr_put(nlh, XFRMA_TMPL, sizeof(tmpl), &tmpl);
+
+    return xfrm_send_and_recv(nlh);
+}
+
+int xfrm_del_tunnel_policy(const char *inner_ip, int dir)
+{
+    char buf[XFRM_BUF_SIZE];
+    struct nlmsghdr *nlh;
+    struct xfrm_userpolicy_id *pol_id;
+
+    if (!xfrm_nl) {
+        WARNING("XFRM netlink not initialized");
+        return -1;
+    }
+
+    memset(buf, 0, sizeof(buf));
+    nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type = XFRM_MSG_DELPOLICY;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_seq = ++xfrm_seq;
+
+    pol_id = (struct xfrm_userpolicy_id *)mnl_nlmsg_put_extra_header(nlh, sizeof(*pol_id));
+    if (fill_inner_selector(&pol_id->sel, inner_ip, dir) < 0) {
+        return -1;
+    }
+    pol_id->dir = dir;
+
+    return xfrm_send_and_recv(nlh);
+}
+
 int xfrm_add_policy(const char *src_ip, const char *dst_ip,
                     uint16_t src_port, uint16_t dst_port, int proto,
                     int dir, uint32_t spi,
-                    const char *tmpl_src, const char *tmpl_dst)
+                    const char *tmpl_src, const char *tmpl_dst,
+                    const XfrmTunnel *outer)
 {
     char buf[XFRM_BUF_SIZE];
     struct nlmsghdr *nlh;
@@ -336,7 +538,9 @@ int xfrm_add_policy(const char *src_ip, const char *dst_ip,
         return -1;
     }
 
-    struct xfrm_user_tmpl tmpl;
+    /* tmpls[0] is applied first (innermost); tmpls[1] wraps it in the tunnel */
+    struct xfrm_user_tmpl tmpls[2];
+    struct xfrm_user_tmpl &tmpl = tmpls[0];
     memset(&tmpl, 0, sizeof(tmpl));
     tmpl.id.daddr = tdst_addr;
     tmpl.id.spi = htonl(spi);
@@ -349,7 +553,11 @@ int xfrm_add_policy(const char *src_ip, const char *dst_ip,
     tmpl.ealgos = ~0u;
     tmpl.calgos = ~0u;
 
-    mnl_attr_put(nlh, XFRMA_TMPL, sizeof(tmpl), &tmpl);
+    if (outer && fill_tunnel_tmpl(&tmpls[1], outer, dir) < 0) {
+        return -1;
+    }
+
+    mnl_attr_put(nlh, XFRMA_TMPL, (outer ? 2 : 1) * sizeof(tmpl), tmpls);
 
     return xfrm_send_and_recv(nlh);
 }

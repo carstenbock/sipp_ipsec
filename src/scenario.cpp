@@ -1606,6 +1606,16 @@ void scenario::parseAction(CActions *actions)
         } else if(!strcmp(actionElem, "ipsec_teardown")) {
             tmpAction->setActionType(CAction::E_AT_IPSEC_TEARDOWN);
 #endif
+#ifdef USE_SWU
+        } else if(!strcmp(actionElem, "swu_attach")) {
+            tmpAction->setMessage(xp_get_string("identity", actionElem), 0);
+            tmpAction->setMessage(xp_get_string("k", actionElem), 1);
+            tmpAction->setMessage(xp_get_string("opc", actionElem), 2);
+            tmpAction->setMessage(xp_get_value("apn") ? xp_get_value("apn") : "ims", 3);
+            tmpAction->setActionType(CAction::E_AT_SWU_ATTACH);
+        } else if(!strcmp(actionElem, "swu_detach")) {
+            tmpAction->setActionType(CAction::E_AT_SWU_DETACH);
+#endif
         } else if(!strcmp(actionElem, "strcmp")) {
             if (xp_get_value("check_it")) {
                 tmpAction->setCheckIt(xp_get_bool("check_it", "strcmp"));

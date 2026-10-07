@@ -65,6 +65,9 @@
 #ifdef USE_IPSEC
 #include "security_headers.hpp"
 #endif
+#ifdef USE_SWU
+static bool swu_hex16(const char *hex, uint8_t out[16]);
+#endif
 
 template<typename Out>
 void split(const std::string &s, char delim, Out result) {
@@ -165,6 +168,12 @@ unsigned int call::wake()
     if (recv_timeout && (!wake || (recv_timeout < wake))) {
         wake = recv_timeout;
     }
+
+#ifdef USE_SWU
+    if (swu_wake && (!wake || (swu_wake < wake))) {
+        wake = swu_wake;
+    }
+#endif
 
     return wake;
 }
@@ -911,6 +920,12 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     ipsec_socket = nullptr;
     ipsec_server_socket = nullptr;
 #endif
+#ifdef USE_SWU
+    swu = nullptr;
+    swu_wait = false;
+    swu_detaching = false;
+    swu_wake = 0;
+#endif
 
     //
     // JLSRTP CLIENT context constants
@@ -1227,6 +1242,9 @@ call::~call()
      * the next call get a port that is still in use. */
     IPSecManager::release_local_ports(ipsec_params);
 #endif
+#ifdef USE_SWU
+    delete swu;
+#endif
 
     if (use_tdmmap) {
         tdm_map[tdm_map_number] = false;
@@ -1369,6 +1387,12 @@ bool call::connect_socket_if_needed()
         if (peripsocket) {
             gai_getsockaddr(&saddr, peripaddr, local_port, AI_PASSIVE, AF_UNSPEC);
         }
+#ifdef USE_IPSEC
+        if (tunnel_ip()) {
+            /* VoWiFi: the UE's address is the one the ePDG assigned */
+            gai_getsockaddr(&saddr, tunnel_ip(), (unsigned short)0, AI_PASSIVE, AF_UNSPEC);
+        }
+#endif
 
         if (sipp_bind_socket(call_socket, &saddr, &call_port)) {
             ERROR_NO("Unable to bind UDP socket");
@@ -2124,6 +2148,24 @@ bool call::run()
 
     update_clock_tick();
 
+#ifdef USE_SWU
+    if (swu_wait) {
+        if (swu->busy()) {
+            /* SwuSession::poll_all() drives the exchange with the ePDG */
+            swu_wake = clock_tick + 10;
+            setPaused();
+            return true;
+        }
+        swu_wake = 0;
+        swu_wait = false;
+        if (!swu_settle()) {
+            /* E_NO_ACTION: counted as one failed call, no further reason */
+            terminate(CStat::E_NO_ACTION);
+            return false;
+        }
+    }
+#endif
+
     message *curmsg;
     if (initCall) {
         if(msg_index >= (int)call_scenario->initmessages.size()) {
@@ -2653,6 +2695,12 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             }
             break;
         case E_Message_Remote_IP:
+#ifdef USE_SWU
+            if (tunnel_ip() && *swu->pcscf()) {
+                dest += snprintf(dest, left, "%s", swu->pcscf());
+                break;
+            }
+#endif
             dest += snprintf(dest, left, "%s", remote_ip_w_brackets);
             break;
         case E_Message_Remote_Host:
@@ -2681,6 +2729,12 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
 #endif
             break;
         case E_Message_Local_IP:
+#ifdef USE_IPSEC
+            if (tunnel_ip()) {
+                dest += snprintf(dest, left, "%s", tunnel_ip());
+                break;
+            }
+#endif
             dest += snprintf(dest, left, "%s", local_ip_w_brackets);
             break;
         case E_Message_Local_Port: {
@@ -2717,6 +2771,12 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             dest += snprintf(dest, left, "%s", TRANSPORT_TO_STRING(transport));
             break;
         case E_Message_Local_IP_Type:
+#ifdef USE_IPSEC
+            if (tunnel_ip()) {
+                dest += snprintf(dest, left, "4");  /* SWu inner addresses are IPv4 */
+                break;
+            }
+#endif
             dest += snprintf(dest, left, "%s", (local_ip_is_ipv6 ? "6" : "4"));
             break;
         case E_Message_Server_IP: {
@@ -2738,6 +2798,12 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         }
         break;
         case E_Message_Media_IP:
+#ifdef USE_IPSEC
+            if (tunnel_ip()) {
+                dest += snprintf(dest, left, "%s", tunnel_ip());
+                break;
+            }
+#endif
             dest += snprintf(dest, left, "%s", media_ip);
             break;
         case E_Message_Auto_Media_Port:
@@ -6041,6 +6107,36 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
         } else if (currentAction->getActionType() == CAction::E_AT_IPSEC_TEARDOWN) {
             ipsec_teardown_sas();
 #endif
+#ifdef USE_SWU
+        } else if (currentAction->getActionType() == CAction::E_AT_SWU_ATTACH) {
+            if (!swu_epdg) {
+                ERROR("<swu_attach> needs the -swu_epdg option");
+            }
+            if (!multisocket || transport != T_UDP) {
+                ERROR("<swu_attach> needs one UDP socket per call (-t un)");
+            }
+            if (swu || call_socket) {
+                ERROR("<swu_attach> must run once, before the call's first message");
+            }
+            SwuConfig cfg;
+            cfg.epdg = swu_epdg;
+            cfg.local_ip = local_ip;
+            cfg.identity = createSendingMessage(currentAction->getMessage(0));
+            if (!swu_hex16(createSendingMessage(currentAction->getMessage(1)), cfg.k) ||
+                !swu_hex16(createSendingMessage(currentAction->getMessage(2)), cfg.opc)) {
+                ERROR("<swu_attach>: k and opc must be 32 hex digits each");
+            }
+            cfg.apn = createSendingMessage(currentAction->getMessage(3));
+            swu = new SwuSession(cfg);
+            swu->start();
+            swu_wait = true;
+        } else if (currentAction->getActionType() == CAction::E_AT_SWU_DETACH) {
+            if (swu) {
+                swu->detach();
+                swu_detaching = true;
+                swu_wait = true;
+            }
+#endif
         } else if (currentAction->getActionType() == CAction::E_AT_JUMP) {
             double operand = get_rhs(currentAction);
             if (msg_index == ((int)operand)) {
@@ -6289,6 +6385,15 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 struct sockaddr_in* from = (struct sockaddr_in*) &(play_args->from);
                 from->sin_family = AF_INET;
                 from->sin_addr.s_addr = inet_addr(media_ip);
+#ifdef USE_IPSEC
+                /* VoWiFi: the UE's RTP comes from the address the ePDG
+                 * assigned, the one [media_ip] put into the SDP. Sent from
+                 * the process-wide media address it would match no tunnel
+                 * policy and leave the host outside the SWu tunnel. */
+                if (tunnel_ip()) {
+                    from->sin_addr.s_addr = inet_addr(tunnel_ip());
+                }
+#endif
             }
             /* Create a thread to send RTP or UDPTL packets */
             pthread_attr_t attr;
@@ -7071,6 +7176,62 @@ TEST(sdp, good_remote_media_addr_v6) {
 #endif
 
 #ifdef USE_IPSEC
+const char *call::tunnel_ip()
+{
+#ifdef USE_SWU
+    if (swu && swu->state() == SWU_ESTABLISHED) {
+        return swu->inner_ip();
+    }
+#endif
+    return nullptr;
+}
+
+#ifdef USE_SWU
+static bool swu_hex16(const char *hex, uint8_t out[16])
+{
+    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
+        hex += 2;
+    }
+    if (strlen(hex) != 32) {
+        return false;
+    }
+    for (int i = 0; i < 16; i++) {
+        unsigned int byte;
+        if (!isxdigit(hex[2 * i]) || !isxdigit(hex[2 * i + 1]) ||
+            sscanf(hex + 2 * i, "%2x", &byte) != 1) {
+            return false;
+        }
+        out[i] = byte;
+    }
+    return true;
+}
+
+/*
+ * An attach or detach has finished. After an attach the call talks from its
+ * inner address to the P-CSCF the ePDG named; false fails the call.
+ */
+bool call::swu_settle()
+{
+    if (swu_detaching) {
+        swu_detaching = false;
+        delete swu;
+        swu = nullptr;
+        return true;
+    }
+    if (swu->state() != SWU_ESTABLISHED) {
+        WARNING("SWu attach failed for call %s: %s", id, swu->error());
+        return false;
+    }
+    if (*swu->pcscf() &&
+        gai_getsockaddr(&call_peer, swu->pcscf(), (unsigned short)remote_port,
+                        AI_PASSIVE, AF_UNSPEC) != 0) {
+        WARNING("Unusable P-CSCF address '%s' from the ePDG", swu->pcscf());
+        return false;
+    }
+    return true;
+}
+#endif
+
 /*
  * Phase 1: Parse the 401 response and store Security-Server parameters.
  * Triggered by the <ipsec_setup/> action on receiving the 401.
@@ -7142,8 +7303,31 @@ int call::ipsec_setup_sas(const char *msg)
     /* Set IP addresses and protocol (IPs always fit; suppress truncation warning) */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
-    snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", local_ip);
+    if (tunnel_ip()) {
+        /* VoWiFi: the IMS SAs run between the address the ePDG assigned and
+         * the P-CSCF it named, nested inside the SWu tunnel. */
+        snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", tunnel_ip());
+    } else if (peripsocket) {
+        /* -t ui: the SAs and the protected sockets belong to this call's
+         * address from the injection file, not to the process-wide one. */
+        char peripaddr[256];
+        char *tmp = peripaddr;
+        getFieldFromInputFile(ip_file, peripfield, nullptr, tmp);
+        snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", peripaddr);
+    } else {
+        snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", local_ip);
+    }
     snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", remote_ip);
+#ifdef USE_SWU
+    if (tunnel_ip()) {
+        if (*swu->pcscf()) {
+            snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", swu->pcscf());
+        }
+        snprintf(ipsec_params.tun_local, sizeof(ipsec_params.tun_local), "%s", swu->outer_local());
+        snprintf(ipsec_params.tun_remote, sizeof(ipsec_params.tun_remote), "%s", swu->outer_remote());
+        ipsec_params.tun_reqid = swu->reqid();
+    }
+#endif
 #pragma GCC diagnostic pop
     ipsec_params.proto = (transport == T_TCP) ? IPPROTO_TCP : IPPROTO_UDP;
 
@@ -7220,7 +7404,8 @@ int call::ipsec_rebind_socket()
         }
 
         ipsec_socket = SIPpSocket::new_sipp_ipsec_socket(
-            use_ipv6, transport, ipsec_params.port_uc);
+            use_ipv6, transport, ipsec_params.port_uc,
+            (peripsocket || tunnel_ip()) ? ipsec_params.local_ip : nullptr);
 
         if (!ipsec_socket) {
             WARNING("Failed to create IPSec socket on port %d", ipsec_params.port_uc);
@@ -7251,7 +7436,8 @@ int call::ipsec_rebind_socket()
      * to this call via Call-ID matching in process_message().
      */
     ipsec_server_socket = SIPpSocket::new_sipp_ipsec_socket(
-        use_ipv6, transport, ipsec_params.port_us);
+        use_ipv6, transport, ipsec_params.port_us,
+        (peripsocket || tunnel_ip()) ? ipsec_params.local_ip : nullptr);
 
     if (!ipsec_server_socket) {
         WARNING("Failed to create IPSec server socket on port %d", ipsec_params.port_us);

@@ -101,7 +101,8 @@ public:
 
 #ifdef USE_IPSEC
     /* Create a new socket bound to a specific local port for IPSec protected traffic */
-    static SIPpSocket* new_sipp_ipsec_socket(bool use_ipv6, int transport, uint16_t local_port);
+    static SIPpSocket* new_sipp_ipsec_socket(bool use_ipv6, int transport, uint16_t local_port,
+                                             const char *bind_ip = nullptr);
 #endif
 
     int ss_count = 1;           /* How many users are there of this socket? */
