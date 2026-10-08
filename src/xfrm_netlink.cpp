@@ -340,7 +340,12 @@ int xfrm_add_tunnel_sa(const char *src_ip, const char *dst_ip,
     nlh->nlmsg_seq = ++xfrm_seq;
 
     sa = (struct xfrm_usersa_info *)mnl_nlmsg_put_extra_header(nlh, sizeof(*sa));
-    sa->sel.family = src_family;    /* any inner traffic; the policies select */
+    /* Any inner traffic of either family (the policies select): with
+     * AF_UNSPEC the kernel sets the SA up for IPv4 and IPv6 packets inside
+     * the tunnel, with the outer family it would take only that one */
+    sa->sel.family = AF_UNSPEC;
+    /* Without this flag the kernel replaces AF_UNSPEC by the outer family */
+    sa->flags |= XFRM_STATE_AF_UNSPEC;
     sa->id.daddr = dst_addr;
     sa->id.spi = htonl(spi);
     sa->id.proto = IPPROTO_ESP;

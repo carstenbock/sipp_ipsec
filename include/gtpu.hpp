@@ -26,6 +26,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include <vector>
 
 /* --- Codec, exposed for the unit tests ---------------------------------- */
@@ -56,11 +57,14 @@ int gtpu_start(const char *local_ip);
 const char *gtpu_error();
 
 /*
- * Bring a UE's default bearer into service: its address becomes a local
- * address (on the TUN device, routed there by source), uplink goes to
- * peer_ip with peer_teid, downlink arrives on local_teid.
+ * Bring a UE's default bearer into service: its addresses become local
+ * addresses (on the TUN device, routed there by source), uplink goes to
+ * peer_ip with peer_teid, downlink arrives on local_teid. ue_ip (IPv4) or
+ * ue_ip6 may be empty, not both; of an IPv6 address the UE owns the /64.
+ * The other functions name the UE by ue_ip, or by ue_ip6 if it has no IPv4
+ * address.
  */
-int gtpu_add_ue(const char *ue_ip, uint32_t local_teid,
+int gtpu_add_ue(const char *ue_ip, const char *ue_ip6, uint32_t local_teid,
                 const char *peer_ip, uint32_t peer_teid);
 void gtpu_del_ue(const char *ue_ip);
 
@@ -77,14 +81,19 @@ struct GtpuFilter {
     uint32_t remote_addr, remote_mask;
     uint16_t local_port_lo, local_port_hi;
     uint16_t remote_port_lo, remote_port_hi;
-    bool never;                 /* has a component an IPv4 packet cannot meet */
+    /* IPv6 address components: prefix and its length in bits, -1 if absent */
+    uint8_t local6[16], remote6[16];
+    int local6_len, remote6_len;
+    bool never;                 /* has a component no packet here can meet */
 
     GtpuFilter() : precedence(0), protocol(-1), local_addr(0), local_mask(0),
         remote_addr(0), remote_mask(0), local_port_lo(0), local_port_hi(65535),
-        remote_port_lo(0), remote_port_hi(65535), never(false) {}
+        remote_port_lo(0), remote_port_hi(65535), local6_len(-1), remote6_len(-1),
+        never(false) { memset(local6, 0, 16); memset(remote6, 0, 16); }
 };
 
-/* Does the uplink IPv4 packet pkt meet the filter? Exposed for the unit tests. */
+/* Does the uplink IPv4 or IPv6 packet pkt meet the filter? A filter with an
+ * address of the other family does not. Exposed for the unit tests. */
 bool gtpu_filter_matches(const GtpuFilter &f, const uint8_t *pkt, size_t len);
 
 /*

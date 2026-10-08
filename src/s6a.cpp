@@ -608,7 +608,19 @@ bool S6aEndpoint::open(std::string &error)
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         }
     }
-    if (s < 0 || connect(s, res->ai_addr, res->ai_addrlen) < 0) {
+    /* One local address: an unbound SCTP socket offers the peer every
+     * address of the host (multi-homing, RFC 9260 §6.4), which neither a
+     * NAT in between nor a test wants */
+    const char *bind_ip = s6a_local_ip ? s6a_local_ip : s8_local_ip;
+    bool bound = true;
+    if (s >= 0 && bind_ip) {
+        struct sockaddr_in local;
+        memset(&local, 0, sizeof(local));
+        local.sin_family = AF_INET;
+        bound = inet_pton(AF_INET, bind_ip, &local.sin_addr) == 1 &&
+                bind(s, (struct sockaddr *)&local, sizeof(local)) == 0;
+    }
+    if (s < 0 || !bound || connect(s, res->ai_addr, res->ai_addrlen) < 0) {
         error = std::string("cannot connect to the Diameter peer ") + s6a_peer + " over " +
                 (sctp ? "SCTP" : "TCP") + ": " + strerror(errno);
         freeaddrinfo(res);

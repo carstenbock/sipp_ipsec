@@ -63,6 +63,8 @@ struct KeywordMap SimpleKeywords[] = {
     {"s8_pgw_c_teid", E_Message_S8_PGW_C_TEID },
     {"s8_pgw_u_ip", E_Message_S8_PGW_U_IP },
     {"s8_pgw_u_teid", E_Message_S8_PGW_U_TEID },
+    {"s8_ue_ip", E_Message_S8_UE_IP },
+    {"s8_ue_ip6", E_Message_S8_UE_IP6 },
     {"s6a_result", E_Message_S6A_Result },
     {"s6a_msisdn", E_Message_S6A_MSISDN },
     {"s6a_qci", E_Message_S6A_QCI },

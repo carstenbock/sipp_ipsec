@@ -2807,7 +2807,9 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         case E_Message_Remote_IP:
 #ifdef USE_IPSEC
             if (tunnel_pcscf()) {
-                dest += snprintf(dest, left, "%s", tunnel_pcscf());
+                /* An IPv6 address goes into SIP in brackets (RFC 3261 §25.1) */
+                bool v6 = strchr(tunnel_pcscf(), ':') != nullptr;
+                dest += snprintf(dest, left, v6 ? "[%s]" : "%s", tunnel_pcscf());
                 break;
             }
 #endif
@@ -2841,7 +2843,8 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         case E_Message_Local_IP:
 #ifdef USE_IPSEC
             if (tunnel_ip()) {
-                dest += snprintf(dest, left, "%s", tunnel_ip());
+                bool v6 = strchr(tunnel_ip(), ':') != nullptr;
+                dest += snprintf(dest, left, v6 ? "[%s]" : "%s", tunnel_ip());
                 break;
             }
 #endif
@@ -2883,7 +2886,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         case E_Message_Local_IP_Type:
 #ifdef USE_IPSEC
             if (tunnel_ip()) {
-                dest += snprintf(dest, left, "4");  /* SWu inner addresses are IPv4 */
+                dest += snprintf(dest, left, strchr(tunnel_ip(), ':') ? "6" : "4");
                 break;
             }
 #endif
@@ -2923,6 +2926,12 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         case E_Message_S8_PGW_U_TEID:
             dest += snprintf(dest, left, "%u", s8_result.pgw_u_teid);
             break;
+        case E_Message_S8_UE_IP:
+            dest += snprintf(dest, left, "%s", s8_result.ue_ip.c_str());
+            break;
+        case E_Message_S8_UE_IP6:
+            dest += snprintf(dest, left, "%s", s8_result.ue_ip6.c_str());
+            break;
         case E_Message_S6A_Result:
             dest += snprintf(dest, left, "%d", s6a_result);
             break;
@@ -2950,6 +2959,8 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         case E_Message_S8_PGW_C_TEID:
         case E_Message_S8_PGW_U_IP:
         case E_Message_S8_PGW_U_TEID:
+        case E_Message_S8_UE_IP:
+        case E_Message_S8_UE_IP6:
         case E_Message_S6A_Result:
         case E_Message_S6A_MSISDN:
         case E_Message_S6A_QCI:
@@ -4047,6 +4058,14 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         }
         break;
         case E_Message_Media_IP_Type:
+#ifdef USE_IPSEC
+            if (tunnel_ip()) {
+                /* [media_ip] is the tunnel address then, without brackets
+                 * as SDP wants it */
+                dest += snprintf(dest, left, strchr(tunnel_ip(), ':') ? "6" : "4");
+                break;
+            }
+#endif
             dest += snprintf(dest, left, "%s", (media_ip_is_ipv6 ? "6" : "4"));
             break;
         case E_Message_Call_Number:
@@ -6289,7 +6308,13 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 !swu_hex16(createSendingMessage(currentAction->getMessage(2)), cfg.opc)) {
                 ERROR("<swu_attach>: k and opc must be 32 hex digits each");
             }
-            cfg.apn = createSendingMessage(currentAction->getMessage(3));
+            {
+                std::vector<std::string> parts = split(createSendingMessage(currentAction->getMessage(3)), ';');
+                parts.resize(3);
+                cfg.apn = parts[0];
+                cfg.pdn_type = parts[1] == "ipv6" ? 2 : parts[1] == "ipv4v6" ? 3 : 1;
+                cfg.sip_family = parts[2] == "ipv6" ? 6 : parts[2] == "ipv4" ? 4 : 0;
+            }
             swu = new SwuSession(cfg);
             swu->start();
             swu_wait = true;
@@ -6325,6 +6350,8 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
             cfg.ambr_dl = a.count("ambr_dl") ? strtoul(a["ambr_dl"].c_str(), nullptr, 10) : 1000000;
             cfg.tac = a.count("tac") ? atoi(a["tac"].c_str()) : 1;
             cfg.eci = a.count("eci") ? strtoul(a["eci"].c_str(), nullptr, 0) : 1;
+            cfg.pdn_type = a["pdn_type"] == "ipv6" ? 2 : a["pdn_type"] == "ipv4v6" ? 3 : 1;
+            cfg.sip_family = a["sip_family"] == "ipv6" ? 6 : a["sip_family"] == "ipv4" ? 4 : 0;
             s8_expect = createSendingMessage(currentAction->getMessage(1));
             s8_var = currentAction->getVarId();
             s8 = new S8Session(cfg);
@@ -7421,7 +7448,7 @@ const char *call::tunnel_ip()
 #endif
 #ifdef USE_S8
     if (s8 && s8->state() == S8_ACTIVE) {
-        return s8->result().ue_ip.c_str();
+        return s8->result().sip_ip.c_str();
     }
 #endif
     return nullptr;
@@ -7435,8 +7462,8 @@ const char *call::tunnel_pcscf()
     }
 #endif
 #ifdef USE_S8
-    if (s8 && s8->state() == S8_ACTIVE && !s8->result().pcscf.empty()) {
-        return s8->result().pcscf.c_str();
+    if (s8 && s8->state() == S8_ACTIVE && !s8->result().sip_pcscf.empty()) {
+        return s8->result().sip_pcscf.c_str();
     }
 #endif
     return nullptr;
@@ -7492,7 +7519,12 @@ bool call::s8_settle()
         delete s8;
         s8 = nullptr;
     }
-    if (s8_expect != "any" && cause != atoi(s8_expect.c_str())) {
+    /* The PGW may accept with another PDN type than asked for (causes 18
+     * and 19, e.g. IPv4 only for an IPv4v6 request): a scenario that expects
+     * "accepted" gets the session, [s8_cause] tells which it was. */
+    bool accepted_variant = !deleting && s8 && s8->state() == S8_ACTIVE &&
+                            atoi(s8_expect.c_str()) == GTP_CAUSE_ACCEPTED;
+    if (s8_expect != "any" && cause != atoi(s8_expect.c_str()) && !accepted_variant) {
         WARNING("S8 %s for call %s: GTP cause %d, expected %s%s%s", deleting ? "delete" : "create",
                 id, cause, s8_expect.c_str(), s8 && *s8->error() ? ": " : "",
                 s8 ? s8->error() : "");
@@ -7503,6 +7535,15 @@ bool call::s8_settle()
                         AI_PASSIVE, AF_UNSPEC) != 0) {
         WARNING("Unusable P-CSCF address '%s' from the PGW", tunnel_pcscf());
         return false;
+    }
+    if (!deleting && s8->state() == S8_ACTIVE && tunnel_ip()) {
+        /* The call's sockets are of the family SIP uses on this bearer */
+        use_ipv6 = strchr(tunnel_ip(), ':') != nullptr;
+        if (use_ipv6 != (call_peer.ss_family == AF_INET6)) {
+            WARNING("S8 for call %s: SIP would use %s, but the P-CSCF is not of that family "
+                    "(none from the PGW for it, and another one on the command line)", id, tunnel_ip());
+            return false;
+        }
     }
     return true;
 }
@@ -7548,6 +7589,13 @@ bool call::swu_settle()
         gai_getsockaddr(&call_peer, swu->pcscf(), (unsigned short)remote_port,
                         AI_PASSIVE, AF_UNSPEC) != 0) {
         WARNING("Unusable P-CSCF address '%s' from the ePDG", swu->pcscf());
+        return false;
+    }
+    /* The call's sockets are of the family SIP uses in this tunnel */
+    use_ipv6 = strchr(swu->inner_ip(), ':') != nullptr;
+    if (use_ipv6 != (call_peer.ss_family == AF_INET6)) {
+        WARNING("SWu for call %s: SIP would use %s, but the P-CSCF is not of that family "
+                "(none from the ePDG for it, and another one on the command line)", id, swu->inner_ip());
         return false;
     }
     return true;

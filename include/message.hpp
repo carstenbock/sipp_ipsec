@@ -60,6 +60,8 @@ typedef enum {
     E_Message_S8_PGW_C_TEID,
     E_Message_S8_PGW_U_IP,
     E_Message_S8_PGW_U_TEID,
+    E_Message_S8_UE_IP,
+    E_Message_S8_UE_IP6,
     E_Message_S6A_Result,
     E_Message_S6A_MSISDN,
     E_Message_S6A_QCI,

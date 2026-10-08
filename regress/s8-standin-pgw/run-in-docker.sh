@@ -41,6 +41,13 @@ sed 's/EXPECT/5004/' s6a_denied.xml > "$OUT/s6a_denied.xml"
 sed 's/EXPECT/2001/' s6a_denied.xml > "$OUT/s6a_denied_unexpected.xml"
 sed 's/TIMEOUT/5000/' s6a_cancel.xml > "$OUT/s6a_cancel.xml"
 sed 's/TIMEOUT/500/' s6a_cancel.xml > "$OUT/s6a_cancel_short.xml"
+v6() {      # v6 <file> <pdn type> <sip_family attribute or ""> <apn>
+    sed -e "s/PDN/$2/" -e "s/FAMILY/$3/" -e "s/APN/$4/" session_v6.xml > "$OUT/$1"
+}
+v6 v6_only.xml ipv6 "" ims
+v6 v6_dual.xml ipv4v6 "" ims
+v6 v6_dual_sip4.xml ipv4v6 'sip_family="ipv4"' ims
+v6 v6_dual_v4apn.xml ipv4v6 "" ims4only
 for last in 404 504 317; do printf 'SEQUENTIAL\n001010000000%s;x;ims\n' $last > "$OUT/user$last.csv"; done
 chmod -R a+rX "$OUT"
 
@@ -93,6 +100,17 @@ check "waiting for a bearer that never comes fails the call" 1 "$(echo "$res" | 
 res=$(sipp no_bearer_optional.xml 1 1 -s8_pgw "$PGW_IP")
 check "  unless the scenario calls the bearer optional" 1 "$(echo "$res" | count successful)"
 
+# --- IPv6 and dual stack ---
+res=$(sipp v6_only.xml 5 100 -s8_pgw "$PGW_IP")
+check "5 UEs in parallel with an IPv6 PDN connection: REGISTER over IPv6 through GTP-U" 5 "$(echo "$res" | count successful)"
+res=$(sipp v6_dual.xml 5 100 -s8_pgw "$PGW_IP")
+check "5 dual-stack UEs: SIP prefers IPv6 when the PGW names an IPv6 P-CSCF" 5 "$(echo "$res" | count successful)"
+res=$(sipp v6_dual_sip4.xml 2 100 -s8_pgw "$PGW_IP")
+check "dual stack with sip_family=ipv4: SIP over IPv4" 2 "$(echo "$res" | count successful)"
+res=$(sipp v6_dual_v4apn.xml 1 1 -s8_pgw "$PGW_IP")
+check "IPv4v6 asked, IPv4 granted (cause 19): session accepted, SIP over IPv4" 1 "$(echo "$res" | count successful)"
+check "  nothing left in the kernel, IPv6 addresses and rules included" "0 0 0 0 0" "$(kernel_leftovers) $(docker exec "$UE" sh -c 'echo "$(ip -6 addr | grep -c fd99) $(ip -6 rule | grep -c fd99)"')"
+
 # --- S6a (stand-in HSS on the same address, Diameter over TCP) ---
 S6A="-s6a_peer $PGW_IP -s6a_transport tcp -s6a_dest_realm epc.mnc024.mcc262.3gppnetwork.org"
 res=$(sipp s6a_attach.xml 10 100 -s8_pgw "$PGW_IP" $S6A)
@@ -137,6 +155,11 @@ check "HSS: no Purge UE after the cancellation" 0 "$(echo "$hlog" | grep -c '^PU
 
 log=$(docker exec "$PGW" cat /tmp/pgw.log)
 check "PGW: Create Session carries MSISDN, APN-AMBR, QCI and ARP from the HSS" 10 "$(echo "$log" | grep -c 'subscription: msisdn=49155500000[01][0-9] ambr_ul=384 ambr_dl=640 qci=5 arp=3$')"
+check "PGW: IPv6-only request asks for the IPv6 P-CSCF and DNS, not the IPv4 ones" 5 "$(echo "$log" | grep -c 'pdn type asked=2 granted=2, PCO containers asked: 0001,0003,0002$')"
+check "PGW: REGISTERs of IPv6-only UEs arrive from their /64, to the IPv6 P-CSCF" 5 "$(echo "$log" | grep -c 'X-Info: cause=16 v4= v6=fd99:0:0:[0-9a-f]*::1 local=\[fd99:0:0:[0-9a-f]*::1\] type=IP6 pcscf=\[fd88::1\]')"
+check "PGW: dual-stack UEs register over IPv6" 5 "$(echo "$log" | grep -c 'X-Info: cause=16 v4=10.99.0.[0-9]* v6=fd99:0:0:[0-9a-f]*::1 local=\[fd99.*type=IP6')"
+check "PGW: dual-stack UEs told to use IPv4 register over IPv4" 2 "$(echo "$log" | grep -c 'X-Info: cause=16 v4=10.99.0.[0-9]* v6=fd99:0:0:[0-9a-f]*::1 local=10.99.0.[0-9]* type=IP4 pcscf=10.88.0.1')"
+check "PGW: IPv4 granted for IPv4v6 is reported as cause 19" 1 "$(echo "$log" | grep -c 'X-Info: cause=19 v4=10.99.0.[0-9]* v6= local=10.99.0.[0-9]* type=IP4')"
 blog=$(echo "$log" | grep -E 'BEARER TEST|BRsp')
 check "PGW: Create Bearer accepted with the SGW's F-TEID, the PGW's echoed" 10 "$(echo "$blog" | grep -c 'CBRsp known=True cause=\[16\] bearer_cause=\[16\] ebi=\[6\] sgw_iface=4 .*pgw_fteid_echo=ok$')"
 check "PGW: a retransmitted Create Bearer Request gets the same answer" 10 "$(echo "$blog" | grep -c 'retransmission=same answer')"
@@ -147,10 +170,10 @@ check "PGW: REGISTER 3, filter replaced: default bearer" 10 "$(echo "$blog" | gr
 check "PGW: REGISTER 4, bearer deleted: default bearer" 10 "$(echo "$blog" | grep -c 'CSeq: 4 REGISTER arrived on the default')"
 check "PGW: Update Bearer accepted" 10 "$(echo "$blog" | grep -c 'UBRsp known=True cause=\[16\] bearer_cause=\[16\] ebi=\[6\]')"
 check "PGW: Delete Bearer accepted" 10 "$(echo "$blog" | grep -c 'DBRsp known=True cause=\[16\] bearer_cause=\[16\] ebi=\[6\]')"
-check "PGW: sessions accepted" 44 "$(echo "$log" | grep -c -- '-> accepted')"
-check "PGW: REGISTERs on a TEID it assigned" 70 "$(echo "$log" | grep -c 'matches session\|matches dedicated')"
+check "PGW: sessions accepted" 57 "$(echo "$log" | grep -c -- '-> accepted')"
+check "PGW: REGISTERs on a TEID it assigned" 83 "$(echo "$log" | grep -c 'matches session\|matches dedicated')"
 check "PGW: packets on a TEID it does not know" 0 "$(echo "$log" | grep -c 'UNKNOWN')"
-check "PGW: sessions deleted" 44 "$(echo "$log" | grep -c '^DSR.*known=True')"
+check "PGW: sessions deleted" 57 "$(echo "$log" | grep -c '^DSR.*known=True')"
 check "PGW: no IE of a request it could not parse" 0 "$(echo "$log" | grep -c 'malformed=True')"
 check "PGW: control plane TEIDs are unique" 0 "$(echo "$log" | grep -o 'sender F-TEID iface=6 teid=0x[0-9a-f]*' | sort | uniq -d | wc -l)"
 

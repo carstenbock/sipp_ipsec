@@ -21,7 +21,7 @@
  *  thread of its own moves packets between one TUN device and the UDP 2152
  *  socket, so RTP does not wait for SIPp's main loop.
  *
- *  IPv4 only.
+ *  The UE side is IPv4, IPv6 or both; GTP-U itself runs over IPv4.
  */
 
 #ifdef USE_S8
@@ -73,20 +73,52 @@ struct GtpuDedicated {
     unsigned long ul_packets, dl_packets;
 };
 
+/* A UE is known by its IPv4 address (network order, in the low 32 bits) or,
+ * if it has none, by its IPv6 /64 prefix; the two cannot collide, as no
+ * global prefix starts with 32 zero bits. */
+typedef uint64_t UeId;
+
 struct GtpuUe {
     GtpuBearer def;                         /* default bearer */
     std::vector<GtpuDedicated> dedicated;
+    uint32_t v4;                            /* 0: none */
+    bool has6;
+    uint8_t addr6[16];
 };
 
 /* Where a local TEID leads: the UE, and the dedicated bearer if it is one's */
 struct GtpuTeidOwner {
-    uint32_t ue;
+    UeId ue;
     int ebi;                                /* -1: default bearer */
 };
 
 static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
-static std::map<uint32_t, GtpuUe> by_ue;            /* UE address (network order) */
+static std::map<UeId, GtpuUe> by_ue;
+static std::map<uint64_t, UeId> by_prefix6;         /* IPv6 /64 prefix -> UE */
 static std::map<uint32_t, GtpuTeidOwner> by_teid;   /* local TEID */
+
+static uint64_t prefix64(const uint8_t *addr6)
+{
+    uint64_t p;
+    memcpy(&p, addr6, 8);
+    return p;
+}
+
+/* The id of the UE that the other modules name by one of its addresses */
+static bool ue_id(const char *ip, UeId &id)
+{
+    uint32_t v4;
+    uint8_t v6[16];
+    if (ip && inet_pton(AF_INET, ip, &v4) == 1) {
+        id = v4;
+        return true;
+    }
+    if (ip && inet_pton(AF_INET6, ip, v6) == 1) {
+        id = prefix64(v6);
+        return true;
+    }
+    return false;
+}
 
 static int tun_fd = -1;
 static int udp_fd = -1;
@@ -184,26 +216,31 @@ static int rtnl_talk(struct nlmsghdr *nlh)
     return rc;
 }
 
-/* UE address as a local /32 on the TUN device */
-static int rtnl_addr(uint32_t addr, bool add)
+/* UE address as a local /32 (or /128) on the TUN device */
+static int rtnl_addr(int family, const void *addr, bool add)
 {
     char buf[256];
+    size_t alen = family == AF_INET ? 4 : 16;
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
     nlh->nlmsg_type = add ? RTM_NEWADDR : RTM_DELADDR;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_REPLACE : 0);
     struct ifaddrmsg *ifa = (struct ifaddrmsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*ifa));
-    ifa->ifa_family = AF_INET;
-    ifa->ifa_prefixlen = 32;
+    ifa->ifa_family = family;
+    ifa->ifa_prefixlen = alen * 8;
     ifa->ifa_index = tun_ifindex;
-    mnl_attr_put(nlh, IFA_LOCAL, 4, &addr);
-    mnl_attr_put(nlh, IFA_ADDRESS, 4, &addr);
+    /* No duplicate address detection: nobody else is on this link, and a
+     * tentative address cannot be bound for a second */
+    ifa->ifa_flags = family == AF_INET6 ? IFA_F_NODAD : 0;
+    mnl_attr_put(nlh, IFA_LOCAL, alen, addr);
+    mnl_attr_put(nlh, IFA_ADDRESS, alen, addr);
     return rtnl_talk(nlh);
 }
 
-/* "from <UE>/32 lookup <our table>": what a UE's sockets send leaves through
- * the TUN device whatever the destination, as its only way out is the bearer. */
-static int rtnl_rule(uint32_t addr, bool add)
+/* "from <UE>/32 lookup <our table>" (IPv6: the UE's /64): what a UE's sockets
+ * send leaves through the TUN device whatever the destination, as its only
+ * way out is the bearer. */
+static int rtnl_rule(int family, const void *addr, bool add)
 {
     char buf[256];
     memset(buf, 0, sizeof(buf));
@@ -211,17 +248,24 @@ static int rtnl_rule(uint32_t addr, bool add)
     nlh->nlmsg_type = add ? RTM_NEWRULE : RTM_DELRULE;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
     struct fib_rule_hdr *frh = (struct fib_rule_hdr *)mnl_nlmsg_put_extra_header(nlh, sizeof(*frh));
-    frh->family = AF_INET;
-    frh->src_len = 32;
+    frh->family = family;
+    frh->src_len = family == AF_INET ? 32 : 64;
     frh->table = RT_TABLE_UNSPEC;
     frh->action = FR_ACT_TO_TBL;
-    mnl_attr_put(nlh, FRA_SRC, 4, &addr);
+    if (family == AF_INET) {
+        mnl_attr_put(nlh, FRA_SRC, 4, addr);
+    } else {
+        uint8_t prefix[16];
+        memset(prefix, 0, sizeof(prefix));
+        memcpy(prefix, addr, 8);
+        mnl_attr_put(nlh, FRA_SRC, 16, prefix);
+    }
     mnl_attr_put_u32(nlh, FRA_TABLE, route_table);
     return rtnl_talk(nlh);
 }
 
 /* "default dev <tun>" in our table */
-static int rtnl_default_route()
+static int rtnl_default_route(int family)
 {
     char buf[256];
     memset(buf, 0, sizeof(buf));
@@ -229,10 +273,10 @@ static int rtnl_default_route()
     nlh->nlmsg_type = RTM_NEWROUTE;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
     struct rtmsg *rtm = (struct rtmsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*rtm));
-    rtm->rtm_family = AF_INET;
+    rtm->rtm_family = family;
     rtm->rtm_table = RT_TABLE_UNSPEC;
     rtm->rtm_protocol = RTPROT_STATIC;
-    rtm->rtm_scope = RT_SCOPE_LINK;
+    rtm->rtm_scope = family == AF_INET ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
     rtm->rtm_type = RTN_UNICAST;
     mnl_attr_put_u32(nlh, RTA_TABLE, route_table);
     mnl_attr_put_u32(nlh, RTA_OIF, tun_ifindex);
@@ -241,20 +285,60 @@ static int rtnl_default_route()
 
 /* --- uplink classification ---------------------------------------------- */
 
+static bool prefix_matches(const uint8_t *addr, const uint8_t *prefix, int bits)
+{
+    for (int i = 0; i < 16 && bits > 0; i++, bits -= 8) {
+        uint8_t mask = bits >= 8 ? 0xff : (uint8_t)(0xff << (8 - bits));
+        if ((addr[i] & mask) != (prefix[i] & mask)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool gtpu_filter_matches(const GtpuFilter &f, const uint8_t *pkt, size_t len)
 {
-    if (f.never || len < 20 || (pkt[0] >> 4) != 4) {
+    if (f.never || len < 20) {
         return false;
     }
-    size_t ihl = (size_t)(pkt[0] & 0x0f) * 4;
-    uint32_t src, dst;
-    memcpy(&src, pkt + 12, 4);
-    memcpy(&dst, pkt + 16, 4);
-    if ((src & f.local_mask) != (f.local_addr & f.local_mask) ||
-        (dst & f.remote_mask) != (f.remote_addr & f.remote_mask)) {
+    int version = pkt[0] >> 4;
+    bool v4_filter = f.local_mask != 0 || f.remote_mask != 0;
+    bool v6_filter = f.local6_len >= 0 || f.remote6_len >= 0;
+    uint8_t proto;
+    size_t l4;                  /* offset of the transport header */
+    bool later_fragment;
+
+    if (version == 4) {
+        if (v6_filter) {
+            return false;
+        }
+        uint32_t src, dst;
+        memcpy(&src, pkt + 12, 4);
+        memcpy(&dst, pkt + 16, 4);
+        if ((src & f.local_mask) != (f.local_addr & f.local_mask) ||
+            (dst & f.remote_mask) != (f.remote_addr & f.remote_mask)) {
+            return false;
+        }
+        proto = pkt[9];
+        l4 = (size_t)(pkt[0] & 0x0f) * 4;
+        later_fragment = (((pkt[6] & 0x1f) << 8) | pkt[7]) != 0;
+    } else if (version == 6 && len >= 40) {
+        if (v4_filter) {
+            return false;
+        }
+        if ((f.local6_len >= 0 && !prefix_matches(pkt + 8, f.local6, f.local6_len)) ||
+            (f.remote6_len >= 0 && !prefix_matches(pkt + 24, f.remote6, f.remote6_len))) {
+            return false;
+        }
+        /* The next header of the fixed header; extension headers are not
+         * walked, so a packet with one meets no protocol or port component */
+        proto = pkt[6];
+        l4 = 40;
+        later_fragment = false;
+    } else {
         return false;
     }
-    if (f.protocol >= 0 && pkt[9] != f.protocol) {
+    if (f.protocol >= 0 && proto != f.protocol) {
         return false;
     }
     bool ports_wanted = f.local_port_lo != 0 || f.local_port_hi != 65535 ||
@@ -263,21 +347,20 @@ bool gtpu_filter_matches(const GtpuFilter &f, const uint8_t *pkt, size_t len)
         return true;
     }
     /* Ports exist in UDP, TCP and SCTP, and only in a first fragment */
-    bool has_ports = pkt[9] == IPPROTO_UDP || pkt[9] == IPPROTO_TCP || pkt[9] == IPPROTO_SCTP;
-    bool later_fragment = (((pkt[6] & 0x1f) << 8) | pkt[7]) != 0;
-    if (!has_ports || later_fragment || ihl < 20 || len < ihl + 4) {
+    bool has_ports = proto == IPPROTO_UDP || proto == IPPROTO_TCP || proto == IPPROTO_SCTP;
+    if (!has_ports || later_fragment || l4 < 20 || len < l4 + 4) {
         return false;
     }
-    uint16_t sport = (pkt[ihl] << 8) | pkt[ihl + 1];
-    uint16_t dport = (pkt[ihl + 2] << 8) | pkt[ihl + 3];
+    uint16_t sport = (pkt[l4] << 8) | pkt[l4 + 1];
+    uint16_t dport = (pkt[l4 + 2] << 8) | pkt[l4 + 3];
     return sport >= f.local_port_lo && sport <= f.local_port_hi &&
            dport >= f.remote_port_lo && dport <= f.remote_port_hi;
 }
 
 /* Caller holds table_lock */
-static GtpuDedicated *find_dedicated(uint32_t ue, int ebi)
+static GtpuDedicated *find_dedicated(UeId ue, int ebi)
 {
-    std::map<uint32_t, GtpuUe>::iterator it = by_ue.find(ue);
+    std::map<UeId, GtpuUe>::iterator it = by_ue.find(ue);
     if (it == by_ue.end()) {
         return nullptr;
     }
@@ -293,15 +376,33 @@ static GtpuDedicated *find_dedicated(uint32_t ue, int ebi)
 
 static void forward_uplink(const uint8_t *pkt, size_t len)
 {
-    if (len < 20 || (pkt[0] >> 4) != 4) {
-        return;                 /* IPv4 only */
+    if (len < 20) {
+        return;
     }
-    uint32_t src;
-    memcpy(&src, pkt + 12, 4);
+    /* The source address names the UE: IPv4 exactly, IPv6 by its /64. What
+     * the kernel sends from a link-local address (neighbour discovery,
+     * MLD) belongs to no bearer and is dropped. */
+    UeId src = 0;
+    bool v6 = (pkt[0] >> 4) == 6 && len >= 40;
+    if ((pkt[0] >> 4) == 4) {
+        uint32_t a;
+        memcpy(&a, pkt + 12, 4);
+        src = a;
+    } else if (!v6) {
+        return;
+    }
 
     GtpuBearer bearer;
     pthread_mutex_lock(&table_lock);
-    std::map<uint32_t, GtpuUe>::iterator it = by_ue.find(src);
+    if (v6) {
+        std::map<uint64_t, UeId>::iterator p = by_prefix6.find(prefix64(pkt + 8));
+        if (p == by_prefix6.end()) {
+            pthread_mutex_unlock(&table_lock);
+            return;
+        }
+        src = p->second;
+    }
+    std::map<UeId, GtpuUe>::iterator it = by_ue.find(src);
     bool found = it != by_ue.end();
     if (found) {
         /* The filter with the lowest precedence value that the packet meets
@@ -440,6 +541,23 @@ static bool open_tun()
         return fail("cannot bring the TUN device up");
     }
     tun_ifindex = if_nametoindex(tun_name);
+    /* IPv6 for UEs with an IPv6 PDN connection: on (containers often start
+     * with it off), and without address autoconfiguration from the PGW's
+     * router advertisements, as the addresses come from GTP-C. Failing
+     * here only matters once a UE gets an IPv6 address. */
+    static const char *knobs[][2] = { { "disable_ipv6", "0" }, { "accept_ra", "0" },
+                                      { "autoconf", "0" } };
+    for (size_t i = 0; i < sizeof(knobs) / sizeof(knobs[0]); i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/%s", tun_name, knobs[i][0]);
+        int k = open(path, O_WRONLY);
+        if (k >= 0) {
+            if (write(k, knobs[i][1], 1) < 0) {
+                /* read-only /proc/sys: see above */
+            }
+            close(k);
+        }
+    }
     return tun_ifindex != 0;
 }
 
@@ -467,7 +585,7 @@ int gtpu_start(const char *local_ip)
     }
     /* One table per process, so two SIPp instances on a host do not share one */
     route_table = 20000 + getpid() % 10000;
-    if (rtnl_default_route() < 0) {
+    if (rtnl_default_route(AF_INET) < 0) {
         fail("cannot install the route into the TUN device");
         return -1;
     }
@@ -493,46 +611,77 @@ uint32_t gtpu_new_teid()
     return teid;
 }
 
-int gtpu_add_ue(const char *ue_ip, uint32_t local_teid,
+/* Undo what gtpu_add_ue() put into the kernel for a UE */
+static void kernel_remove(const GtpuUe &u)
+{
+    if (u.v4) {
+        rtnl_rule(AF_INET, &u.v4, false);
+        rtnl_addr(AF_INET, &u.v4, false);
+    }
+    if (u.has6) {
+        rtnl_rule(AF_INET6, u.addr6, false);
+        rtnl_addr(AF_INET6, u.addr6, false);
+    }
+}
+
+int gtpu_add_ue(const char *ue_ip, const char *ue_ip6, uint32_t local_teid,
                 const char *peer_ip, uint32_t peer_teid)
 {
-    uint32_t ue;
-    GtpuBearer b;
+    GtpuUe entry;
+    GtpuBearer &b = entry.def;
 
     memset(&b, 0, sizeof(b));
     b.local_teid = local_teid;
     b.peer_teid = peer_teid;
     b.peer.sin_family = AF_INET;
     b.peer.sin_port = htons(GTPU_PORT);
-    if (!forwarder_running || inet_pton(AF_INET, ue_ip, &ue) != 1 ||
+    entry.v4 = 0;
+    entry.has6 = false;
+    memset(entry.addr6, 0, sizeof(entry.addr6));
+    bool want4 = ue_ip && *ue_ip, want6 = ue_ip6 && *ue_ip6;
+    if (!forwarder_running || (!want4 && !want6) ||
+        (want4 && inet_pton(AF_INET, ue_ip, &entry.v4) != 1) ||
+        (want6 && inet_pton(AF_INET6, ue_ip6, entry.addr6) != 1) ||
         inet_pton(AF_INET, peer_ip, &b.peer.sin_addr) != 1) {
-        last_error = "GTP-U not started, or not IPv4 addresses";
+        last_error = "GTP-U not started, or unusable addresses";
         return -1;
     }
-    if (rtnl_addr(ue, true) < 0) {
-        fail("cannot add the UE address to the TUN device");
-        return -1;
+    entry.has6 = want6;
+    for (int pass = 0; pass < 2; pass++) {
+        int family = pass == 0 ? AF_INET : AF_INET6;
+        const void *addr = pass == 0 ? (const void *)&entry.v4 : (const void *)entry.addr6;
+        if (pass == 0 ? !want4 : !want6) {
+            continue;
+        }
+        const char *what = nullptr;
+        if (rtnl_addr(family, addr, true) < 0) {
+            what = family == AF_INET6 ? "cannot add the UE's IPv6 address to the TUN device (IPv6 disabled?)"
+                                      : "cannot add the UE address to the TUN device";
+        } else if (rtnl_default_route(family) < 0) {
+            /* The kernel drops every route through a device when its last
+             * address goes, ours included: without this, the UE attached
+             * after the previous one detached would send past the tunnel. */
+            what = "cannot install the route into the TUN device";
+        } else {
+            /* A rule left by a run that crashed would make this one fail with EEXIST */
+            rtnl_rule(family, addr, false);
+            if (rtnl_rule(family, addr, true) < 0) {
+                what = "cannot add the source routing rule for the UE";
+            }
+        }
+        if (what) {
+            fail(what);
+            kernel_remove(entry);
+            return -1;
+        }
     }
-    /* The kernel drops every route through a device when its last address
-     * goes, ours included: without this, the UE attached after the previous
-     * one detached would send past the tunnel. */
-    if (rtnl_default_route() < 0) {
-        fail("cannot install the route into the TUN device");
-        rtnl_addr(ue, false);
-        return -1;
-    }
-    /* A rule left by a run that crashed would make this one fail with EEXIST */
-    rtnl_rule(ue, false);
-    if (rtnl_rule(ue, true) < 0) {
-        fail("cannot add the source routing rule for the UE");
-        rtnl_addr(ue, false);
-        return -1;
-    }
-    GtpuUe entry;
-    entry.def = b;
-    GtpuTeidOwner owner = { ue, -1 };
+    UeId id = want4 ? (UeId)entry.v4 : prefix64(entry.addr6);
+    GtpuTeidOwner owner = { id, -1 };
     pthread_mutex_lock(&table_lock);
-    by_ue[ue] = entry;
+    by_ue[id] = entry;
+    if (want6) {
+        by_prefix6[prefix64(entry.addr6)] = id;
+    }
     by_teid[local_teid] = owner;
     pthread_mutex_unlock(&table_lock);
     return 0;
@@ -542,7 +691,7 @@ int gtpu_add_bearer(const char *ue_ip, uint8_t ebi, uint32_t local_teid,
                     const char *peer_ip, uint32_t peer_teid,
                     const std::vector<GtpuFilter> &uplink)
 {
-    uint32_t ue;
+    UeId ue;
     GtpuDedicated d;
 
     d.ebi = ebi;
@@ -553,14 +702,14 @@ int gtpu_add_bearer(const char *ue_ip, uint8_t ebi, uint32_t local_teid,
     d.bearer.peer_teid = peer_teid;
     d.bearer.peer.sin_family = AF_INET;
     d.bearer.peer.sin_port = htons(GTPU_PORT);
-    if (inet_pton(AF_INET, ue_ip, &ue) != 1 ||
+    if (!ue_id(ue_ip, ue) ||
         inet_pton(AF_INET, peer_ip, &d.bearer.peer.sin_addr) != 1) {
-        last_error = "not IPv4 addresses";
+        last_error = "unusable addresses";
         return -1;
     }
     int rc = -1;
     pthread_mutex_lock(&table_lock);
-    std::map<uint32_t, GtpuUe>::iterator it = by_ue.find(ue);
+    std::map<UeId, GtpuUe>::iterator it = by_ue.find(ue);
     if (it != by_ue.end()) {
         GtpuDedicated *old = find_dedicated(ue, ebi);
         if (old) {
@@ -581,8 +730,8 @@ int gtpu_add_bearer(const char *ue_ip, uint8_t ebi, uint32_t local_teid,
 
 void gtpu_set_filters(const char *ue_ip, uint8_t ebi, const std::vector<GtpuFilter> &uplink)
 {
-    uint32_t ue;
-    if (inet_pton(AF_INET, ue_ip, &ue) != 1) {
+    UeId ue;
+    if (!ue_id(ue_ip, ue)) {
         return;
     }
     pthread_mutex_lock(&table_lock);
@@ -595,12 +744,12 @@ void gtpu_set_filters(const char *ue_ip, uint8_t ebi, const std::vector<GtpuFilt
 
 void gtpu_del_bearer(const char *ue_ip, uint8_t ebi)
 {
-    uint32_t ue;
-    if (inet_pton(AF_INET, ue_ip, &ue) != 1) {
+    UeId ue;
+    if (!ue_id(ue_ip, ue)) {
         return;
     }
     pthread_mutex_lock(&table_lock);
-    std::map<uint32_t, GtpuUe>::iterator it = by_ue.find(ue);
+    std::map<UeId, GtpuUe>::iterator it = by_ue.find(ue);
     if (it != by_ue.end()) {
         std::vector<GtpuDedicated> &v = it->second.dedicated;
         for (size_t i = 0; i < v.size(); i++) {
@@ -617,8 +766,8 @@ void gtpu_del_bearer(const char *ue_ip, uint8_t ebi)
 bool gtpu_bearer_counters(const char *ue_ip, uint8_t ebi,
                           unsigned long &uplink, unsigned long &downlink)
 {
-    uint32_t ue;
-    if (inet_pton(AF_INET, ue_ip, &ue) != 1) {
+    UeId ue;
+    if (!ue_id(ue_ip, ue)) {
         return false;
     }
     pthread_mutex_lock(&table_lock);
@@ -633,24 +782,28 @@ bool gtpu_bearer_counters(const char *ue_ip, uint8_t ebi,
 
 void gtpu_del_ue(const char *ue_ip)
 {
-    uint32_t ue;
-    if (inet_pton(AF_INET, ue_ip, &ue) != 1) {
+    UeId ue;
+    if (!ue_id(ue_ip, ue)) {
         return;
     }
     pthread_mutex_lock(&table_lock);
-    std::map<uint32_t, GtpuUe>::iterator it = by_ue.find(ue);
+    std::map<UeId, GtpuUe>::iterator it = by_ue.find(ue);
     bool found = it != by_ue.end();
+    GtpuUe gone;
     if (found) {
-        by_teid.erase(it->second.def.local_teid);
-        for (size_t i = 0; i < it->second.dedicated.size(); i++) {
-            by_teid.erase(it->second.dedicated[i].bearer.local_teid);
+        gone = it->second;
+        by_teid.erase(gone.def.local_teid);
+        for (size_t i = 0; i < gone.dedicated.size(); i++) {
+            by_teid.erase(gone.dedicated[i].bearer.local_teid);
+        }
+        if (gone.has6) {
+            by_prefix6.erase(prefix64(gone.addr6));
         }
         by_ue.erase(it);
     }
     pthread_mutex_unlock(&table_lock);
     if (found) {
-        rtnl_rule(ue, false);
-        rtnl_addr(ue, false);
+        kernel_remove(gone);
     }
 }
 
@@ -665,12 +818,18 @@ void gtpu_stop()
 
     /* Addresses and the route go with the device; rules do not. */
     pthread_mutex_lock(&table_lock);
-    std::map<uint32_t, GtpuUe> ues;
+    std::map<UeId, GtpuUe> ues;
     ues.swap(by_ue);
+    by_prefix6.clear();
     by_teid.clear();
     pthread_mutex_unlock(&table_lock);
-    for (std::map<uint32_t, GtpuUe>::iterator it = ues.begin(); it != ues.end(); ++it) {
-        rtnl_rule(it->first, false);
+    for (std::map<UeId, GtpuUe>::iterator it = ues.begin(); it != ues.end(); ++it) {
+        if (it->second.v4) {
+            rtnl_rule(AF_INET, &it->second.v4, false);
+        }
+        if (it->second.has6) {
+            rtnl_rule(AF_INET6, it->second.addr6, false);
+        }
     }
     close(tun_fd);
     close(udp_fd);
@@ -799,6 +958,61 @@ TEST(Gtpu, UplinkFilterLocalAddressAndFragments) {
     EXPECT_TRUE(gtpu_filter_matches(any, later.data(), later.size()));
     any.never = true;                   /* e.g. an IPv6 address component */
     EXPECT_FALSE(gtpu_filter_matches(any, later.data(), later.size()));
+}
+
+/* An uplink IPv6 UDP packet cafe:0:46:1::5 port 49170 -> 2001:db8::9 port 30000 */
+static std::vector<uint8_t> udp6_packet(uint16_t sport, uint16_t dport, uint8_t next = 17)
+{
+    std::vector<uint8_t> p(48, 0);
+    p[0] = 0x60;
+    p[6] = next;
+    inet_pton(AF_INET6, "cafe:0:46:1::5", &p[8]);
+    inet_pton(AF_INET6, "2001:db8::9", &p[24]);
+    p[40] = sport >> 8; p[41] = sport;
+    p[42] = dport >> 8; p[43] = dport;
+    return p;
+}
+
+/* An IPv6 call's media has to reach the voice bearer like an IPv4 call's:
+ * the filter names the remote /128 and both ports. A filter for the other
+ * address family must not catch it, or IPv4 and IPv6 flows of a dual-stack
+ * UE would end up on each other's bearers. */
+TEST(Gtpu, UplinkFilterForIpv6) {
+    GtpuFilter f;
+    f.protocol = 17;
+    inet_pton(AF_INET6, "2001:db8::9", f.remote6);
+    f.remote6_len = 128;
+    f.remote_port_lo = f.remote_port_hi = 30000;
+    f.local_port_lo = f.local_port_hi = 49170;
+
+    std::vector<uint8_t> rtp = udp6_packet(49170, 30000);
+    std::vector<uint8_t> sip = udp6_packet(5060, 5060);
+    std::vector<uint8_t> v4 = udp_packet(49170, 30000);
+    EXPECT_TRUE(gtpu_filter_matches(f, rtp.data(), rtp.size()));
+    EXPECT_FALSE(gtpu_filter_matches(f, sip.data(), sip.size()));
+    EXPECT_FALSE(gtpu_filter_matches(f, v4.data(), v4.size()));
+
+    rtp[39] = 8;        /* another remote host */
+    EXPECT_FALSE(gtpu_filter_matches(f, rtp.data(), rtp.size()));
+
+    GtpuFilter prefix;  /* the UE's own /64 as local prefix */
+    inet_pton(AF_INET6, "cafe:0:46:1::", prefix.local6);
+    prefix.local6_len = 64;
+    EXPECT_TRUE(gtpu_filter_matches(prefix, sip.data(), sip.size()));
+    prefix.local6[7] = 2;
+    EXPECT_FALSE(gtpu_filter_matches(prefix, sip.data(), sip.size()));
+
+    GtpuFilter v4only;
+    inet_pton(AF_INET, "203.0.113.9", &v4only.remote_addr);
+    v4only.remote_mask = 0xffffffff;
+    EXPECT_FALSE(gtpu_filter_matches(v4only, sip.data(), sip.size()));
+
+    GtpuFilter ports;   /* no address: both families */
+    ports.remote_port_lo = ports.remote_port_hi = 5060;
+    EXPECT_TRUE(gtpu_filter_matches(ports, sip.data(), sip.size()));
+    /* behind an extension header (here hop-by-hop) the ports are not looked for */
+    std::vector<uint8_t> ext = udp6_packet(5060, 5060, 0);
+    EXPECT_FALSE(gtpu_filter_matches(ports, ext.data(), ext.size()));
 }
 
 TEST(Gtpu, RejectsTruncatedAndForeignMessages) {

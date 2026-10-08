@@ -1626,7 +1626,16 @@ void scenario::parseAction(CActions *actions)
             tmpAction->setMessage(xp_get_string("identity", actionElem), 0);
             tmpAction->setMessage(xp_get_string("k", actionElem), 1);
             tmpAction->setMessage(xp_get_string("opc", actionElem), 2);
-            tmpAction->setMessage(xp_get_value("apn") ? xp_get_value("apn") : "ims", 3);
+            /* Slot 3: "<apn>;<pdn_type>;<sip_family>", the last two optional */
+            {
+                /* one at a time: xp_get_value() returns a buffer it reuses */
+                std::string slot = xp_get_value("apn") ? xp_get_value("apn") : "ims";
+                slot += ";";
+                slot += xp_get_value("pdn_type") ? xp_get_value("pdn_type") : "";
+                slot += ";";
+                slot += xp_get_value("sip_family") ? xp_get_value("sip_family") : "";
+                tmpAction->setMessage(slot.c_str(), 3);
+            }
             tmpAction->setActionType(CAction::E_AT_SWU_ATTACH);
         } else if(!strcmp(actionElem, "swu_detach")) {
             tmpAction->setActionType(CAction::E_AT_SWU_DETACH);
@@ -1640,7 +1649,7 @@ void scenario::parseAction(CActions *actions)
             access_action_found = true;
             static const char *names[] = { "imsi", "msisdn", "mei", "apn", "plmn",
                                            "qci", "arp", "ambr_ul", "ambr_dl",
-                                           "tac", "eci", nullptr };
+                                           "tac", "eci", "pdn_type", "sip_family", nullptr };
             std::string attrs;
             bool create = !strcmp(actionElem, "s8_create_session");
             for (int i = 0; create && names[i]; i++) {

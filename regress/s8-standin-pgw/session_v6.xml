@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!-- IPv6 and dual-stack PDN connections with the stand-in PGW. PDN, FAMILY
+     and APN are replaced by run-in-docker.sh. The REGISTER shows from which
+     address SIP runs; the stand-in answers on the same family. -->
+<scenario name="S8 IPv6 loopback test">
+  <nop><action><s8_create_session imsi="[field0]" apn="APN" pdn_type="PDN" FAMILY/></action></nop>
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:test.invalid SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:[field0]@test.invalid>;tag=[call_number]
+      To: <sip:[field0]@test.invalid>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:[field0]@[local_ip]:[local_port]>
+      X-Info: cause=[s8_cause] v4=[s8_ue_ip] v6=[s8_ue_ip6] local=[local_ip] type=IP[local_ip_type] pcscf=[remote_ip]
+      Max-Forwards: 70
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <recv response="200"/>
+  <nop><action><s8_delete_session/></action></nop>
+</scenario>

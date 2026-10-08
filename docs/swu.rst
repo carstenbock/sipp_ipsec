@@ -27,7 +27,9 @@ Two scenario actions and one option:
     ``<nop>``; the call waits there until the tunnel is up and fails if
     it cannot be built. All attributes may use keywords such as
     ``[field0]``. ``k`` and ``opc`` are 32 hex digits each; ``apn``
-    defaults to ``ims``.
+    defaults to ``ims``. ``pdn_type`` (``ipv4``, ``ipv6`` or ``ipv4v6``,
+    default ``ipv4``) says which inner addresses to ask for, and
+    ``sip_family`` (``ipv4`` or ``ipv6``) which of two SIP uses.
 
 ``<swu_detach/>``
     Sends the IKE Delete and waits for the answer. A call that ends
@@ -101,10 +103,34 @@ How it works
   one and send the IMS ESP out untunnelled.
 
 
+IPv6 inner addresses
+````````````````````
+
+With ``pdn_type="ipv6"`` or ``"ipv4v6"`` the CFG_REQUEST asks for
+INTERNAL_IP6_ADDRESS, INTERNAL_IP6_DNS and P_CSCF_IP6_ADDRESS, alone or
+next to their IPv4 counterparts, and the traffic selectors cover IPv6.
+An ePDG derives the PDN type it asks the PGW for from that. Both
+families share the one pair of ESP SAs (IPv6 inside the IPv4 tunnel).
+
+SIP runs over IPv6 if the ePDG named an IPv6 P-CSCF, over IPv4 otherwise;
+``sip_family`` overrides the choice. A UE with only an IPv6 address needs
+an IPv6 P-CSCF, from the ePDG or on the command line.
+
+The host needs IPv6 for this, in two places SIPp takes care of where it
+can: every inner IPv6 address gets a routing rule of its own (a host
+without IPv6 connectivity has no route the IPsec policy could apply to),
+and IPv6 is switched on for the interface with the outer address, where
+decrypted packets count as received. The second needs a writable
+``/proc/sys``: in Docker that is ``--privileged``, as the default bridge
+network creates its interfaces with IPv6 disabled; SIPp warns when it
+cannot do it.
+
+
 Limitations
 ```````````
 
-* IPv4 only, for the outer and the inner address.
+* The outer address (IKE and ESP to the ePDG) is IPv4. The inner address
+  may be IPv4, IPv6 or both, see below.
 * SIP over UDP only. The IMS IPSec SAs cover TCP too, so a P-CSCF that
   tries TCP toward the UE's protected server port is refused by the
   kernel and can fall back to UDP; SIPp does not accept such a connection.

@@ -55,6 +55,9 @@ Usage
     ambr_dl      1000000     APN-AMBR downlink, kbit/s
     tac          1           Tracking area code (ULI)
     eci          1           E-UTRAN cell identifier (ULI)
+    pdn_type     ipv4        ``ipv4``, ``ipv6`` or ``ipv4v6`` (dual stack)
+    sip_family   (see text)  ``ipv4`` or ``ipv6``: the address SIP uses when
+                             the UE has both
     expect       16          GTP cause that lets the call go on; ``any``
                              accepts every outcome
     assign_to                Variable that receives the cause
@@ -102,6 +105,33 @@ A test that the PGW refuses an unknown APN, with no SIP at all::
 
 To branch instead of failing, use ``expect="any" assign_to="cause"`` and
 test ``cause`` in the next element.
+
+
+IPv6 and dual stack
+```````````````````
+
+``pdn_type="ipv6"`` or ``"ipv4v6"`` asks the PGW for an IPv6 prefix, alone
+or next to an IPv4 address, and for an IPv6 P-CSCF in the PCO. The PGW
+may grant less than was asked for (cause 18 or 19: the session comes up,
+``[s8_cause]`` says which). From the PAA SIPp takes the /64 prefix and the
+interface identifier as the UE's address; the whole /64 is routed into
+the bearer. ``[s8_ue_ip]`` and ``[s8_ue_ip6]`` are the two addresses.
+
+With both families SIP runs over IPv6 if the PGW named an IPv6 P-CSCF,
+as GSMA IR.92 prefers, and over IPv4 otherwise; ``sip_family`` overrides
+the choice. ``[local_ip]`` and ``[remote_ip]`` are then IPv6 addresses in
+brackets, ``[local_ip_type]`` and ``[media_ip_type]`` are ``6``. A UE
+with only an IPv6 address needs an IPv6 P-CSCF: from the PGW, or on the
+command line. Packet filters with IPv6 addresses steer IPv6 media onto a
+dedicated bearer like their IPv4 counterparts.
+
+GTP itself (the S8 leg to the PGW) still runs over IPv4. IPv6 has to be
+available on the host: SIPp enables it on its TUN device, which needs a
+writable ``/proc/sys`` in a container. Router advertisements of the PGW
+are ignored; no router solicitation is sent.
+
+Not covered for IPv6 yet: PCAP play and ``-rtp_echo`` use IPv4 media
+addresses, and IMS IPSec over an IPv6 bearer is untested.
 
 
 Dedicated bearers
@@ -179,6 +209,7 @@ out are part of the test.
     -s6a_peer <host[:port]>   the home network's DRA, or its HSS (port 3868)
     -s6a_dest_realm <realm>   Destination-Realm: the realm of the home HSS
     -s6a_transport sctp|tcp   default sctp
+    -s6a_local_ip <address>   local address of the connection; default -s8_local_ip
     -s6a_origin_host <name>   default mmec01.mmegi0001.mme.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
     -s6a_origin_realm <realm> default epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org
     -s6a_timeout <ms>         wait for an answer, default 5000
@@ -242,6 +273,50 @@ how an MME and SGW build the Create Session Request::
 
 ``sipp_scenarios/s6a_s8hr_register.xml`` is the whole attach: AIR, ULR,
 Create Session, IMS registration, and back.
+
+
+Example scenarios
+`````````````````
+
+All are in ``sipp_scenarios/`` and carry their command line in the header.
+
+.. table::
+
+    ================================  ==============================================
+    Scenario                          What it shows
+    ================================  ==============================================
+    ``s6a_s8hr_register.xml``         Attach and IMS registration: S6a, S8, REGISTER
+                                      with IPSec through GTP-U, and back
+    ``s6a_s8hr_uac.xml``,             The happy path with a call: both UEs attach
+    ``s6a_s8hr_uas.xml``              (S6a, S8), register, the caller invites, the
+                                      PGW creates the voice bearers, RTP runs on
+                                      them, BYE, de-registration, Delete Session,
+                                      Purge UE
+    ``s6a_roaming_not_allowed.xml``   The HSS refuses the UE in the visited PLMN
+                                      (5004 on the AIR or the ULR); the call passes
+                                      on the refusal and fails on success
+    ``s6a_s8hr_cancel_uac.xml``       The HSS cancels the location during a call:
+                                      the UE is detached without SIP, as an MME
+                                      does; what the home network makes of the lost
+                                      bearers is the test
+    ``s8hr_register.xml``,            The same registration and call without S6a,
+    ``s8hr_uac.xml``,                 for a setup where only the PGW is reachable
+    ``s8hr_uas.xml``
+    ================================  ==============================================
+
+A call needs two SIPp instances, callee first, each with its own address
+for S8 (GTP-C and GTP-U ports are fixed) and its own Origin-Host on S6a
+(``-s6a_origin_host``), or the HSS takes the second for the same MME. Give
+the callee's registration a few seconds before the caller starts.
+
+For the cancellation test start the callee with ``s6a_s8hr_uas.xml``, the
+caller with ``s6a_s8hr_cancel_uac.xml -key cancel_wait 30000``, and make
+the HSS cancel the caller's location while the call is up. The caller
+then logs the Cancellation-Type and sends only a Delete Session Request.
+A home network that handles it releases the call toward the callee,
+which sees a BYE; if the callee runs into its own timeout instead, the
+P-CSCF did not act on the loss of the bearers. Without a cancellation
+the caller ends the call normally after ``cancel_wait``.
 
 Requests of the HSS are answered without the scenario: Cancel-Location,
 Insert-Subscriber-Data, Delete-Subscriber-Data and Reset with success,
@@ -365,7 +440,8 @@ In Wireshark, with a capture on SIPp's S8 interface:
 Limitations
 ```````````
 
-* IPv4 PDN connections only.
+* GTP-C and GTP-U run over IPv4; the PDN connection may be IPv4, IPv6 or
+  both (see `IPv6 and dual stack`_).
 * S6a: one peer, no failover; no Notify, no handling of the
   authentication vectors (there is no NAS), no TLS.
 * Dedicated bearers come from the PGW only; SIPp does not ask for one
@@ -404,6 +480,14 @@ Call answered, uplink counted, but ``0 downlink`` on both ends
     The Diameter peer does not know SIPp's Origin-Host or does not offer
     S6a: see its peer configuration, or set ``-s6a_origin_host`` and
     ``-s6a_origin_realm`` to names it accepts.
+
+``cannot connect to the Diameter peer ... over SCTP: Operation now in progress``
+    The association setup was not answered in time. On a host with
+    several addresses give SIPp one with ``-s6a_local_ip`` (or
+    ``-s8_local_ip``): an unbound SCTP socket offers the peer all of them.
+    Behind a Kubernetes NodePort, use the node that runs the peer's pod.
+    A new connection right after the previous SIPp ended may also go
+    unanswered for some seconds, until the peer has dropped the old one.
 
 ``S6a <imsi>: no answer from the HSS``
     The request went out but nothing came back in ``-s6a_timeout``: a DRA

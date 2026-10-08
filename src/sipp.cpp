@@ -278,6 +278,9 @@ struct sipp_option options_table[] = {
      SIPP_OPTION_STRING, &s6a_peer, 1},
     {"s6a_transport", "Set the transport to the Diameter peer: sctp (default) or tcp.",
      SIPP_OPTION_STRING, &s6a_transport, 1},
+    {"s6a_local_ip", "Set the local address of the Diameter connection. Default is the address given\n"
+     "with -s8_local_ip, or the kernel's choice. On a host with several addresses SCTP\n"
+     "would otherwise offer all of them to the peer.", SIPP_OPTION_STRING, &s6a_local_ip, 1},
     {"s6a_origin_host", "Set the Origin-Host on S6a. Default is the MME name of the visited PLMN,\n"
      "mmec01.mmegi0001.mme.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org.", SIPP_OPTION_STRING, &s6a_origin_host, 1},
     {"s6a_origin_realm", "Set the Origin-Realm on S6a. Default is epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org\n"

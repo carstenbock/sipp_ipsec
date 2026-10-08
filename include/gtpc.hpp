@@ -36,6 +36,9 @@ typedef std::vector<uint8_t> GtpBytes;
 /* GTPv2 cause values used here (TS 29.274 Table 8.4-1) */
 enum {
     GTP_CAUSE_ACCEPTED = 16,
+    /* Accepted with another PDN type than asked for: 18 "network
+     * preference", 19 "single address bearers only" */
+    GTP_CAUSE_ACCEPTED_LAST = 19,
     GTP_CAUSE_CONTEXT_NOT_FOUND = 64,
     GTP_CAUSE_NO_RESOURCES = 73,
     GTP_CAUSE_REQUEST_REJECTED = 94
@@ -57,6 +60,9 @@ struct S8Config {
     std::string apn;
     std::string plmn;           /* visited PLMN: Serving Network and ULI */
     std::string local_ip;       /* address in our F-TEIDs */
+    int pdn_type;               /* 1 IPv4, 2 IPv6, 3 IPv4v6 (§8.34) */
+    int sip_family;             /* address family for SIP: 0 as IR.92 has it
+                                   (IPv6 if there is a P-CSCF for it), 4 or 6 */
     int qci;
     int arp;                    /* priority level 1..15 */
     uint32_t ambr_ul, ambr_dl;  /* APN-AMBR in kbit/s */
@@ -67,7 +73,11 @@ struct S8Config {
 /* What a Create Session Response told us */
 struct S8Result {
     int cause;                  /* 0 when the response had no Cause IE */
-    std::string ue_ip, pcscf;
+    int pdn_type;               /* what the PGW granted */
+    std::string ue_ip, pcscf;   /* IPv4 */
+    std::string ue_ip6, pcscf6; /* IPv6: prefix and interface identifier of the PAA */
+    /* The pair SIP uses, chosen from the above when the session comes up */
+    std::string sip_ip, sip_pcscf;
     std::string pgw_c_ip, pgw_u_ip;
     uint32_t pgw_c_teid, pgw_u_teid;
 };
@@ -154,6 +164,10 @@ public:
     S8State state() const { return state_; }
     bool busy() const { return state_ == S8_CREATING || state_ == S8_DELETING; }
     const char *error() const { return error_.c_str(); }
+    /* The address the user plane knows this UE by */
+    const char *ue_key() const {
+        return result_.ue_ip.empty() ? result_.ue_ip6.c_str() : result_.ue_ip.c_str();
+    }
     /* GTP cause of the last response; -1 when the PGW did not answer */
     int cause() const { return result_.cause; }
     const S8Result &result() const { return result_; }

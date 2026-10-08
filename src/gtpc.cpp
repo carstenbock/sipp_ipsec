@@ -87,10 +87,14 @@ enum {
 enum {
     RAT_EUTRAN = 6,             /* §8.17 */
     PDN_TYPE_IPV4 = 1,          /* §8.34 */
+    PDN_TYPE_IPV6 = 2,
+    PDN_TYPE_IPV4V6 = 3,
     DEFAULT_EBI = 5,
     MAX_EBI = 15,               /* §8.8: EBI is 4 bits, 5..15 in EPS */
     /* PCO protocol/container ids (TS 24.008 §10.5.6.3) */
+    PCO_PCSCF_IPV6 = 0x0001,
     PCO_IM_CN_SIGNALLING_FLAG = 0x0002,
+    PCO_DNS_IPV6 = 0x0003,
     PCO_PCSCF_IPV4 = 0x000c,
     PCO_DNS_IPV4 = 0x000d
 };
@@ -230,11 +234,15 @@ GtpBytes gtp_encode_create_session(const S8Config &cfg, uint32_t seq,
     put_ie(ies, IE_FTEID, 0, fteid(FTEID_S5S8_SGW_GTPC, c_teid, cfg.local_ip));
     put_ie(ies, IE_APN, 0, gtp_apn(cfg.apn));
     put_ie8(ies, IE_SELECTION_MODE, 0, 0);      /* subscribed APN, verified */
-    put_ie8(ies, IE_PDN_TYPE, 0, PDN_TYPE_IPV4);
+    int pdn = cfg.pdn_type == PDN_TYPE_IPV6 || cfg.pdn_type == PDN_TYPE_IPV4V6 ? cfg.pdn_type
+                                                                               : PDN_TYPE_IPV4;
+    bool want4 = pdn != PDN_TYPE_IPV6, want6 = pdn != PDN_TYPE_IPV4;
+    put_ie8(ies, IE_PDN_TYPE, 0, pdn);
 
-    /* PAA: IPv4, 0.0.0.0 asks the PGW to allocate (§8.14) */
-    v.assign(5, 0);
-    v[0] = PDN_TYPE_IPV4;
+    /* PAA (§8.14), all zero to have the PGW allocate: the type, then for
+     * IPv6 the prefix length and prefix, then for IPv4 the address */
+    v.assign(1 + (want6 ? 17 : 0) + (want4 ? 4 : 0), 0);
+    v[0] = pdn;
     put_ie(ies, IE_PAA, 0, v);
 
     put_ie8(ies, IE_APN_RESTRICTION, 0, 0);     /* maximum APN restriction: none */
@@ -248,9 +256,14 @@ GtpBytes gtp_encode_create_session(const S8Config &cfg, uint32_t seq,
      * IMS signalling bearer, as a VoLTE UE does (TS 24.008 §10.5.6.3) */
     v.clear();
     put8(v, 0x80);
-    static const uint16_t containers[] = { PCO_PCSCF_IPV4, PCO_DNS_IPV4,
-                                           PCO_IM_CN_SIGNALLING_FLAG };
+    static const uint16_t containers[] = { PCO_PCSCF_IPV6, PCO_DNS_IPV6, PCO_PCSCF_IPV4,
+                                           PCO_DNS_IPV4, PCO_IM_CN_SIGNALLING_FLAG };
     for (size_t i = 0; i < sizeof(containers) / sizeof(containers[0]); i++) {
+        bool v6 = containers[i] == PCO_PCSCF_IPV6 || containers[i] == PCO_DNS_IPV6;
+        bool v4 = containers[i] == PCO_PCSCF_IPV4 || containers[i] == PCO_DNS_IPV4;
+        if ((v6 && !want6) || (v4 && !want4)) {
+            continue;
+        }
         put16(v, containers[i]);
         put8(v, 0);
     }
@@ -327,6 +340,12 @@ static std::string ip4(const uint8_t *p)
     return inet_ntop(AF_INET, p, buf, sizeof(buf)) ? buf : "";
 }
 
+static std::string ip6(const uint8_t *p)
+{
+    char buf[INET6_ADDRSTRLEN];
+    return inet_ntop(AF_INET6, p, buf, sizeof(buf)) ? buf : "";
+}
+
 struct FteidOut {
     uint8_t iface;
     std::string *ip;
@@ -350,6 +369,7 @@ bool gtp_decode_create_session_response(const uint8_t *msg, size_t len, S8Result
     }
     out = S8Result();
     out.pgw_c_teid = out.pgw_u_teid = 0;
+    out.pdn_type = 0;
     S8Result *r = &out;
     return for_each_ie(h.ies, h.ies_len, [r](uint8_t type, uint8_t, const uint8_t *v, size_t vlen) {
         if (type == IE_CAUSE && vlen >= 1) {
@@ -358,7 +378,18 @@ bool gtp_decode_create_session_response(const uint8_t *msg, size_t len, S8Result
             FteidOut want = { FTEID_S5S8_PGW_GTPC, &r->pgw_c_ip, &r->pgw_c_teid };
             take_fteid(v, vlen, want);
         } else if (type == IE_PAA && vlen >= 5 && (v[0] & 0x07) == PDN_TYPE_IPV4) {
+            r->pdn_type = PDN_TYPE_IPV4;
             r->ue_ip = ip4(v + 1);
+        } else if (type == IE_PAA && vlen >= 18 && ((v[0] & 0x07) == PDN_TYPE_IPV6 ||
+                                                    (v[0] & 0x07) == PDN_TYPE_IPV4V6)) {
+            /* Prefix length, then prefix and interface identifier: the /64
+             * is the UE's, the identifier is what the PGW expects in its
+             * link-local address and is used for the global one here too */
+            r->pdn_type = v[0] & 0x07;
+            r->ue_ip6 = ip6(v + 2);
+            if (r->pdn_type == PDN_TYPE_IPV4V6 && vlen >= 22) {
+                r->ue_ip = ip4(v + 18);
+            }
         } else if (type == IE_PCO && vlen >= 1) {
             /* containers after the configuration protocol octet */
             for (size_t off = 1; off + 3 <= vlen;) {
@@ -369,6 +400,8 @@ bool gtp_decode_create_session_response(const uint8_t *msg, size_t len, S8Result
                 }
                 if (id == PCO_PCSCF_IPV4 && clen == 4 && r->pcscf.empty()) {
                     r->pcscf = ip4(v + off + 3);
+                } else if (id == PCO_PCSCF_IPV6 && clen == 16 && r->pcscf6.empty()) {
+                    r->pcscf6 = ip6(v + off + 3);
                 }
                 off += 3 + clen;
             }
@@ -396,7 +429,7 @@ enum {
 };
 
 /* Contents of one packet filter. A component this user plane cannot
- * evaluate (IPv6, SPI, TOS, flow label, unknown) makes the filter select
+ * evaluate (SPI, TOS, flow label, unknown) makes the filter select
  * nothing, so such traffic stays on the default bearer. */
 static void decode_filter_contents(const uint8_t *c, size_t len, GtpuFilter &f)
 {
@@ -410,6 +443,21 @@ static void decode_filter_contents(const uint8_t *c, size_t len, GtpuFilter &f)
             memcpy(addr, c + off, 4);
             memcpy(mask, c + off + 4, 4);
             off += 8;
+        } else if ((type == PF_IPV6_REMOTE_PREFIX || type == PF_IPV6_LOCAL_PREFIX) && left >= 17) {
+            /* Address and prefix length */
+            bool remote = type == PF_IPV6_REMOTE_PREFIX;
+            memcpy(remote ? f.remote6 : f.local6, c + off, 16);
+            (remote ? f.remote6_len : f.local6_len) = c[off + 16] > 128 ? 128 : c[off + 16];
+            off += 17;
+        } else if (type == PF_IPV6_REMOTE && left >= 32) {
+            /* Address and mask: the mask's leading one bits are the prefix */
+            int bits = 0;
+            while (bits < 128 && (c[off + 16 + bits / 8] & (0x80 >> (bits % 8)))) {
+                bits++;
+            }
+            memcpy(f.remote6, c + off, 16);
+            f.remote6_len = bits;
+            off += 32;
         } else if (type == PF_PROTOCOL && left >= 1) {
             f.protocol = c[off];
             off += 1;
@@ -717,6 +765,7 @@ S8Session::S8Session(const S8Config &cfg) :
 {
     result_ = S8Result();
     result_.pgw_c_teid = result_.pgw_u_teid = 0;
+    result_.pdn_type = 0;
     GtpcEndpoint::all.insert(this);
 }
 
@@ -763,7 +812,7 @@ void S8Session::release_user_plane()
         drop_bearer(bearers_.size() - 1, "released with the session");
     }
     if (user_plane_) {
-        gtpu_del_ue(result_.ue_ip.c_str());
+        gtpu_del_ue(ue_key());
         user_plane_ = false;
     }
 }
@@ -844,26 +893,42 @@ void S8Session::on_response(uint8_t type, const uint8_t *msg, size_t len)
             fail("malformed Create Session Response");
             return;
         }
-        if (result_.cause != GTP_CAUSE_ACCEPTED) {
+        if (result_.cause < GTP_CAUSE_ACCEPTED || result_.cause > GTP_CAUSE_ACCEPTED_LAST) {
             int cause = result_.cause;
             fail("Create Session rejected by the PGW, cause %d", cause);
             result_.cause = cause;
             return;
         }
-        if (result_.ue_ip.empty() || !result_.pgw_u_teid || result_.pgw_u_ip.empty()) {
+        if ((result_.ue_ip.empty() && result_.ue_ip6.empty()) || !result_.pgw_u_teid ||
+            result_.pgw_u_ip.empty()) {
             fail("Create Session Response without UE address or PGW user plane F-TEID");
             return;
         }
-        if (gtpu_add_ue(result_.ue_ip.c_str(), u_teid_, result_.pgw_u_ip.c_str(),
+        /* SIP uses IPv6 when the UE has an IPv6 address and the PGW named
+         * a P-CSCF for it (GSMA IR.92: IPv6 is preferred), unless the
+         * scenario asks for one family */
+        {
+            bool can6 = !result_.ue_ip6.empty(), can4 = !result_.ue_ip.empty();
+            bool use6 = cfg_.sip_family == 6 ? can6 :
+                        cfg_.sip_family == 4 ? !can4 :
+                        (can6 && !result_.pcscf6.empty()) || !can4;
+            result_.sip_ip = use6 ? result_.ue_ip6 : result_.ue_ip;
+            result_.sip_pcscf = use6 ? result_.pcscf6 : result_.pcscf;
+        }
+        if (gtpu_add_ue(result_.ue_ip.c_str(), result_.ue_ip6.c_str(), u_teid_, result_.pgw_u_ip.c_str(),
                         result_.pgw_u_teid) < 0) {
             fail("user plane: %s", gtpu_error());
             return;
         }
         user_plane_ = true;
         state_ = S8_ACTIVE;
-        LOG_MSG("S8 %s: session up, UE IP %s, P-CSCF %s, PGW-U %s TEID 0x%x\n",
+        LOG_MSG("S8 %s: session up, UE IP %s%s%s, P-CSCF %s%s%s, SIP from %s, PGW-U %s TEID 0x%x\n",
                 cfg_.imsi.c_str(), result_.ue_ip.c_str(),
-                result_.pcscf.empty() ? "(none)" : result_.pcscf.c_str(),
+                !result_.ue_ip.empty() && !result_.ue_ip6.empty() ? " and " : "",
+                result_.ue_ip6.c_str(),
+                result_.pcscf.empty() && result_.pcscf6.empty() ? "(none)" : result_.pcscf.c_str(),
+                !result_.pcscf.empty() && !result_.pcscf6.empty() ? " and " : "",
+                result_.pcscf6.c_str(), result_.sip_ip.c_str(),
                 result_.pgw_u_ip.c_str(), result_.pgw_u_teid);
     } else if (state_ == S8_DELETING && type == GTP_DELETE_SESSION_RESPONSE) {
         Header h;
@@ -919,13 +984,19 @@ static std::string log_time()
 static std::string describe_filter(const GtpTftFilter &f)
 {
     static const char *dir[] = { "both ways (pre Rel-7)", "downlink", "uplink", "both ways" };
-    char buf[256], local[INET_ADDRSTRLEN] = "any", remote[INET_ADDRSTRLEN] = "any";
+    char buf[320], local[INET6_ADDRSTRLEN + 8] = "any", remote[INET6_ADDRSTRLEN + 8] = "any";
     const GtpuFilter &m = f.match;
     if (m.local_mask) {
         inet_ntop(AF_INET, &m.local_addr, local, sizeof(local));
+    } else if (m.local6_len >= 0) {
+        inet_ntop(AF_INET6, m.local6, local, INET6_ADDRSTRLEN);
+        snprintf(local + strlen(local), 8, "/%d", m.local6_len);
     }
     if (m.remote_mask) {
         inet_ntop(AF_INET, &m.remote_addr, remote, sizeof(remote));
+    } else if (m.remote6_len >= 0) {
+        inet_ntop(AF_INET6, m.remote6, remote, INET6_ADDRSTRLEN);
+        snprintf(remote + strlen(remote), 8, "/%d", m.remote6_len);
     }
     snprintf(buf, sizeof(buf), "filter %d %s, precedence %d: protocol %d, local %s port %d-%d, remote %s port %d-%d%s",
              f.id, dir[f.direction & 3], m.precedence, m.protocol, local, m.local_port_lo,
@@ -955,10 +1026,10 @@ void S8Session::drop_bearer(size_t index, const char *why)
 {
     const S8Bearer &b = bearers_[index];
     unsigned long ul = 0, dl = 0;
-    gtpu_bearer_counters(result_.ue_ip.c_str(), b.ebi, ul, dl);
+    gtpu_bearer_counters(ue_key(), b.ebi, ul, dl);
     LOG_MSG("%s S8 %s: dedicated bearer EBI %d (QCI %d) %s, carried %lu uplink and %lu downlink packets\n",
             log_time().c_str(), cfg_.imsi.c_str(), b.ebi, b.qci, why, ul, dl);
-    gtpu_del_bearer(result_.ue_ip.c_str(), b.ebi);
+    gtpu_del_bearer(ue_key(), b.ebi);
     bearers_.erase(bearers_.begin() + index);
 }
 
@@ -1007,7 +1078,7 @@ GtpBytes S8Session::create_bearers(const uint8_t *ies, size_t len)
         b.pgw_u_teid = w.pgw_u_teid;
         b.local_teid = gtpu_new_teid();
         gtp_apply_tft(b.tft, w.tft_opcode, w.tft);
-        if (gtpu_add_bearer(result_.ue_ip.c_str(), b.ebi, b.local_teid, b.pgw_u_ip.c_str(),
+        if (gtpu_add_bearer(ue_key(), b.ebi, b.local_teid, b.pgw_u_ip.c_str(),
                             b.pgw_u_teid, gtp_uplink_filters(b.tft)) < 0) {
             put_ie(contexts, IE_BEARER_CONTEXT, 0,
                    bearer_answer(0, GTP_CAUSE_REQUEST_REJECTED, fteids));
@@ -1053,7 +1124,7 @@ GtpBytes S8Session::update_bearers(const uint8_t *ies, size_t len)
         } else if (b) {
             if (w.has_tft) {
                 gtp_apply_tft(b->tft, w.tft_opcode, w.tft);
-                gtpu_set_filters(result_.ue_ip.c_str(), b->ebi, gtp_uplink_filters(b->tft));
+                gtpu_set_filters(ue_key(), b->ebi, gtp_uplink_filters(b->tft));
             }
             if (w.qci) {
                 b->qci = w.qci;
@@ -1257,6 +1328,8 @@ static S8Config test_config()
     c.ambr_dl = 2000;
     c.tac = 1;
     c.eci = 0x15ee001;
+    c.pdn_type = 1;
+    c.sip_family = 0;
     return c;
 }
 
@@ -1504,19 +1577,100 @@ TEST(Gtpc, TftOperationsChangeSingleFilters) {
     EXPECT_TRUE(gtp_uplink_filters(tft).empty());
 }
 
-/* A filter with a component this user plane cannot check (here an IPv6
- * remote address) must select nothing rather than everything, and a TFT cut
+/* A filter with a component this user plane cannot check (here an IPsec
+ * SPI) must select nothing rather than everything, and a TFT cut
  * short must be refused, not half applied. */
 TEST(Gtpc, TftWithUnsupportedOrTruncatedFilters) {
     std::vector<GtpTftFilter> in;
     int op = 0;
-    GtpBytes v6 = bytes("21" "31" "00" "12" "21" "20010db8000000000000000000000001" "80");
+    GtpBytes v6 = bytes("21" "31" "00" "05" "60" "12345678");
     ASSERT_TRUE(gtp_decode_tft(v6.data(), v6.size(), op, in));
     ASSERT_EQ(1u, in.size());
     EXPECT_TRUE(in[0].match.never);
 
     GtpBytes cut = bytes("21" "21" "05" "09" "3011");
     EXPECT_FALSE(gtp_decode_tft(cut.data(), cut.size(), op, in));
+}
+
+/* A PGW allocates by the PDN type and the shape of the PAA: for IPv4v6 it
+ * expects type 3 with room for a prefix and an address, and it only names
+ * an IPv6 P-CSCF when the PCO asks for one. */
+TEST(Gtpc, CreateSessionRequestForIpv6AndDualStack) {
+    S8Config cfg = test_config();
+    for (int pdn = 2; pdn <= 3; pdn++) {
+        cfg.pdn_type = pdn;
+        GtpBytes m = gtp_encode_create_session(cfg, 1, 2, 3, 4);
+        Header h;
+        ASSERT_TRUE(decode_header(m.data(), m.size(), h));
+        std::map<int, GtpBytes> top;
+        std::map<int, GtpBytes> *t = &top;
+        ASSERT_TRUE(for_each_ie(h.ies, h.ies_len, [t](uint8_t type, uint8_t inst, const uint8_t *v, size_t vlen) {
+            (*t)[type * 16 + inst] = GtpBytes(v, v + vlen);
+        }));
+        EXPECT_EQ(GtpBytes(1, pdn), top[IE_PDN_TYPE * 16]);
+        ASSERT_EQ(pdn == 2 ? 18u : 22u, top[IE_PAA * 16].size());
+        EXPECT_EQ(pdn, top[IE_PAA * 16][0]);
+        const GtpBytes &pco = top[IE_PCO * 16];
+        /* IPv6-only: P-CSCF v6, DNS v6, IM CN flag; dual stack: all five */
+        EXPECT_EQ(pdn == 2 ? bytes("80" "000100" "000300" "000200")
+                           : bytes("80" "000100" "000300" "000c00" "000d00" "000200"), pco);
+    }
+}
+
+/* Both addresses of a dual-stack answer are needed: SIP runs from one, the
+ * user plane has to know both. The IPv4 address sits behind the 17 octets
+ * of prefix length and prefix; read from the wrong offset it is garbage. */
+TEST(Gtpc, CreateSessionResponseWithIpv6Addresses) {
+    GtpBytes ies, bc;
+    put_ie(ies, IE_CAUSE, 0, bytes("1000"));
+    put_ie(ies, IE_FTEID, 1, bytes("87" "00001001" "0a00010a"));
+    put_ie(ies, IE_PAA, 0, bytes("03" "40" "cafe0000004600070000000000000001" "0a2e0007"));
+    put_ie(ies, IE_PCO, 0, bytes("80" "000110" "2001067c000000000000000000000153" "000c04" "2ee1c599"));
+    put_ie8(bc, IE_EBI, 0, 5);
+    put_ie(bc, IE_FTEID, 2, bytes("85" "00002002" "0a000102"));
+    put_ie(ies, IE_BEARER_CONTEXT, 0, bc);
+    GtpBytes m = message(GTP_CREATE_SESSION_RESPONSE, true, 7, 1, ies);
+    S8Result r;
+    ASSERT_TRUE(gtp_decode_create_session_response(m.data(), m.size(), r));
+    EXPECT_EQ(3, r.pdn_type);
+    EXPECT_EQ("10.46.0.7", r.ue_ip);
+    EXPECT_EQ("cafe:0:46:7::1", r.ue_ip6);
+    EXPECT_EQ("46.225.197.153", r.pcscf);
+    EXPECT_EQ("2001:67c::153", r.pcscf6);
+
+    /* IPv6 only: no IPv4 address may be invented */
+    ies.clear();
+    put_ie(ies, IE_CAUSE, 0, bytes("1000"));
+    put_ie(ies, IE_PAA, 0, bytes("02" "40" "cafe0000004600070000000000000001"));
+    m = message(GTP_CREATE_SESSION_RESPONSE, true, 7, 1, ies);
+    ASSERT_TRUE(gtp_decode_create_session_response(m.data(), m.size(), r));
+    EXPECT_EQ(2, r.pdn_type);
+    EXPECT_TRUE(r.ue_ip.empty());
+    EXPECT_EQ("cafe:0:46:7::1", r.ue_ip6);
+}
+
+/* The voice bearer of an IPv6 call comes with IPv6 filter components
+ * (address with prefix length). They have to be understood, or the media
+ * of every IPv6 call stays on the default bearer. */
+TEST(Gtpc, TftWithIpv6Components) {
+    std::vector<GtpTftFilter> in;
+    int op = 0;
+    /* uplink: UDP, remote 2001:db8::9/128 port 30000, local cafe:0:46:7::/64 */
+    GtpBytes tft = bytes("21" "21" "00" "29"
+                         "3011"
+                         "21" "20010db8000000000000000000000009" "80"
+                         "507530"
+                         "23" "cafe0000004600070000000000000000" "40");
+    ASSERT_TRUE(gtp_decode_tft(tft.data(), tft.size(), op, in));
+    ASSERT_EQ(1u, in.size());
+    const GtpuFilter &f = in[0].match;
+    EXPECT_FALSE(f.never);
+    EXPECT_EQ(128, f.remote6_len);
+    EXPECT_EQ(64, f.local6_len);
+    EXPECT_EQ(0x20, f.remote6[0]);
+    EXPECT_EQ(0x09, f.remote6[15]);
+    EXPECT_EQ(30000, f.remote_port_lo);
+    EXPECT_EQ(17, f.protocol);
 }
 
 TEST(Gtpc, TruncatedMessagesAreRefused) {

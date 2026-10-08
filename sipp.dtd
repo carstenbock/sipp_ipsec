@@ -126,6 +126,8 @@
 <!ATTLIST swu_attach k CDATA #REQUIRED >
 <!ATTLIST swu_attach opc CDATA #REQUIRED >
 <!ATTLIST swu_attach apn CDATA "ims" >
+<!ATTLIST swu_attach pdn_type CDATA "ipv4" >
+<!ATTLIST swu_attach sip_family CDATA #IMPLIED >
 <!ELEMENT swu_detach EMPTY >
 
 <!ELEMENT s8_create_session EMPTY >
@@ -140,6 +142,8 @@
 <!ATTLIST s8_create_session ambr_dl CDATA #IMPLIED >
 <!ATTLIST s8_create_session tac CDATA "1" >
 <!ATTLIST s8_create_session eci CDATA "1" >
+<!ATTLIST s8_create_session pdn_type CDATA "ipv4" >
+<!ATTLIST s8_create_session sip_family CDATA #IMPLIED >
 <!ATTLIST s8_create_session expect CDATA "16" >
 <!ATTLIST s8_create_session assign_to CDATA #IMPLIED >
 <!ELEMENT s8_delete_session EMPTY >

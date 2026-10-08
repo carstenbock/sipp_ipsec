@@ -84,6 +84,9 @@ struct SwuConfig {
     std::string identity;   /* NAI: <d><IMSI>@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org,
                                d = 6 for EAP-AKA', 0 for EAP-AKA (TS 23.003 §19.3.2) */
     std::string apn;        /* sent as IDr */
+    int pdn_type;           /* inner addresses asked for: 1 IPv4, 2 IPv6, 3 both */
+    int sip_family;         /* address family for SIP: 0 IPv6 if there is a
+                               P-CSCF for it (GSMA IR.92), 4 or 6 */
     uint8_t k[16];
     uint8_t opc[16];
 };
@@ -106,8 +109,12 @@ public:
     const char *error() const { return error_.c_str(); }
 
     /* Valid once ESTABLISHED */
-    const char *inner_ip() const { return inner_ip_.c_str(); }
-    const char *pcscf() const { return pcscf_.c_str(); }    /* may be empty */
+    /* The inner address SIP uses, and the P-CSCF for it (may be empty) */
+    const char *inner_ip() const { return sip_ip_.c_str(); }
+    const char *pcscf() const { return sip_pcscf_.c_str(); }
+    /* Every inner address the ePDG assigned; empty if none of that family */
+    const char *inner_ip4() const { return inner_ip_.c_str(); }
+    const char *inner_ip6() const { return inner_ip6_.c_str(); }
     const char *outer_local() const { return outer_local_.c_str(); }
     const char *outer_remote() const { return cfg_.epdg.c_str(); }
     uint32_t reqid() const { return reqid_; }
@@ -176,10 +183,12 @@ private:
     bool natt_;                 /* moved to UDP 4500 (after IKE_SA_INIT) */
     std::string outer_local_;
     uint16_t outer_port_;
-    std::string inner_ip_;
-    std::string pcscf_;
+    std::string inner_ip_, pcscf_;          /* IPv4 */
+    std::string inner_ip6_, pcscf6_;        /* IPv6 */
+    std::string sip_ip_, sip_pcscf_;
     uint32_t reqid_;
     bool sa_out_, sa_in_, pol_out_, pol_in_, addr_;
+    bool pol6_out_, pol6_in_, addr6_;
 };
 
 #endif /* USE_SWU */

@@ -301,6 +301,7 @@ MAYBE_EXTERN const char       * visited_plmn            DEFVAL(nullptr);
 /* S6a: SIPp as visited MME toward the home HSS or its DRA (s6a.hpp) */
 MAYBE_EXTERN const char       * s6a_peer                DEFVAL(nullptr);
 MAYBE_EXTERN const char       * s6a_transport           DEFVAL("sctp");
+MAYBE_EXTERN const char       * s6a_local_ip            DEFVAL(nullptr);
 MAYBE_EXTERN const char       * s6a_origin_host         DEFVAL(nullptr);
 MAYBE_EXTERN const char       * s6a_origin_realm        DEFVAL(nullptr);
 MAYBE_EXTERN const char       * s6a_dest_realm          DEFVAL(nullptr);

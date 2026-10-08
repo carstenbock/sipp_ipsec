@@ -42,6 +42,9 @@
 #include <sys/socket.h>
 #include <linux/xfrm.h>
 #include <linux/rtnetlink.h>
+#include <linux/fib_rules.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
 #include <libmnl/libmnl.h>
 
 #include <openssl/bn.h>
@@ -315,12 +318,14 @@ static SwuBytes aka_mac(bool prime, const SwuBytes &k_aut, const SwuBytes &packe
 static int inner_addr(const char *ip, bool add)
 {
     char buf[512];
-    struct in_addr a;
+    uint8_t a[16];
+    int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
+    size_t alen = family == AF_INET ? 4 : 16;
     unsigned int ifindex = if_nametoindex(SWU_INNER_DEV);
     struct mnl_socket *nl;
     int rc = -1;
 
-    if (!ifindex || inet_pton(AF_INET, ip, &a) != 1) {
+    if (!ifindex || inet_pton(family, ip, a) != 1) {
         return -1;
     }
     if (!(nl = mnl_socket_open(NETLINK_ROUTE))) {
@@ -333,11 +338,14 @@ static int inner_addr(const char *ip, bool add)
         nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_REPLACE : 0);
         nlh->nlmsg_seq = 1;
         struct ifaddrmsg *ifa = (struct ifaddrmsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*ifa));
-        ifa->ifa_family = AF_INET;
-        ifa->ifa_prefixlen = 32;
+        ifa->ifa_family = family;
+        ifa->ifa_prefixlen = alen * 8;
         ifa->ifa_index = ifindex;
-        mnl_attr_put(nlh, IFA_LOCAL, sizeof(a), &a);
-        mnl_attr_put(nlh, IFA_ADDRESS, sizeof(a), &a);
+        /* No duplicate address detection: a tentative address cannot be
+         * bound for a second, and nobody else is on this link */
+        ifa->ifa_flags = family == AF_INET6 ? IFA_F_NODAD : 0;
+        mnl_attr_put(nlh, IFA_LOCAL, alen, a);
+        mnl_attr_put(nlh, IFA_ADDRESS, alen, a);
         if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) >= 0) {
             ssize_t n = mnl_socket_recvfrom(nl, buf, sizeof(buf));
             if (n > 0 && mnl_cb_run(buf, n, 1, mnl_socket_get_portid(nl), nullptr, nullptr) >= 0) {
@@ -347,6 +355,115 @@ static int inner_addr(const char *ip, bool add)
     }
     mnl_socket_close(nl);
     return rc;
+}
+
+/*
+ * Routing for an inner IPv6 address. The kernel only looks for an IPsec
+ * policy once it has a route, and a host without IPv6 connectivity has none
+ * for the destinations behind the tunnel: so every inner IPv6 address gets a
+ * rule "from <address> lookup <our table>", and that table a default route.
+ * The route's device does not matter, the policy sends the packet into the
+ * tunnel. IPv4 needs nothing like it as long as the host has a default route.
+ */
+static uint32_t swu_route_table()
+{
+    return 21000 + getpid() % 1000;
+}
+
+static int rtnl_send(struct nlmsghdr *nlh)
+{
+    char buf[512];
+    int rc = -1;
+    struct mnl_socket *nl = mnl_socket_open(NETLINK_ROUTE);
+    if (!nl) {
+        return -1;
+    }
+    nlh->nlmsg_seq = 1;
+    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) == 0 &&
+        mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) >= 0) {
+        ssize_t n = mnl_socket_recvfrom(nl, buf, sizeof(buf));
+        if (n > 0 && mnl_cb_run(buf, n, 1, mnl_socket_get_portid(nl), nullptr, nullptr) >= 0) {
+            rc = 0;
+        }
+    }
+    mnl_socket_close(nl);
+    return rc;
+}
+
+static int inner6_route(bool add)
+{
+    char buf[256];
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type = add ? RTM_NEWROUTE : RTM_DELROUTE;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_REPLACE : 0);
+    struct rtmsg *rtm = (struct rtmsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*rtm));
+    rtm->rtm_family = AF_INET6;
+    rtm->rtm_table = RT_TABLE_UNSPEC;
+    rtm->rtm_protocol = RTPROT_STATIC;
+    rtm->rtm_scope = RT_SCOPE_UNIVERSE;
+    rtm->rtm_type = RTN_UNICAST;
+    mnl_attr_put_u32(nlh, RTA_TABLE, swu_route_table());
+    mnl_attr_put_u32(nlh, RTA_OIF, if_nametoindex(SWU_INNER_DEV));
+    return rtnl_send(nlh);
+}
+
+static int inner6_rule(const char *ip6, bool add)
+{
+    char buf[256];
+    uint8_t a[16];
+    if (inet_pton(AF_INET6, ip6, a) != 1) {
+        return -1;
+    }
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type = add ? RTM_NEWRULE : RTM_DELRULE;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
+    struct fib_rule_hdr *frh = (struct fib_rule_hdr *)mnl_nlmsg_put_extra_header(nlh, sizeof(*frh));
+    frh->family = AF_INET6;
+    frh->src_len = 128;
+    frh->table = RT_TABLE_UNSPEC;
+    frh->action = FR_ACT_TO_TBL;
+    mnl_attr_put(nlh, FRA_SRC, 16, a);
+    mnl_attr_put_u32(nlh, FRA_TABLE, swu_route_table());
+    return rtnl_send(nlh);
+}
+
+/*
+ * A decrypted inner packet counts as received on the interface the ESP
+ * packet came in on. If IPv6 is switched off there (the default in many
+ * containers), the kernel discards every inner IPv6 packet: switch it on
+ * for the interface that has our outer address. Best effort.
+ */
+static void enable_ipv6_on_outer(const std::string &outer_ip)
+{
+    struct ifaddrs *ifs = nullptr;
+    struct in_addr want;
+    if (inet_pton(AF_INET, outer_ip.c_str(), &want) != 1 || getifaddrs(&ifs) != 0) {
+        return;
+    }
+    for (struct ifaddrs *i = ifs; i; i = i->ifa_next) {
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET &&
+            ((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr == want.s_addr) {
+            char path[128];
+            snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/disable_ipv6", i->ifa_name);
+            int fd = open(path, O_RDWR);
+            char cur = '0';
+            if (fd >= 0) {
+                if (read(fd, &cur, 1) == 1 && cur != '0' &&
+                    (lseek(fd, 0, SEEK_SET) != 0 || write(fd, "0", 1) != 1)) {
+                    WARNING("SWu: IPv6 is disabled on %s and cannot be enabled: inner IPv6 "
+                            "packets will not be received", i->ifa_name);
+                }
+                close(fd);
+            } else {
+                WARNING("SWu: cannot check whether IPv6 is enabled on %s (%s): if it is not, "
+                        "inner IPv6 packets will not be received", i->ifa_name, strerror(errno));
+            }
+            break;
+        }
+    }
+    freeifaddrs(ifs);
 }
 
 /* --- IKEv2 encoding ----------------------------------------------------- */
@@ -451,7 +568,8 @@ SwuSession::SwuSession(const SwuConfig &cfg) :
     next_msgid_(0), retrans_at_(0), retrans_count_(0),
     last_peer_msgid_(0xffffffff),
     natt_(false), outer_port_(0), reqid_(0),
-    sa_out_(false), sa_in_(false), pol_out_(false), pol_in_(false), addr_(false)
+    sa_out_(false), sa_in_(false), pol_out_(false), pol_in_(false), addr_(false),
+    pol6_out_(false), pol6_in_(false), addr6_(false)
 {
     memset(spi_i_, 0, sizeof(spi_i_));
     memset(spi_r_, 0, sizeof(spi_r_));
@@ -902,16 +1020,29 @@ void SwuSession::send_auth_first()
         pls.push_back(p);
     }
 
-    /* CFG_REQUEST: inner IPv4 address, DNS, P-CSCF (RFC 7651) */
+    /* CFG_REQUEST: inner address, DNS and P-CSCF (RFC 7651) for each
+     * address family wanted. Which INTERNAL_IPx_ADDRESS attributes are there
+     * tells the ePDG the PDN type to ask the PGW for (TS 24.302 §7.2.2). */
+    bool want4 = cfg_.pdn_type != 2, want6 = cfg_.pdn_type == 2 || cfg_.pdn_type == 3;
     p.type = PL_CP;
     p.body.clear();
     put8(p.body, 1);
     p.body.resize(4, 0);
-    static const uint16_t attrs[] = { 1 /* INTERNAL_IP4_ADDRESS */, 3 /* INTERNAL_IP4_DNS */,
-                                      20 /* P_CSCF_IP4_ADDRESS */ };
-    for (size_t i = 0; i < sizeof(attrs) / sizeof(attrs[0]); i++) {
-        put16(p.body, attrs[i]);
-        put16(p.body, 0);
+    static const uint16_t attrs4[] = { 1 /* INTERNAL_IP4_ADDRESS */, 3 /* INTERNAL_IP4_DNS */,
+                                       20 /* P_CSCF_IP4_ADDRESS */ };
+    static const uint16_t attrs6[] = { 8 /* INTERNAL_IP6_ADDRESS */, 10 /* INTERNAL_IP6_DNS */,
+                                       21 /* P_CSCF_IP6_ADDRESS */ };
+    for (size_t i = 0; i < 3; i++) {
+        if (want4) {
+            put16(p.body, attrs4[i]);
+            put16(p.body, 0);
+        }
+    }
+    for (size_t i = 0; i < 3; i++) {
+        if (want6) {
+            put16(p.body, attrs6[i]);
+            put16(p.body, 0);
+        }
     }
     pls.push_back(p);
 
@@ -922,17 +1053,29 @@ void SwuSession::send_auth_first()
     p.body = sa_body(true, child_spi_i_);
     pls.push_back(p);
 
-    /* TSi / TSr: any IPv4; the ePDG narrows TSi to the inner address */
+    /* TSi / TSr: any address of each family wanted (RFC 7296 §3.13.1); the
+     * ePDG narrows TSi to the inner addresses */
     p.body.clear();
-    put8(p.body, 1);
+    put8(p.body, (want4 ? 1 : 0) + (want6 ? 1 : 0));
     p.body.resize(4, 0);
-    put8(p.body, 7);        /* TS_IPV4_ADDR_RANGE */
-    put8(p.body, 0);
-    put16(p.body, 16);
-    put16(p.body, 0);
-    put16(p.body, 65535);
-    put32(p.body, 0);
-    put32(p.body, 0xffffffff);
+    if (want4) {
+        put8(p.body, 7);        /* TS_IPV4_ADDR_RANGE */
+        put8(p.body, 0);
+        put16(p.body, 16);
+        put16(p.body, 0);
+        put16(p.body, 65535);
+        put32(p.body, 0);
+        put32(p.body, 0xffffffff);
+    }
+    if (want6) {
+        put8(p.body, 8);        /* TS_IPV6_ADDR_RANGE */
+        put8(p.body, 0);
+        put16(p.body, 40);
+        put16(p.body, 0);
+        put16(p.body, 65535);
+        p.body.insert(p.body.end(), 16, 0x00);
+        p.body.insert(p.body.end(), 16, 0xff);
+    }
     p.type = PL_TSI;
     pls.push_back(p);
     p.type = PL_TSR;
@@ -1175,12 +1318,24 @@ void SwuSession::finish_auth(const std::vector<Payload> &pls)
                 if (off + 4 + alen > b.size()) {
                     break;
                 }
-                if (alen >= 4 && inet_ntop(AF_INET, &b[off + 4], addr, sizeof(addr))) {
+                bool v4 = type == 1 || type == 20 || type == 16389;
+                bool v6 = type == 8 || type == 21 || type == 16390;
+                char addr6[INET6_ADDRSTRLEN];
+                if (v4 && alen >= 4 && inet_ntop(AF_INET, &b[off + 4], addr, sizeof(addr))) {
                     if (type == 1 && inner_ip_.empty()) {
                         inner_ip_ = addr;
-                    } else if ((type == 20 || type == 16389) && pcscf_.empty()) {
+                    } else if (type != 1 && pcscf_.empty()) {
                         /* RFC 7651, or the 3GPP private attribute */
                         pcscf_ = addr;
+                    }
+                } else if (v6 && alen >= 16 && inet_ntop(AF_INET6, &b[off + 4], addr6, sizeof(addr6))) {
+                    /* INTERNAL_IP6_ADDRESS: address and prefix length; the
+                     * address is the UE's (prefix and interface identifier
+                     * from the PGW) */
+                    if (type == 8 && inner_ip6_.empty()) {
+                        inner_ip6_ = addr6;
+                    } else if (type != 8 && pcscf6_.empty()) {
+                        pcscf6_ = addr6;
                     }
                 }
                 off += 4 + alen;
@@ -1194,17 +1349,30 @@ void SwuSession::finish_auth(const std::vector<Payload> &pls)
         fail("ePDG did not prove knowledge of the MSK (AUTH missing or wrong)");
         return;
     }
-    if (inner_ip_.empty() || !child_spi_r_) {
-        fail("ePDG assigned no inner IPv4 address or no ESP SA");
+    if ((inner_ip_.empty() && inner_ip6_.empty()) || !child_spi_r_) {
+        fail("ePDG assigned no inner address or no ESP SA");
         return;
+    }
+    {
+        /* SIP uses IPv6 when there is an inner IPv6 address and a P-CSCF
+         * for it (GSMA IR.92 prefers IPv6), unless the scenario says which */
+        bool can6 = !inner_ip6_.empty(), can4 = !inner_ip_.empty();
+        bool use6 = cfg_.sip_family == 6 ? can6 :
+                    cfg_.sip_family == 4 ? !can4 :
+                    (can6 && !pcscf6_.empty()) || !can4;
+        sip_ip_ = use6 ? inner_ip6_ : inner_ip_;
+        sip_pcscf_ = use6 ? pcscf6_ : pcscf_;
     }
     if (install_kernel() < 0) {
         fail("cannot install the tunnel in the kernel (CAP_NET_ADMIN?)");
         return;
     }
     state_ = SWU_ESTABLISHED;
-    LOG_MSG("SWu %s: tunnel up, inner IP %s, P-CSCF %s\n", cfg_.identity.c_str(),
-            inner_ip_.c_str(), pcscf_.empty() ? "(none)" : pcscf_.c_str());
+    LOG_MSG("SWu %s: tunnel up (asked for %s), inner IP %s%s%s, P-CSCF %s%s%s, SIP from %s\n", cfg_.identity.c_str(),
+            cfg_.pdn_type == 2 ? "IPv6" : cfg_.pdn_type == 3 ? "IPv4v6" : "IPv4",
+            inner_ip_.c_str(), !inner_ip_.empty() && !inner_ip6_.empty() ? " and " : "",
+            inner_ip6_.c_str(), pcscf_.empty() && pcscf6_.empty() ? "(none)" : pcscf_.c_str(),
+            !pcscf_.empty() && !pcscf6_.empty() ? " and " : "", pcscf6_.c_str(), sip_ip_.c_str());
 }
 
 int SwuSession::install_kernel()
@@ -1232,18 +1400,45 @@ int SwuSession::install_kernel()
         return -1;
     }
     sa_in_ = true;
-    if (xfrm_add_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_OUT, &tun) < 0) {
-        return -1;
+    /* One pair of policies and one local address per inner address; both
+     * families share the SA pair (IPv6 in an IPv4 tunnel, RFC 7296 §2.9) */
+    if (!inner_ip_.empty()) {
+        if (xfrm_add_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_OUT, &tun) < 0) {
+            return -1;
+        }
+        pol_out_ = true;
+        if (xfrm_add_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_IN, &tun) < 0) {
+            return -1;
+        }
+        pol_in_ = true;
+        if (inner_addr(inner_ip_.c_str(), true) < 0) {
+            return -1;
+        }
+        addr_ = true;
     }
-    pol_out_ = true;
-    if (xfrm_add_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_IN, &tun) < 0) {
-        return -1;
+    if (!inner_ip6_.empty()) {
+        if (xfrm_add_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_OUT, &tun) < 0) {
+            return -1;
+        }
+        pol6_out_ = true;
+        if (xfrm_add_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_IN, &tun) < 0) {
+            return -1;
+        }
+        pol6_in_ = true;
+        if (inner_addr(inner_ip6_.c_str(), true) < 0) {
+            WARNING("SWu: cannot add the inner IPv6 address %s to %s (IPv6 disabled?)",
+                    inner_ip6_.c_str(), SWU_INNER_DEV);
+            return -1;
+        }
+        addr6_ = true;
+        enable_ipv6_on_outer(outer_local_);
+        inner6_route(true);
+        inner6_rule(inner_ip6_.c_str(), false);     /* left by a run that crashed */
+        if (inner6_rule(inner_ip6_.c_str(), true) < 0) {
+            WARNING("SWu: cannot add the routing rule for the inner IPv6 address %s", inner_ip6_.c_str());
+            return -1;
+        }
     }
-    pol_in_ = true;
-    if (inner_addr(inner_ip_.c_str(), true) < 0) {
-        return -1;
-    }
-    addr_ = true;
     return 0;
 }
 
@@ -1260,6 +1455,16 @@ void SwuSession::remove_kernel()
     if (pol_in_) {
         xfrm_del_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_IN);
     }
+    if (addr6_) {
+        inner6_rule(inner_ip6_.c_str(), false);
+        inner_addr(inner_ip6_.c_str(), false);
+    }
+    if (pol6_out_) {
+        xfrm_del_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_OUT);
+    }
+    if (pol6_in_) {
+        xfrm_del_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_IN);
+    }
     if (sa_out_) {
         xfrm_del_sa(local, epdg, child_spi_r_, 0);
     }
@@ -1267,6 +1472,7 @@ void SwuSession::remove_kernel()
         xfrm_del_sa(epdg, local, child_spi_i_, 0);
     }
     addr_ = pol_out_ = pol_in_ = sa_out_ = sa_in_ = false;
+    addr6_ = pol6_out_ = pol6_in_ = false;
 }
 
 void SwuSession::detach()
@@ -1358,6 +1564,8 @@ void SwuSession::shutdown_all()
         }
         s->remove_kernel();
     }
+    /* The route of inner6_route(); there is none if no session had IPv6 */
+    inner6_route(false);
 }
 
 #ifdef GTEST
