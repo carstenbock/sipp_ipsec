@@ -178,6 +178,7 @@ private:
     unsigned long retrans_at_;
     int retrans_count_;
     uint32_t last_peer_msgid_;  /* last ePDG request we answered */
+    unsigned long keepalive_at_;    /* clock_tick of the next NAT keepalive, 0 = not scheduled */
     SwuBytes last_peer_reply_;
 
     bool natt_;                 /* moved to UDP 4500 (after IKE_SA_INIT) */

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- SWu NAT keepalives: every established tunnel sends the one-byte keepalive of RFC 3948 section 2.3 from its UDP port, every `-swu_keepalive` seconds (default 20, 0 = off). Without them a NAT or stateful firewall forgot the port of an idle UE, the ePDG's dead peer detection got no answer and the tunnel was deleted after about two and a half minutes
 - IPv6 and dual stack for S8 and SWu: `pdn_type="ipv6"` or `"ipv4v6"` on `<s8_create_session>` and `<swu_attach>` asks for an IPv6 prefix (PAA and PCO on S8; INTERNAL_IP6_ADDRESS, P_CSCF_IP6_ADDRESS and IPv6 traffic selectors on SWu), alone or next to an IPv4 address. SIP uses IPv6 when the network names an IPv6 P-CSCF (`sip_family=` overrides), with `[local_ip]`, `[remote_ip]`, `[local_ip_type]` and `[media_ip_type]` following; `[s8_ue_ip]` and `[s8_ue_ip6]` give both addresses. GTP-U carries IPv6 packets, and TFT packet filters with IPv6 addresses select the bearer. The transport to the PGW and the ePDG stays IPv4
 - S8 home-routed roaming: SIPp can play the visited SGW toward a home PGW. `<s8_create_session imsi= msisdn= apn= ...>` opens a PDN connection over GTPv2-C (3GPP TS 29.274) at the PGW given with `-s8_pgw`, `<s8_delete_session/>` closes it; the UE's SIP and RTP then travel as IP packets inside GTP-U (TS 29.281) through a TUN device. `expect=` names the GTP cause a call accepts and `assign_to=` stores it, so rejections can be tested; `[s8_cause]`, `[s8_pgw_c_ip]`, `[s8_pgw_c_teid]`, `[s8_pgw_u_ip]` and `[s8_pgw_u_teid]` expose the result. New options `-s8_local_ip`, `-s8_t3`, `-s8_n3` and `-visited_plmn`. IPv4 only (see `docs/s8hr.rst`)
 - S8 dedicated bearers: a Create, Update or Delete Bearer Request of the PGW is accepted without the scenario. Uplink packets that match a bearer's uplink TFT packet filters leave on that bearer's TEID, so a call's RTP travels on the voice bearer (QCI 1) the home network sets up. `<s8_wait_bearer qci= released= timeout= optional= assign_to=>` lets a scenario wait for a bearer to come or go
@@ -33,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `apps/sipp/sipp_scenarios/media/` directory: RTP PCAP files (`evs-ue-side.pcap`, `g722-gw-side.pcap`) moved from repo root; `amr-wb.pcap`, `amr-nb.pcap`, `pcmu.pcap`, `pcma.pcap` from nesfit/Codecs
 - `apps/sipp/sipp_scenarios/traces/` directory: `mo-call-1.pcap` (iOS 26.3.1 reference trace) moved from repo root
 - `docker/Dockerfile`: `USE_IPSEC=1` build argument enables `-DUSE_IPSEC=1` CMake flag; `iproute2` added to runtime image for XFRM SA management
+
+### Fixed
+- SWu with several SIPp processes on one host: the tunnel SAs took their kernel reqid from a per-process counter, so UEs of different processes that used the same ePDG shared a reqid and half of them sent their packets through another UE's SA (REGISTERs retransmitted for tens of seconds, re-REGISTERs unanswered). The reqid is now the SPI the ePDG assigned
 
 ### Changed
 - The ESP tunnel SAs of an SWu attach accept inner packets of both address families (`XFRM_STATE_AF_UNSPEC`); a PGW's answer "accepted with another PDN type" (GTP causes 17 to 19) brings an S8 session up like cause 16

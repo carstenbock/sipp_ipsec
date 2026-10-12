@@ -92,7 +92,6 @@ enum {
 static std::set<SwuSession *> all_sessions;
 static std::set<SwuSession *> pending_sessions;     /* with an unanswered request */
 static int swu_epfd = -1;
-static uint32_t next_reqid = 0x10000;
 
 /* --- byte helpers ------------------------------------------------------- */
 
@@ -567,7 +566,7 @@ SwuSession::SwuSession(const SwuConfig &cfg) :
     child_spi_i_(0), child_spi_r_(0),
     next_msgid_(0), retrans_at_(0), retrans_count_(0),
     last_peer_msgid_(0xffffffff),
-    natt_(false), outer_port_(0), reqid_(0),
+    keepalive_at_(0), natt_(false), outer_port_(0), reqid_(0),
     sa_out_(false), sa_in_(false), pol_out_(false), pol_in_(false), addr_(false),
     pol6_out_(false), pol6_in_(false), addr6_(false)
 {
@@ -1387,7 +1386,13 @@ int SwuSession::install_kernel()
     if (xfrm_init() < 0) {
         return -1;
     }
-    reqid_ = next_reqid++;
+    /* The reqid ties the policies of this UE to its pair of tunnel SAs. It
+     * has to be unique in the kernel, not in this process: several SIPp
+     * processes on one host share the kernel, and with a per-process counter
+     * the UEs of two processes got the same reqid toward the same ePDG, so
+     * half of them sent their traffic through another UE's SA. The SPI the
+     * ePDG chose for our outbound SA is unique per ePDG. */
+    reqid_ = child_spi_r_;
     XfrmTunnel tun = { local, epdg, reqid_ };
 
     if (xfrm_add_tunnel_sa(local, epdg, child_spi_r_, reqid_, outer_port_, IKE_NATT_PORT,
@@ -1545,6 +1550,30 @@ void SwuSession::poll_all()
         std::vector<SwuSession *> waiting(pending_sessions.begin(), pending_sessions.end());
         for (size_t i = 0; i < waiting.size(); i++) {
             waiting[i]->on_timer();
+        }
+    }
+
+    /* NAT keepalives (RFC 3948 section 2.3): one 0xFF byte from the tunnel's
+     * UDP port. An idle UE sends nothing else, and without them the state a
+     * NAT or stateful firewall holds for the port expires: the ePDG's dead
+     * peer detection then no longer reaches the UE and the ePDG deletes the
+     * tunnel. Looked at once a second; each tunnel has its own phase. */
+    static unsigned long keepalive_scan_at = 0;
+    if (swu_keepalive > 0 && clock_tick >= keepalive_scan_at) {
+        keepalive_scan_at = clock_tick + 1000;
+        const unsigned long interval = (unsigned long)swu_keepalive * 1000;
+        static const uint8_t keepalive = 0xff;
+        for (std::set<SwuSession *>::iterator it = all_sessions.begin(); it != all_sessions.end(); ++it) {
+            SwuSession *s = *it;
+            if (s->state_ != SWU_ESTABLISHED || !s->natt_ || s->fd_ < 0) {
+                continue;
+            }
+            if (s->keepalive_at_ == 0) {
+                s->keepalive_at_ = clock_tick + (unsigned long)rand() % interval;
+            } else if (clock_tick >= s->keepalive_at_) {
+                (void)send(s->fd_, &keepalive, 1, 0);
+                s->keepalive_at_ = clock_tick + interval;
+            }
         }
     }
 }

@@ -257,6 +257,9 @@ struct sipp_option options_table[] = {
     {"swu_epdg", "Set the ePDG that the <swu_attach> action builds its VoWiFi tunnel to\n"
      "(IKEv2 with EAP-AKA' on UDP 4500, 3GPP TS 24.302). IPv4 address or host name.\n"
      "Needs -t un and root or CAP_NET_ADMIN.", SIPP_OPTION_STRING, &swu_epdg, 1},
+    {"swu_keepalive", "Seconds between the NAT keepalives of an SWu tunnel (RFC 3948 section 2.3), 0 = none. Default: 20.\n"
+     "They keep NAT and firewall state for UDP 4500 alive, so the ePDG's dead peer detection still reaches an idle UE.",
+     SIPP_OPTION_INT, &swu_keepalive, 1},
 #endif
 #ifdef USE_S8
     {"s8_pgw", "Set the PGW that the <s8_create_session> action opens its PDN connection at\n"

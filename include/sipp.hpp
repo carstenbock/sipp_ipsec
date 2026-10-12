@@ -292,6 +292,7 @@ MAYBE_EXTERN char             * auth_uri                DEFVAL(0);
 #ifdef USE_IPSEC
 MAYBE_EXTERN bool               ipsec_enabled           DEFVAL(false);
 MAYBE_EXTERN const char       * swu_epdg                DEFVAL(nullptr);
+MAYBE_EXTERN int               swu_keepalive           DEFVAL(20);  /* NAT keepalive interval, seconds */
 /* S8 home-routed roaming: SIPp as visited SGW toward the home PGW (gtpc.hpp) */
 MAYBE_EXTERN const char       * s8_pgw                  DEFVAL(nullptr);
 MAYBE_EXTERN const char       * s8_local_ip             DEFVAL(nullptr);

@@ -22,6 +22,13 @@ Two scenario actions and one option:
 ``-swu_epdg <host>``
     The ePDG, as IPv4 address or host name.
 
+``-swu_keepalive <seconds>``
+    Interval of the NAT keepalives (RFC 3948 section 2.3) each tunnel sends
+    from its UDP port, default 20, ``0`` for none. An idle UE sends nothing
+    else; without them a NAT or stateful firewall on the path forgets the
+    port, the ePDG's dead peer detection no longer reaches the UE and the
+    ePDG deletes the tunnel (seen as a re-REGISTER that is never answered).
+
 ``<swu_attach identity="..." k="..." opc="..." apn="ims"/>``
     Builds the tunnel. It must be the first step of a call, inside a
     ``<nop>``; the call waits there until the tunnel is up and fails if
@@ -135,7 +142,7 @@ Limitations
   tries TCP toward the UE's protected server port is refused by the
   kernel and can fall back to UDP; SIPp does not accept such a connection.
 * No rekeying: a ``CREATE_CHILD_SA`` from the ePDG is refused, so a
-  call cannot outlive the SA lifetime. No MOBIKE, no NAT keepalives.
+  call cannot outlive the SA lifetime. No MOBIKE.
 * The ``rtp_stream`` actions (SIPp's built-in RTP streaming) are not
   tunnel-aware; use PCAP play or ``-rtp_echo``.
 * Large messages depend on the path: SIP goes over UDP, so an INVITE of
