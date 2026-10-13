@@ -71,10 +71,12 @@ public:
      * This struct is used for repartition table
      * border max is the max value allow for this range
      * nbInThisBorder is the counter of value in this range
+     * nbInThisBorderPL is the same counter since the last statistics dump
      */
     typedef struct _T_dynamicalRepartition {
         unsigned int  borderMax;
         unsigned long nbInThisBorder;
+        unsigned long nbInThisBorderPL;
     } T_dynamicalRepartition;
 
     typedef struct _T_value_rtt {
@@ -92,6 +94,8 @@ public:
         E_CREATE_INCOMING_CALL,
         E_CALL_FAILED,
         E_CALL_SUCCESSFULLY_ENDED,
+        /* The call is over, neither successful nor failed. */
+        E_CALL_ENDED_UNCOUNTED,
         E_RESET_C_COUNTERS,
         E_RESET_PD_COUNTERS,
         E_RESET_PL_COUNTERS,
@@ -405,9 +409,9 @@ public:
      *
      * @param P_ms.
      *
-     * @return a pointer on a static string containing formatted time
+     * @return the formatted time
      */
-    static char* msToHHMMSS (unsigned long P_ms);
+    static std::string msToHHMMSS (unsigned long P_ms);
 
     /**
      * msToHHMMSSmm.
@@ -417,9 +421,9 @@ public:
      *
      * @param P_ms.
      *
-     * @return a pointer on a static string containing formatted time
+     * @return the formatted time
      */
-    static char* msToHHMMSSus (unsigned long P_ms);
+    static std::string msToHHMMSSus (unsigned long P_ms);
 
     /* Get a counter ID by name. */
     int findCounter(const char *counter, bool alloc);
@@ -466,7 +470,7 @@ private:
     std::ofstream*           M_outputStream;
 
     bool                     M_headerAlreadyDisplayedRtt ;
-    char*                    M_fileNameRtt               ;
+    std::string              M_fileNameRtt               ;
     std::ofstream*           M_outputStreamRtt           ;
     double                   M_time_ref                  ;
 
@@ -520,7 +524,7 @@ private:
 
     /**
      * resetRepartition
-     * Zeros out all repartition counters.
+     * Zeros out the periodic repartition counters.
      */
     void  resetRepartition(T_dynamicalRepartition* P_tabReport,
                            int P_sizeOfTab);
@@ -529,17 +533,15 @@ private:
      * sRepartitionHeader
      * return a string with the range description of the given repartition
      */
-    char* sRepartitionHeader(T_dynamicalRepartition * tabRepartition,
-                             int sizeOfTab,
-                             const char* P_repartitionName);
+    std::string sRepartitionHeader(T_dynamicalRepartition *tabRepartition, int sizeOfTab,
+                                   const char *P_repartitionName);
 
     /**
      * sRepartitionInfo
      * return a string with the number of value in the differente range of the
      * given repartition
      */
-    char* sRepartitionInfo(T_dynamicalRepartition * tabRepartition,
-                           int sizeOfTab);
+    std::string sRepartitionInfo(T_dynamicalRepartition *tabRepartition, int sizeOfTab);
 
     /**
      * UpdateAverageCounter

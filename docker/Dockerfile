@@ -2,7 +2,7 @@
 #   git submodule update --init
 #   docker build -t sipp -f docker/Dockerfile .
 
-FROM alpine:3.20 AS build
+FROM alpine:3.24 AS build
 
 ARG FULL=''
 ARG USE_IPSEC=''
@@ -15,21 +15,23 @@ RUN apk add --no-cache \
   git \
   gsl-dev \
   gsl-static \
+  gtest-dev \
   help2man \
   libpcap-dev \
+  linux-headers \
   make \
   ncurses-dev \
   ncurses-static \
   ninja \
   openssl-dev \
   openssl-libs-static \
-  ${FULL:+linux-headers lksctp-tools-dev lksctp-tools-static} \
-  ${USE_IPSEC:+linux-headers}
+  ${FULL:+lksctp-tools-dev lksctp-tools-static}
 
 WORKDIR /sipp
 COPY CMakeLists.txt ./
 COPY src src
 COPY include include
+COPY docs/*.xml docs/
 COPY gtest gtest
 COPY third_party third_party
 
@@ -51,7 +53,7 @@ RUN help2man --output=sipp.1 -v -v --no-info \
 FROM scratch AS bin
 COPY --from=build /sipp/sipp /sipp/sipp.1 /sipp/version.h /
 
-FROM alpine:3.20
+FROM alpine:3.24
 # iproute2 provides 'ip xfrm' for IPSec SA/SP management at runtime (USE_IPSEC=1 builds)
 RUN apk add --no-cache iproute2
 CMD ["sipp"]

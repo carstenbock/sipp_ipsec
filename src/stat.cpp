@@ -172,10 +172,6 @@ CStat::~CStat()
         M_outputStreamRtt->close();
         delete M_outputStreamRtt;
     }
-    if(M_fileNameRtt != nullptr)
-        delete [] M_fileNameRtt;
-
-
     if(M_dumpRespTime != nullptr)
         delete [] M_dumpRespTime;
 
@@ -190,7 +186,7 @@ CStat::~CStat()
     M_outputStream                  = nullptr;
 
     M_outputStreamRtt               = nullptr;
-    M_fileNameRtt                   = nullptr;
+    M_fileNameRtt.clear();
     M_dumpRespTime                  = nullptr;
 }
 
@@ -209,8 +205,6 @@ int CStat::init ()
     M_headerAlreadyDisplayedRtt = false;
 
     std::vector<int> error_codes(0);
-
-    getTimezoneOffset();
 
     return(1);
 }
@@ -304,39 +298,12 @@ int CStat::createIntegerTable(char * P_listeStr,
 
 void CStat::setFileName(const char* P_name, const char* P_extension)
 {
-    int sizeOf, sizeOfExtension;
-
     if(P_name != nullptr) {
-        // +6 for PID
-        sizeOf = strlen(P_name) + 6;
-        if(sizeOf > 0) {
-            if(P_extension != nullptr) {
-                sizeOfExtension = strlen(P_extension);
-                if(sizeOfExtension > 0) {
-                    if(M_fileName != nullptr)
-                        delete [] M_fileName;
-                    M_fileName = new char[MAX_PATH];
-                    sprintf(M_fileName, "%s_%ld_", P_name, (long) getpid());
-                    strcat(M_fileName, P_extension);
-                } else {
-                    if(M_fileName != nullptr)
-                        delete [] M_fileName;
-                    M_fileName = new char[MAX_PATH];
-                    sprintf(M_fileName, "%s_%ld_", P_name, (long) getpid());
-                    strcat(M_fileName, DEFAULT_EXTENSION);
-                }
-            } else {
-                if(M_fileName != nullptr)
-                    delete [] M_fileName;
-                M_fileName = new char[MAX_PATH];
-                sprintf(M_fileName, "%s_%ld_", P_name, (long) getpid());
-                strcat(M_fileName, DEFAULT_EXTENSION);
-            }
-        } else {
-            std::cerr << "new file name length is null - "
-                 << "keeping the default filename : "
-                 << DEFAULT_FILE_NAME << std::endl;
-        }
+        const char *extension = P_extension && *P_extension ? P_extension : DEFAULT_EXTENSION;
+        std::string name = std::string(P_name) + "_" + std::to_string(getpid()) + "_" + extension;
+        delete[] M_fileName;
+        M_fileName = new char[name.size() + 1];
+        memcpy(M_fileName, name.c_str(), name.size() + 1);
     } else {
         std::cerr << "new file name is NULL ! - keeping the default filename : "
              << DEFAULT_FILE_NAME << std::endl;
@@ -370,19 +337,10 @@ void CStat::setFileName(const char* P_name)
 void CStat::initRtt(const char* P_name, const char* P_extension,
                     unsigned long P_report_freq_dumpRtt)
 {
-    int sizeOf, sizeOfExtension;
-
     if(P_name != nullptr) {
-        sizeOf = strlen(P_name) ;
-        if(sizeOf > 0) {
-            //  4 for '_rtt' and 6 for pid
-            sizeOf += 10 ;
-            sizeOfExtension = strlen(P_extension);
-            if(M_fileNameRtt != nullptr)
-                delete [] M_fileNameRtt;
-            sizeOf += sizeOfExtension;
-            M_fileNameRtt = new char[sizeOf+1];
-            sprintf (M_fileNameRtt, "%s_%ld_rtt%s", P_name, (long) getpid(),P_extension);
+        if(*P_name) {
+            M_fileNameRtt = std::string(P_name) + "_" + std::to_string(getpid()) +
+                            "_rtt" + P_extension;
         } else {
             std::cerr << "new file name length is null - "
                  << "keeping the default filename : "
@@ -484,8 +442,9 @@ void CStat::initRepartition(unsigned int* repartition,
 
     // copying the repartition table in the local table
     for(i=0; i<nombre; i++) {
-        (*tabRepartition)[i].borderMax      = repartition[i];
-        (*tabRepartition)[i].nbInThisBorder = 0;
+        (*tabRepartition)[i].borderMax        = repartition[i];
+        (*tabRepartition)[i].nbInThisBorder   = 0;
+        (*tabRepartition)[i].nbInThisBorderPL = 0;
     }
 
     // sorting the repartition table
@@ -507,6 +466,7 @@ void CStat::initRepartition(unsigned int* repartition,
     (*tabRepartition)[nombre].borderMax =
         (*tabRepartition)[nombre-1].borderMax;
     (*tabRepartition)[nombre].nbInThisBorder = 0;
+    (*tabRepartition)[nombre].nbInThisBorderPL = 0;
 }
 
 void CStat::setRtpEchoErrors(int value)
@@ -571,6 +531,10 @@ int CStat::computeStat (E_Action P_action)
         M_counters [CPT_C_SuccessfulCall]++;
         M_counters [CPT_PD_SuccessfulCall]++;
         M_counters [CPT_PL_SuccessfulCall]++;
+        M_counters [CPT_C_CurrentCall]--;
+        break;
+
+    case E_CALL_ENDED_UNCOUNTED :
         M_counters [CPT_C_CurrentCall]--;
         break;
 
@@ -699,11 +663,9 @@ int CStat::computeStat (E_Action P_action)
         //       "C_Stat::computeStat : RESET_PL_COUNTERS");
         RESET_PL_COUNTERS;
         GET_TIME (&M_plStartTime);
-        if (periodic_rtd) {
-            resetRepartition(M_CallLengthRepartition, M_SizeOfCallLengthRepartition);
-            for (int i = 0; i < nRtds(); i++) {
-                resetRepartition(M_ResponseTimeRepartition[i], M_SizeOfResponseTimeRepartition);
-            }
+        resetRepartition(M_CallLengthRepartition, M_SizeOfCallLengthRepartition);
+        for (int i = 0; i < nRtds(); i++) {
+            resetRepartition(M_ResponseTimeRepartition[i], M_SizeOfResponseTimeRepartition);
         }
         break;
 
@@ -797,12 +759,13 @@ void CStat::getStartTime(struct timeval *t)
 
 
 /* Use the short form standard deviation formula given the sum of the squares
- * and the sum. */
+ * and the sum. With no sample or a single one it is 0, as the formula
+ * would divide by zero. */
 double CStat::computeStdev(E_CounterName P_SumCounter,
                            E_CounterName P_NbOfCallUsed,
                            E_CounterName P_Squares)
 {
-    if (M_counters[P_NbOfCallUsed] <= 0)
+    if (M_counters[P_NbOfCallUsed] <= 1)
         return 0.0;
 
     double numerator = ((double)(M_counters[P_NbOfCallUsed]) * (double)(M_counters[P_Squares])) - ((double)(M_counters[P_SumCounter] * M_counters[P_SumCounter]));
@@ -1039,6 +1002,7 @@ void CStat::updateRepartition(T_dynamicalRepartition* P_tabReport,
     for (int i = 0; i < P_sizeOfTab - 1; i++) {
         if (P_value < P_tabReport[i].borderMax) {
             P_tabReport[i].nbInThisBorder++;
+            P_tabReport[i].nbInThisBorderPL++;
             return;
         }
     }
@@ -1046,6 +1010,7 @@ void CStat::updateRepartition(T_dynamicalRepartition* P_tabReport,
     /* If this is not true, we never should have gotten here. */
     assert(P_value >= P_tabReport[P_sizeOfTab-1].borderMax);
     P_tabReport[P_sizeOfTab-1].nbInThisBorder ++;
+    P_tabReport[P_sizeOfTab-1].nbInThisBorderPL ++;
 }
 
 void CStat::resetRepartition(T_dynamicalRepartition* P_tabReport,
@@ -1056,7 +1021,7 @@ void CStat::resetRepartition(T_dynamicalRepartition* P_tabReport,
     }
 
     for (int i = 0; i < P_sizeOfTab; i++) {
-        P_tabReport[i].nbInThisBorder = 0;
+        P_tabReport[i].nbInThisBorderPL = 0;
     }
 }
 
@@ -1074,71 +1039,60 @@ CStat::CStat ()
     M_CallLengthRepartition   = nullptr;
     M_SizeOfResponseTimeRepartition = 0;
     M_SizeOfCallLengthRepartition   = 0;
-    M_fileNameRtt = nullptr;
     M_genericCounters = nullptr;
     M_time_ref = 0.0                   ;
     M_dumpRespTime = nullptr              ;
     M_counterDumpRespTime = 0          ;
+    M_report_freq_dumpRtt = 0;
     M_dumpRespTime = nullptr;
-    M_fileNameRtt  = nullptr;
     M_rtdInfo = nullptr;
     M_rtpEchoErrors = 0;
 
     init();
 }
 
-char* CStat::sRepartitionHeader(T_dynamicalRepartition * tabRepartition,
-                                int sizeOfTab,
-                                const char * P_repartitionName)
+std::string CStat::sRepartitionHeader(T_dynamicalRepartition *tabRepartition, int sizeOfTab,
+                                      const char *P_repartitionName)
 {
-    static char *repartitionHeader = nullptr;
     char buffer[MAX_CHAR_BUFFER_SIZE];
-    int dlen = strlen(stat_delimiter);
 
-    if(tabRepartition != nullptr) {
-        repartitionHeader = (char *)realloc(repartitionHeader, strlen(P_repartitionName) + dlen + 1);
-        sprintf(repartitionHeader, "%s%s", P_repartitionName, stat_delimiter);
-        for(int i=0; i<(sizeOfTab-1); i++) {
-            sprintf(buffer, "%s_<%d%s", P_repartitionName, tabRepartition[i].borderMax, stat_delimiter);
-            repartitionHeader = (char *)realloc(repartitionHeader, strlen(repartitionHeader) + strlen(buffer) + 1);
-            strcat(repartitionHeader, buffer);
-        }
-        sprintf(buffer, "%s_>=%d%s", P_repartitionName, tabRepartition[sizeOfTab-1].borderMax, stat_delimiter);
-        repartitionHeader = (char *)realloc(repartitionHeader, strlen(repartitionHeader) + strlen(buffer) + 1);
-        strcat(repartitionHeader, buffer);
-    } else {
-        repartitionHeader = (char *)realloc(repartitionHeader, 2);
-        strcpy(repartitionHeader, "");
+    if (!tabRepartition) {
+        return {};
     }
 
-    return(repartitionHeader);
+    std::string repartitionHeader = std::string(P_repartitionName) + stat_delimiter;
+    for (const char *kind : {"(P)", "(C)"}) {
+        for (int i = 0; i < (sizeOfTab - 1); i++) {
+            sprintf(buffer, "%s_<%d%s%s", P_repartitionName, tabRepartition[i].borderMax, kind, stat_delimiter);
+            repartitionHeader += buffer;
+        }
+        sprintf(buffer, "%s_>=%d%s%s", P_repartitionName, tabRepartition[sizeOfTab - 1].borderMax, kind,
+                stat_delimiter);
+        repartitionHeader += buffer;
+    }
+
+    return repartitionHeader;
 }
 
-char* CStat::sRepartitionInfo(T_dynamicalRepartition * tabRepartition,
-                              int sizeOfTab)
+std::string CStat::sRepartitionInfo(T_dynamicalRepartition *tabRepartition, int sizeOfTab)
 {
-    static char *repartitionInfo;
     char buffer[MAX_CHAR_BUFFER_SIZE];
-    int dlen = strlen(stat_delimiter);
 
-    if(tabRepartition != nullptr) {
-        // if a repartition is present, this field match the repartition name
-        repartitionInfo = (char *)realloc(repartitionInfo, dlen + 1);
-        sprintf(repartitionInfo, "%s", stat_delimiter);
-        for(int i=0; i<(sizeOfTab-1); i++) {
-            sprintf(buffer, "%lu%s", tabRepartition[i].nbInThisBorder, stat_delimiter);
-            repartitionInfo = (char *)realloc(repartitionInfo, strlen(repartitionInfo) + strlen(buffer) + 1);
-            strcat(repartitionInfo, buffer);
-        }
-        sprintf(buffer, "%lu%s", tabRepartition[sizeOfTab-1].nbInThisBorder, stat_delimiter);
-        repartitionInfo = (char *)realloc(repartitionInfo, strlen(repartitionInfo) + strlen(buffer) + 1);
-        strcat(repartitionInfo, buffer);
-    } else {
-        repartitionInfo = (char *)realloc(repartitionInfo, 2);
-        repartitionInfo[0] = '\0';
+    if (!tabRepartition) {
+        return {};
     }
 
-    return(repartitionInfo);
+    // if a repartition is present, this field match the repartition name
+    std::string repartitionInfo = stat_delimiter;
+    for (bool periodic : {true, false}) {
+        for (int i = 0; i < sizeOfTab; i++) {
+            sprintf(buffer, "%lu%s", periodic ? tabRepartition[i].nbInThisBorderPL : tabRepartition[i].nbInThisBorder,
+                    stat_delimiter);
+            repartitionInfo += buffer;
+        }
+    }
+
+    return repartitionInfo;
 }
 
 void CStat::dumpData ()
@@ -1430,6 +1384,10 @@ void CStat::dumpDataRtt ()
         M_headerAlreadyDisplayedRtt = true;
     }
 
+    /* Milliseconds with their microseconds: the default six significant
+     * digits would round the date, and write it with an exponent once the
+     * run is past 1000 s. */
+    (*M_outputStreamRtt) << std::fixed << std::setprecision(3);
     for (unsigned int L_i = 0; L_i < M_counterDumpRespTime ; L_i ++) {
         (*M_outputStreamRtt) <<  M_dumpRespTime[L_i].date   << stat_delimiter ;
         (*M_outputStreamRtt) <<  M_dumpRespTime[L_i].rtt    << stat_delimiter ;
@@ -1448,9 +1406,9 @@ void CStat::dumpDataRtt ()
 
 
 /* Time Gestion */
-char* CStat::msToHHMMSS (unsigned long P_ms)
+std::string CStat::msToHHMMSS (unsigned long P_ms)
 {
-    static char L_time [TIME_LENGTH];
+    char L_time [TIME_LENGTH];
     unsigned long hh, mm, ss;
 
     P_ms = P_ms / 1000;
@@ -1461,9 +1419,9 @@ char* CStat::msToHHMMSS (unsigned long P_ms)
     return (L_time);
 } /* end of msToHHMMSS */
 
-char* CStat::msToHHMMSSus (unsigned long P_ms)
+std::string CStat::msToHHMMSSus (unsigned long P_ms)
 {
-    static char L_time [TIME_LENGTH];
+    char L_time [TIME_LENGTH];
     unsigned long sec, hh, mm, ss, us;
 
     sec  = P_ms / 1000;
@@ -1488,6 +1446,7 @@ char* CStat::formatTime (struct timeval* P_tv, bool with_epoch)
         memset (L_time, 0, TIME_LENGTH);
     } else {
         if (with_epoch) {
+            getTimezoneOffset();
             sprintf(L_time, "%4.4d-%2.2d-%2.2dT%2.2d:%2.2d:%2.2d.%06ld%s",
                     L_currentDate->tm_year + 1900,
                     L_currentDate->tm_mon + 1,
@@ -1572,13 +1531,8 @@ double CDefaultPause::cdfInv(double /*percentile*/)
 }
 
 /* Implementation of a uniform distribution. */
-static bool uniform_init = false;
 CUniform::CUniform(double min, double max)
 {
-    if (!uniform_init) {
-        uniform_init = true;
-        srand(time(nullptr));
-    }
     this->min = min;
     this->max = max;
 }
@@ -1600,8 +1554,31 @@ int CUniform::timeDescr(char *s, int len)
 }
 double CUniform::cdfInv(double percentile)
 {
-    return min + (max * percentile);
+    return min + ((max - min) * percentile);
 }
+
+#ifdef GTEST
+#include "gtest/gtest.h"
+
+TEST(CUniform, cdf_inverse_spans_min_to_max) {
+    CUniform u(1000, 2000);
+    EXPECT_DOUBLE_EQ(u.cdfInv(0.0), 1000);
+    EXPECT_DOUBLE_EQ(u.cdfInv(0.5), 1500);
+    EXPECT_DOUBLE_EQ(u.cdfInv(0.99), 1990);
+}
+
+TEST(CStat, ms_to_hhmmss_twice_in_one_call) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s %s",
+             CStat::msToHHMMSSus(1).c_str(),
+             CStat::msToHHMMSSus(3723004).c_str());
+    EXPECT_STREQ(buf, "00:00:00:001000 01:02:03:004000");
+    snprintf(buf, sizeof(buf), "%s %s",
+             CStat::msToHHMMSS(1000).c_str(),
+             CStat::msToHHMMSS(3723004).c_str());
+    EXPECT_STREQ(buf, "00:00:01 01:02:03");
+}
+#endif
 
 #ifdef HAVE_GSL
 gsl_rng *gsl_init()
@@ -1616,6 +1593,10 @@ gsl_rng *gsl_init()
     rng = gsl_rng_alloc(gsl_rng_default);
     if (!rng) {
         ERROR("Could not initialize GSL random number generator");
+    }
+    // Seed it like rand(), from randomseed(), unless GSL_RNG_SEED is set.
+    if (!getenv("GSL_RNG_SEED")) {
+        gsl_rng_set(rng, rand());
     }
 
     return rng;
@@ -1881,5 +1862,63 @@ int CNegBin::timeDescr(char *s, int len)
 double CNegBin::cdfInv(double percentile)
 {
     return 0;
+}
+#endif
+
+#ifdef GTEST
+#include "gtest/gtest.h"
+
+TEST(CStat, rtt_file_keeps_microseconds) {
+    std::string name = testing::TempDir() + "sipp_stat";
+    CStat stat;
+    stat.initRtt(name.c_str(), ".csv", 1);
+    int rtd = stat.findRtd("1", false);
+    /* 1234.5 s into the run, a response 2.5 ms after its request. */
+    stat.computeRtt(1234567887623ULL, 1234567890123ULL, rtd);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s_%ld_rtt.csv", name.c_str(), (long)getpid());
+    std::ifstream f(path);
+    std::string header, row;
+    std::getline(f, header);
+    std::getline(f, row);
+    unlink(path);
+    EXPECT_EQ(header, "Date_ms;response_time_ms;rtd_no");
+    EXPECT_EQ(row, "1234567890.123;2.500;1");
+}
+
+static bool ends_with(const std::string &s, const std::string &suffix)
+{
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+TEST(CStat, repartition_has_periodic_and_cumulative_columns) {
+    std::string path = testing::TempDir() + "sipp_stat_repartition.csv";
+    CStat stat;
+    stat.setFileName(path.c_str());
+    unsigned int borders[] = {20, 10};
+    stat.setRepartitionCallLength(borders, 2);
+
+    stat.computeStat(CStat::E_ADD_CALL_DURATION, 5);
+    stat.computeStat(CStat::E_ADD_CALL_DURATION, 25);
+    stat.dumpData();
+    stat.computeStat(CStat::E_RESET_PL_COUNTERS);
+    stat.computeStat(CStat::E_ADD_CALL_DURATION, 15);
+    stat.dumpData();
+
+    std::ifstream f(path);
+    std::string header, row1, row2;
+    std::getline(f, header);
+    std::getline(f, row1);
+    std::getline(f, row2);
+    unlink(path.c_str());
+    EXPECT_TRUE(ends_with(header, ";CallLengthRepartition;"
+                          "CallLengthRepartition_<10(P);CallLengthRepartition_<20(P);"
+                          "CallLengthRepartition_>=20(P);"
+                          "CallLengthRepartition_<10(C);CallLengthRepartition_<20(C);"
+                          "CallLengthRepartition_>=20(C);")) << header;
+    EXPECT_TRUE(ends_with(row1, ";;1;0;1;1;0;1;")) << row1;
+    EXPECT_TRUE(ends_with(row2, ";;0;1;0;1;1;1;")) << row2;
 }
 #endif

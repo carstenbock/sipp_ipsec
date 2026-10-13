@@ -106,6 +106,22 @@ struct KeywordMap SimpleKeywords[] = {
     {"ueaescm128sha1802video" , E_Message_UEAesCm128Sha1802Video },
     {"ueaescm128sha1321video" , E_Message_UEAesCm128Sha1321Video },
     {"ueaescm128sha1322video" , E_Message_UEAesCm128Sha1322Video },
+    {"cryptosuiteaescm192sha1801audio", E_Message_CryptoSuiteAesCm192Sha1801Audio },
+    {"cryptosuiteaescm192sha1802audio", E_Message_CryptoSuiteAesCm192Sha1802Audio },
+    {"cryptosuiteaescm192sha1321audio", E_Message_CryptoSuiteAesCm192Sha1321Audio },
+    {"cryptosuiteaescm192sha1322audio", E_Message_CryptoSuiteAesCm192Sha1322Audio },
+    {"cryptosuiteaescm256sha1801audio", E_Message_CryptoSuiteAesCm256Sha1801Audio },
+    {"cryptosuiteaescm256sha1802audio", E_Message_CryptoSuiteAesCm256Sha1802Audio },
+    {"cryptosuiteaescm256sha1321audio", E_Message_CryptoSuiteAesCm256Sha1321Audio },
+    {"cryptosuiteaescm256sha1322audio", E_Message_CryptoSuiteAesCm256Sha1322Audio },
+    {"cryptosuiteaescm192sha1801video", E_Message_CryptoSuiteAesCm192Sha1801Video },
+    {"cryptosuiteaescm192sha1802video", E_Message_CryptoSuiteAesCm192Sha1802Video },
+    {"cryptosuiteaescm192sha1321video", E_Message_CryptoSuiteAesCm192Sha1321Video },
+    {"cryptosuiteaescm192sha1322video", E_Message_CryptoSuiteAesCm192Sha1322Video },
+    {"cryptosuiteaescm256sha1801video", E_Message_CryptoSuiteAesCm256Sha1801Video },
+    {"cryptosuiteaescm256sha1802video", E_Message_CryptoSuiteAesCm256Sha1802Video },
+    {"cryptosuiteaescm256sha1321video", E_Message_CryptoSuiteAesCm256Sha1321Video },
+    {"cryptosuiteaescm256sha1322video", E_Message_CryptoSuiteAesCm256Sha1322Video },
     {"media_port", E_Message_Media_Port },
     {"auto_media_port", E_Message_Auto_Media_Port },
     {"media_ip_type", E_Message_Media_IP_Type },
@@ -139,41 +155,73 @@ struct KeywordMap SimpleKeywords[] = {
 
 #define KEYWORD_SIZE 256
 
-static char* quoted_strchr(const char* s, int c)
+/* The '"' that ends the quoted string at s, or the end of its line, past
+ * the characters escaped with '\' as getQuotedParam() reads them. */
+static const char* closing_quote(const char* s)
 {
-    const char* p;
-
-    for (p = s; *p && *p != c; p++) {
-        if (*p == '"') {
-            p++;
-            p += strcspn(p, "\"\n");
-            if (!*p)
-                break;
-        }
-    }
-
-    return *p == c ? const_cast<char*>(p) : nullptr;
+    while (*(s += strcspn(s, "\\\"\n")) == '\\' && s[1])
+        s += 2;
+    return s;
 }
 
-SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bool skip_sanity)
+/* The ']' that closes the '[' before s, past quoted strings and the
+ * [keyword]s nested in it. */
+static char* closing_bracket(const char* s)
 {
-    char * src = strdup(const_src);
-    char * osrc = src;
-    char * literal;
-    int    literalLen;
-    char * dest;
+    const char* p = s;
+    int depth = 0;
+
+    while (*p) {
+        if (*p == '"') {
+            p = closing_quote(p + 1);
+            if (!*p)
+                break;
+        } else if (*p == '[') {
+            depth++;
+        } else if (*p == ']' && !depth--) {
+            return const_cast<char*>(p);
+        }
+        p++;
+    }
+
+    return nullptr;
+}
+
+/* The param that starts a word of the keyword s, not one in a quoted
+ * string or a nested [keyword]. */
+static char* find_param(char* s, const char* param)
+{
+    size_t len = strlen(param);
+    char* p = s;
+
+    while (*p) {
+        if (*p == '"') {
+            p = const_cast<char*>(closing_quote(p + 1));
+            if (!*p)
+                break;
+        } else if (*p == '[') {
+            if (!(p = closing_bracket(p + 1)))
+                break;
+        } else if ((p == s || isspace(p[-1])) && !strncmp(p, param, len)) {
+            return p;
+        }
+        p++;
+    }
+
+    return nullptr;
+}
+
+SendingMessage::SendingMessage(scenario *msg_scenario, const char *osrc, bool skip_sanity)
+{
+    const char *src = osrc;
+    std::string literal;
     char * key;
     char   current_line[MAX_HEADER_LEN];
-    char * line_mark = nullptr;
-    char * tsrc;
-    int    num_cr = get_cr_number(src);
+    const char *line_mark = nullptr;
 
     this->msg_scenario = msg_scenario;
 
-    dest = literal = (char *)malloc(strlen(src) + num_cr + 1);
-
     current_line[0] = '\0';
-    *dest = 0;
 
     while(*src) {
         if (current_line[0] == '\0') {
@@ -189,98 +237,53 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
 
         /* This hex encoding could be done in XML parsing, allowing us to skip
          * these conditionals and branches. */
-        if ((*src == '\\') && (*(src+1) == 'x')) {
-            /* Allows any hex coded char like '\x5B' ([) */
+        if ((*src == '\\') && (*(src+1) == 'x') && isxdigit(*(src+2))) {
+            /* Allows any hex coded char like '\x5B' ([): one or two hex
+             * digits; a "\x" without one stays as it is. */
             src += 2;
+            int val = get_decimal_from_hex(*src++);
             if (isxdigit(*src)) {
-                int val = get_decimal_from_hex(*src);
-                src++;
-                if (isxdigit(*src)) {
-                    val = (val << 4) + get_decimal_from_hex(*src);
-                }
-                *dest++ = val & 0xff;
+                val = (val << 4) + get_decimal_from_hex(*src++);
             }
-            src++;
+            literal += (char)(val & 0xff);
         } else if (*src == '\n') {
-            *dest++ = '\r';
-            *dest++ = *src++;
+            literal += '\r';
+            literal += *src++;
             current_line[0] = '\0';
         } else if (*src != '[') {
-            *dest++ = *src++;
+            literal += *src++;
         } else {
             /* We have found a keyword, store the literal that we have been generating. */
-            literalLen = dest - literal;
-            if (literalLen) {
-                *dest = '\0';
-                literal = (char *)realloc(literal, literalLen + 1);
-                if (!literal) {
-                    ERROR("Out of memory!");
-                }
-
-                MessageComponent *newcomp = (MessageComponent *)calloc(1, sizeof(MessageComponent));
-                if (!newcomp) {
-                    ERROR("Out of memory!");
-                }
-
+            if (!literal.empty()) {
+                MessageComponent *newcomp = new MessageComponent();
                 newcomp->type = E_Message_Literal;
-                newcomp->literal = literal;
-                newcomp->literalLen = literalLen; // length without the terminator
+                newcomp->literal = std::move(literal);
                 messageComponents.push_back(newcomp);
-            } else {
-                free(literal);
             }
-
-            dest = literal = (char *)malloc(strlen(src) + num_cr + 1);
-            *dest = '\0';
+            literal.clear();
 
             /* Now lets determine which keyword we have. */
-            MessageComponent *newcomp = (MessageComponent *)calloc(1, sizeof(MessageComponent));
-            if (!newcomp) {
-                ERROR("Out of memory!");
-            }
+            MessageComponent *newcomp = new MessageComponent();
 
             char keyword [KEYWORD_SIZE+1];
             src++;
 
-            tsrc = quoted_strchr(src, '[');
-            key = quoted_strchr(src, ']');
-
-            if ((tsrc) && (tsrc<key)) {
-                /*
-                 * Nested brackets detected. For keywords that accept
-                 * sub-keywords as parameters (authentication, tdmmap),
-                 * find the matching outer ']' by tracking depth so the
-                 * entire construct is parsed as one keyword.
-                 */
-                if (!strncmp(src, "authentication", strlen("authentication")) ||
-                    !strncmp(src, "tdmmap", strlen("tdmmap"))) {
-                    int depth = 1;
-                    const char *p = src;
-                    while (*p && depth > 0) {
-                        if (*p == '[') depth++;
-                        else if (*p == ']') depth--;
-                        if (depth > 0) p++;
-                    }
-                    if (depth == 0)
-                        key = (char *)p;
-                } else {
-                    memcpy(keyword, src-1,  tsrc - src + 1);
-                    src=tsrc+1;
-                    dest += sprintf(dest, "%s", keyword);
-                }
-            }
-
-            if((!key) || ((key - src) > KEYWORD_SIZE) || (!(key - src))) {
+            /* A literal '[' is written \x5B. */
+            key = closing_bracket(src);
+            if ((!key) || ((key - src) > KEYWORD_SIZE) || (!(key - src))) {
                 ERROR("Syntax error or invalid [keyword] in scenario while parsing '%s'", current_line);
             }
             memcpy(keyword, src,  key - src);
             keyword[key - src] = 0;
             src = key + 1;
-            // allow +/-n for numeric variables
+            // allow +/-n for numeric variables, in the name only: a
+            // parameter such as file="a-1.csv" keeps its '-'
             newcomp->offset = 0;
+            size_t name_len = strcspn(keyword, " ");
             if ((strncmp(keyword, "authentication", strlen("authentication")) &&
                     strncmp(keyword, "tdmmap", strlen("tdmmap"))) &&
-                    ((key = strchr(keyword,'+')) || (key = strchr(keyword,'-')))) {
+                    ((key = (char *)memchr(keyword, '+', name_len)) ||
+                     (key = (char *)memchr(keyword, '-', name_len)))) {
                 if (isdigit(*(key+1))) {
                     newcomp->offset = atoi(key);
                     *key = 0;
@@ -323,19 +326,19 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
                 newcomp->type = E_Message_Injection;
 
                 /* Parse out the interesting things like file and number. */
-                newcomp->comp_param.field_param.field = atoi(keyword + strlen("field"));
+                newcomp->field_param.field = atoi(keyword + strlen("field"));
 
                 char fileName[KEYWORD_SIZE];
                 getKeywordParam(keyword, "file=", fileName);
                 if (fileName[0] == '\0') {
-                    if (!default_file) {
+                    if (default_file.empty()) {
                         ERROR("No injection file was specified!");
                     }
-                    newcomp->comp_param.field_param.filename = strdup(default_file);
+                    newcomp->field_param.filename = default_file;
                 } else {
-                    newcomp->comp_param.field_param.filename = strdup(fileName);
+                    newcomp->field_param.filename = fileName;
                 }
-                if (inFiles.find(newcomp->comp_param.field_param.filename) == inFiles.end()) {
+                if (inFiles.find(newcomp->field_param.filename) == inFiles.end()) {
                     ERROR("Invalid injection file: %s", fileName);
                 }
 
@@ -343,7 +346,7 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
                 getKeywordParam(keyword, "line=", line);
                 if (line[0]) {
                     /* Turn this into a new message component. */
-                    newcomp->comp_param.field_param.line = new SendingMessage(msg_scenario, line, true);
+                    newcomp->field_param.line = new SendingMessage(msg_scenario, line, true);
                 }
             } else if(!strncmp(keyword, "file", strlen("file"))) {
                 newcomp->type = E_Message_File;
@@ -373,16 +376,21 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
                 }
                 getKeywordParam(keyword, "variable=", varName);
 
-                newcomp->literal = strdup(filltext);
-                newcomp->literalLen = strlen(newcomp->literal);
+                newcomp->literal = filltext;
                 if (!msg_scenario) {
                     ERROR("SendingMessage with variable usage outside of scenario!");
                 }
                 newcomp->varId = msg_scenario->get_var(varName, "Fill Variable");
             } else if(!strncmp(keyword, "last_", strlen("last_"))) {
                 newcomp->type = E_Message_Last_Header;
-                newcomp->literal = strdup(keyword + strlen("last_"));
-                newcomp->literalLen = strlen(newcomp->literal);
+                newcomp->literal = keyword + strlen("last_");
+                /* [last_From.value]: the value alone, without "From: " */
+                const size_t suffix = strlen(".value");
+                if (newcomp->literal.size() > suffix &&
+                    !newcomp->literal.compare(newcomp->literal.size() - suffix, suffix, ".value")) {
+                    newcomp->type = E_Message_Last_Header_Value;
+                    newcomp->literal.resize(newcomp->literal.size() - suffix);
+                }
             } else if(!strncmp(keyword, "authentication", strlen("authentication"))) {
                 parseAuthenticationKeyword(msg_scenario, newcomp, keyword);
             } else {
@@ -390,8 +398,7 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
                 auto gen = generic.find(keyword);
                 if (gen != generic.end()) {
                     newcomp->type = E_Message_Literal;
-                    newcomp->literal = strdup((*gen).second.c_str());
-                    newcomp->literalLen = strlen(newcomp->literal);
+                    newcomp->literal = (*gen).second;
                 } else {
                     ERROR("Unsupported keyword '%s' in xml scenario file",
                           keyword);
@@ -402,30 +409,14 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
         }
     }
     if (literal[0]) {
-        *dest++ = '\0';
-        literalLen = dest - literal;
-        literal = (char *)realloc(literal, literalLen);
-        if (!literal) {
-            ERROR("Out of memory!");
-        }
-
-        MessageComponent *newcomp = (MessageComponent *)calloc(1, sizeof(MessageComponent));
-        if (!newcomp) {
-            ERROR("Out of memory!");
-        }
-
+        MessageComponent *newcomp = new MessageComponent();
         newcomp->type = E_Message_Literal;
-        newcomp->literal = literal;
-        newcomp->literalLen = literalLen-1;
+        newcomp->literal = std::move(literal);
         messageComponents.push_back(newcomp);
-    } else {
-        free(literal);
     }
 
     if (skip_sanity) {
         cancel = response = ack = false;
-        method = nullptr;
-        free(osrc);
         return;
     }
 
@@ -436,19 +427,21 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
         ERROR("You can not use a keyword for the METHOD or to generate \"SIP/2.0\" to ensure proper [cseq] operation!\n%s\n", osrc);
     }
 
-    char *p = method = strdup(getComponent(0)->literal);
+    /* The first word, the method or "SIP/2.0", is cut at q */
+    std::string first = getComponent(0)->literal;
+    char *p = first.data();
     char *q;
     while (isspace(*p)) {
         p++;
     }
-    if (!(q = strchr(method, ' '))) {
+    if (!(q = strchr(first.data(), ' '))) {
         ERROR("You can not use a keyword for the METHOD or to generate \"SIP/2.0\" to ensure proper [cseq] operation!\n%s\n", osrc);
     }
     *q++ = '\0';
     while (isspace(*q)) {
         q++;
     }
-    if (!strcmp(method, "SIP/2.0")) {
+    if (!strcmp(first.c_str(), "SIP/2.0")) {
         char *endptr;
         code = strtol(q, &endptr, 10);
         if (*endptr && !isspace(*endptr)) {
@@ -460,21 +453,12 @@ SendingMessage::SendingMessage(scenario* msg_scenario, const char* const_src, bo
         response = true;
         ack = false;
         cancel = false;
-        free(method);
-        method = nullptr;
     } else {
-        if (p != method) {
-            memmove(method, p, strlen(p) + 1);
-        }
-        method = (char *)realloc(method, strlen(method) + 1);
-        if (!method) {
-            ERROR("Out of memory");
-        }
-        ack = (!strcmp(method, "ACK"));
-        cancel = (!strcmp(method, "CANCEL"));
+        method = p;
+        ack = *method == "ACK";
+        cancel = *method == "CANCEL";
         response = false;
     };
-    free(osrc);
 }
 
 SendingMessage::~SendingMessage()
@@ -482,7 +466,6 @@ SendingMessage::~SendingMessage()
     for (int i = 0; i < numComponents(); i++) {
         freeMessageComponent(messageComponents[i]);
     }
-    free(method);
 }
 
 bool SendingMessage::isAck()
@@ -497,9 +480,9 @@ bool SendingMessage::isResponse()
 {
     return response;
 }
-char *SendingMessage::getMethod()
+const char *SendingMessage::getMethod()
 {
-    return method;
+    return method ? method->c_str() : nullptr;
 }
 int SendingMessage::getCode()
 {
@@ -548,36 +531,32 @@ void SendingMessage::getHexStringParam(char * dest, char * src, int * len)
     }
 }
 
-void SendingMessage::getKeywordParam(char * src, const char * param, char * output)
+void SendingMessage::getKeywordParam(char * src, const char * param, char * output, bool decode_hex)
 {
     char *key, *tmp;
     int len;
 
     len = 0;
     key = nullptr;
-    if ((tmp = strstr(src, param))) {
+    if ((tmp = find_param(src, param))) {
         tmp += strlen(param);
         key = tmp;
-        if ((*key == '0') && (*(key+1) == 'x')) {
+        if (decode_hex && (*key == '0') && (*(key+1) == 'x')) {
             key += 2;
             getHexStringParam(output, key, &len);
         } else if (*key == '\"') {
             key++;
             getQuotedParam(output, key, &len);
         } else {
-            int depth = 0;
             while (*key) {
                 if (((key - src) > KEYWORD_SIZE) || (!(key - src))) {
                     ERROR("Syntax error parsing '%s' parameter", param);
-                }
-                if (*key == '[') {
-                    depth++;
-                } else if (*key == ']') {
-                    if (depth > 0)
-                        depth--;
-                    else
-                        break;
-                } else if (depth == 0 && (*key < 33 || *key > 126)) {
+                } else if (*key == '[') {
+                    /* Past a whole nested [keyword] */
+                    if (!(key = closing_bracket(key + 1))) {
+                        ERROR("Syntax error parsing '%s' parameter", param);
+                    }
+                } else if (*key == ']' || *key < 33 || *key > 126) {
                     break;
                 }
                 key++;
@@ -591,8 +570,8 @@ void SendingMessage::getKeywordParam(char * src, const char * param, char * outp
 }
 
 /*
- * Look up a -key generic value and hex-decode it if it starts with 0x.
- * Returns true if found.
+ * Look up a -key generic value, as its text: createAuthHeader() decodes
+ * the hex of an AKA key. Returns true if found.
  */
 static bool getGenericAkaParam(const char *name, char *output, int max_len)
 {
@@ -600,25 +579,8 @@ static bool getGenericAkaParam(const char *name, char *output, int max_len)
     if (gen == generic.end())
         return false;
 
-    const std::string &val = gen->second;
-    if (val.size() >= 2 && val[0] == '0' && (val[1] == 'x' || val[1] == 'X')) {
-        const char *hex = val.c_str() + 2;
-        int len = 0;
-        while (isxdigit(hex[0]) && len < max_len) {
-            int hi = isdigit(hex[0]) ? hex[0] - '0' : tolower(hex[0]) - 'a' + 10;
-            int lo = 0;
-            hex++;
-            if (isxdigit(hex[0])) {
-                lo = isdigit(hex[0]) ? hex[0] - '0' : tolower(hex[0]) - 'a' + 10;
-                hex++;
-            }
-            output[len++] = (char)((hi << 4) | lo);
-        }
-        output[len] = '\0';
-    } else {
-        strncpy(output, val.c_str(), max_len - 1);
-        output[max_len - 1] = '\0';
-    }
+    strncpy(output, gen->second.c_str(), max_len - 1);
+    output[max_len - 1] = '\0';
     return true;
 }
 
@@ -648,35 +610,41 @@ void SendingMessage::parseAuthenticationKeyword(scenario *msg_scenario, struct M
     dst->comp_param.auth_param.auth_user = new SendingMessage(msg_scenario, my_auth_user, true /* skip sanity */);
     dst->comp_param.auth_param.auth_pass = new SendingMessage(msg_scenario, my_auth_pass, true);
 
-    /* add aka_OP, aka_AMF, aka_K -- check inline params first, then -key fallback */
-    getKeywordParam(keyword, "aka_K=", my_aka);
+    /* add aka_OP, aka_OPc, aka_AMF, aka_K as text, "0x" included, for
+     * createAuthHeader() to decode: decoded here, their bytes would be
+     * parsed as a message, and a value from a keyword never decoded.
+     * A parameter the keyword lacks is the -key of that name. Without
+     * aka_K, the password is the key. */
+    getKeywordParam(keyword, "aka_K=", my_aka, false);
     if (my_aka[0] == 0)
-        getGenericAkaParam("aka_K", my_aka, KEYWORD_SIZE);
-    if (my_aka[0] == 0) {
-        memcpy(my_aka, my_auth_pass, 16);
-        my_aka[16] = 0;
+        getGenericAkaParam("aka_K", my_aka, sizeof(my_aka));
+    if (my_aka[0]==0) {
+        getKeywordParam(keyword, "password=", my_aka, false);
+    }
+    if (my_aka[0]==0) {
+        /* The same size, and terminated */
+        memcpy(my_aka, my_auth_pass, sizeof(my_aka));
     }
     dst->comp_param.auth_param.aka_K = new SendingMessage(msg_scenario, my_aka, true);
 
-    getKeywordParam(keyword, "aka_OP=", my_aka);
+    getKeywordParam(keyword, "aka_OP=", my_aka, false);
     if (my_aka[0] == 0)
-        getGenericAkaParam("aka_OP", my_aka, KEYWORD_SIZE);
+        getGenericAkaParam("aka_OP", my_aka, sizeof(my_aka));
     dst->comp_param.auth_param.aka_OP = new SendingMessage(msg_scenario, my_aka, true);
 
-    getKeywordParam(keyword, "aka_OPc=", my_aka);
+    getKeywordParam(keyword, "aka_OPc=", my_aka, false);
     if (my_aka[0] == 0)
-        getGenericAkaParam("aka_OPc", my_aka, KEYWORD_SIZE);
+        getGenericAkaParam("aka_OPc", my_aka, sizeof(my_aka));
     dst->comp_param.auth_param.aka_OPc = new SendingMessage(msg_scenario, my_aka, true);
 
-    getKeywordParam(keyword, "aka_AMF=", my_aka);
+    getKeywordParam(keyword, "aka_AMF=", my_aka, false);
     if (my_aka[0] == 0)
-        getGenericAkaParam("aka_AMF", my_aka, KEYWORD_SIZE);
+        getGenericAkaParam("aka_AMF", my_aka, sizeof(my_aka));
     dst->comp_param.auth_param.aka_AMF = new SendingMessage(msg_scenario, my_aka, true);
 }
 
 void SendingMessage::freeMessageComponent(struct MessageComponent *comp)
 {
-    free(comp->literal);
     if (comp->type == E_Message_Authentication) {
         if (comp->comp_param.auth_param.auth_user) {
             delete comp->comp_param.auth_param.auth_user;
@@ -697,9 +665,11 @@ void SendingMessage::freeMessageComponent(struct MessageComponent *comp)
             delete comp->comp_param.auth_param.aka_OPc;
         }
     } else if (comp->type == E_Message_Injection) {
-        free(comp->comp_param.field_param.filename);
+        delete comp->field_param.line;
+    } else if (comp->type == E_Message_File) {
+        delete comp->comp_param.filename;
     }
-    free(comp);
+    delete comp;
 }
 
 int SendingMessage::numComponents()
@@ -719,3 +689,86 @@ int registerKeyword(char *keyword, customKeyword fxn)
     keyword_map[keyword] = fxn;
     return 0;
 }
+
+#ifdef GTEST
+#include "gtest/gtest.h"
+
+TEST(SendingMessage, UnclosedKeyword) {
+    /* Not "A1[b c", nor a keyword buffer overflow for a long text
+     * before the next '['. */
+    EXPECT_DEATH(SendingMessage(nullptr, "A[b [call_number] c", true),
+                 "Syntax error or invalid \\[keyword\\]");
+    EXPECT_DEATH(SendingMessage(nullptr, ("A[" + std::string(300, 'x') + "[call_number]").c_str(), true),
+                 "Syntax error or invalid \\[keyword\\]");
+    EXPECT_DEATH(SendingMessage(nullptr, "A[call_number", true),
+                 "Syntax error or invalid \\[keyword\\]");
+}
+
+TEST(SendingMessage, EscapedBracket) {
+    SendingMessage m(nullptr, "A\\x5Bb [call_number] c]Z", true);
+    ASSERT_EQ(3, m.numComponents());
+    EXPECT_STREQ("A[b ", m.getComponent(0)->literal.c_str());
+    EXPECT_EQ(E_Message_Call_Number, m.getComponent(1)->type);
+    EXPECT_STREQ(" c]Z", m.getComponent(2)->literal.c_str());
+}
+
+TEST(SendingMessage, HexEscape) {
+    /* One or two hex digits; nothing after them is eaten, and a "\x"
+     * without a hex digit stays as it is. */
+    SendingMessage m(nullptr, "A\\x5\nB\\xgC\\x41\\x4g1\\x", true);
+    ASSERT_EQ(1, m.numComponents());
+    EXPECT_STREQ("A\x05\r\nB\\xgCA\x04"
+                 "g1\\x",
+                 m.getComponent(0)->literal.c_str());
+}
+
+TEST(SendingMessage, NestedKeyword) {
+    SendingMessage m(nullptr, "A[authentication username=[call_number] password=\"[call_id]\" aka_K=[call_number]]Z", true);
+    ASSERT_EQ(3, m.numComponents());
+    EXPECT_STREQ("A", m.getComponent(0)->literal.c_str());
+    EXPECT_STREQ("Z", m.getComponent(2)->literal.c_str());
+    MessageComponent *auth = m.getComponent(1);
+    ASSERT_EQ(E_Message_Authentication, auth->type);
+    SendingMessage *user = auth->comp_param.auth_param.auth_user;
+    ASSERT_EQ(1, user->numComponents());
+    EXPECT_EQ(E_Message_Call_Number, user->getComponent(0)->type);
+    SendingMessage *pass = auth->comp_param.auth_param.auth_pass;
+    ASSERT_EQ(1, pass->numComponents());
+    EXPECT_EQ(E_Message_Call_ID, pass->getComponent(0)->type);
+    SendingMessage *k = auth->comp_param.auth_param.aka_K;
+    ASSERT_EQ(1, k->numComponents());
+    EXPECT_EQ(E_Message_Call_Number, k->getComponent(0)->type);
+    EXPECT_EQ(0, auth->comp_param.auth_param.aka_OP->numComponents());
+
+    /* A ']' quoted in the nested keyword does not close it, even after
+     * an escaped '"' */
+    SendingMessage q(nullptr, "[authentication username=[file name=\"x\\\"]y\"] password=p]", true);
+    ASSERT_EQ(1, q.numComponents());
+    user = q.getComponent(0)->comp_param.auth_param.auth_user;
+    ASSERT_EQ(1, user->numComponents());
+    ASSERT_EQ(E_Message_File, user->getComponent(0)->type);
+    SendingMessage *name = user->getComponent(0)->comp_param.filename;
+    ASSERT_EQ(1, name->numComponents());
+    EXPECT_STREQ("x\"]y", name->getComponent(0)->literal.c_str());
+    pass = q.getComponent(0)->comp_param.auth_param.auth_pass;
+    ASSERT_EQ(1, pass->numComponents());
+    EXPECT_STREQ("p", pass->getComponent(0)->literal.c_str());
+
+    /* A parameter is not found in a quoted or nested value of another */
+    SendingMessage s(nullptr, "[authentication username=[file name=\"password=x\"] password=[call_id]]", true);
+    pass = s.getComponent(0)->comp_param.auth_param.auth_pass;
+    ASSERT_EQ(1, pass->numComponents());
+    EXPECT_EQ(E_Message_Call_ID, pass->getComponent(0)->type);
+    SendingMessage t(nullptr, "[authentication username=\"password=x\" password=[call_id]]", true);
+    user = t.getComponent(0)->comp_param.auth_param.auth_user;
+    ASSERT_EQ(1, user->numComponents());
+    EXPECT_STREQ("password=x", user->getComponent(0)->literal.c_str());
+    pass = t.getComponent(0)->comp_param.auth_param.auth_pass;
+    ASSERT_EQ(1, pass->numComponents());
+    EXPECT_EQ(E_Message_Call_ID, pass->getComponent(0)->type);
+
+    EXPECT_DEATH(SendingMessage(nullptr, "A[b [call_number] c]Z", true),
+                 "Unsupported keyword 'b \\[call_number\\] c'");
+}
+
+#endif //GTEST

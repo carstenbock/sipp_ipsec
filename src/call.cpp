@@ -39,18 +39,24 @@
  */
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <assert.h>
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <string>
 
 #ifdef PCAPPLAY
 #include "send_packets.h"
@@ -60,6 +66,7 @@
 #include "auth.hpp"
 #include "urlcoder.hpp"
 #include "deadcall.hpp"
+#include "luascript.hpp"
 #include "config.h"
 #include "version.h"
 #ifdef USE_IPSEC
@@ -88,17 +95,18 @@ std::vector<std::string> split(const std::string &s, char delim) {
     return elems;
 }
 
-std::string join(const std::vector<std::string> &s, const char* delim) {
+std::string join(const std::vector<std::string> &s, std::string_view delim) {
     std::ostringstream imploded;
-    std::copy(s.begin(), s.end(), std::ostream_iterator<std::string>(imploded, delim));
-    std::string ret = imploded.str();
-    if (ret.length()) {
-        ret.resize(ret.length() - strlen(delim));
+    for (auto it = s.begin(); it != s.end(); ++it) {
+        if (it != s.begin()) {
+            imploded << delim;
+        }
+        imploded << *it;
     }
-    return ret;
+    return imploded.str();
 }
 
-std::string trim(const std::string &s) {
+std::string_view trim(std::string_view s) {
     size_t first = s.find_first_not_of(' ');
     if (first == std::string::npos) {
         return s;
@@ -111,19 +119,212 @@ std::string trim(const std::string &s) {
 
 extern  std::map<std::string, SIPpSocket *>     map_perip_fd;
 
-#ifdef PCAPPLAY
-/* send_packets pthread wrapper */
-void *send_wrapper(void *);
-#endif
+/* The <exec verify> commands running, by pid: the call that waits for
+ * each, nullptr once that call is gone, and the command for the logs */
+struct verify_command {
+    call *waiting;
+    std::string command;
+};
+static std::map<pid_t, verify_command> verify_commands;
+
 int call::dynamicId       = 0;
 int call::maxDynamicId    = 10000+2000*4;      // FIXME both param to be in command line !!!!
 int call::startDynamicId  = 10000;             // FIXME both param to be in command line !!!!
 int call::stepDynamicId   = 4;                // FIXME both param to be in command line !!!!
 
+/* What peekCold() reads in a call that has no cold state */
+const call::call_cold call::no_cold_state;
+
 /************** Call map and management routines **************/
 static const int SM_UNUSED = -1;
 
 static unsigned int next_number = 1;
+
+/* The calls whose scenario has a <recv request> of a dialog that may be
+ * new, in the order they came */
+static std::list<call *> new_dialog_calls;
+
+/* out += std::to_string(n), without the temporary string */
+template <typename T> static void append_number(std::string &out, T n)
+{
+    static_assert(std::is_integral_v<T>);
+    char buf[24];
+    out.append(buf, std::to_chars(buf, buf + sizeof(buf), n).ptr - buf);
+}
+
+class CallIdBuilder {
+public:
+    explicit CallIdBuilder(unsigned int call_number)
+        : call_number(call_number)
+    {
+    }
+
+    void build(char *call_id)
+    {
+        switch (call_id_mode) {
+        case CID_MODE_UUID:
+            build_uuid(false);
+            break;
+        case CID_MODE_UUID_COMPACT:
+            build_uuid(true);
+            break;
+        case CID_MODE_RANDOM:
+            build_random();
+            break;
+        case CID_MODE_TIMESTAMP:
+            build_timestamp();
+            break;
+        case CID_MODE_FORMAT:
+        default:
+            build_format();
+            break;
+        }
+
+        copy_to(call_id);
+    }
+
+private:
+    void build_format()
+    {
+        const char *src = call_id_string;
+
+        while (*src) {
+            if (*src != '%') {
+                output += *src++;
+                continue;
+            }
+
+            ++src;
+            if (*src == '\0') {
+                output += '%';
+                break;
+            }
+
+            switch (*src) {
+            case 'u':
+                append_number(output, call_number);
+                break;
+            case 'p':
+                append_number(output, pid);
+                break;
+            case 's':
+                output += local_ip;
+                break;
+            case 'r':
+                append_number(output, rand());
+                break;
+            case '%':
+                output += '%';
+                break;
+            default:
+                /* Not a conversion: keep it as it is. */
+                output += '%';
+                output += *src;
+                break;
+            }
+            ++src;
+        }
+    }
+
+    void build_uuid(bool compact)
+    {
+        unsigned char bytes[16];
+
+        fill_bytes(bytes, sizeof(bytes));
+        bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0f) | 0x40);
+        bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3f) | 0x80);
+
+        append_hex_bytes(bytes, 4);
+        if (!compact) {
+            output += '-';
+        }
+        append_hex_bytes(bytes + 4, 2);
+        if (!compact) {
+            output += '-';
+        }
+        append_hex_bytes(bytes + 6, 2);
+        if (!compact) {
+            output += '-';
+        }
+        append_hex_bytes(bytes + 8, 2);
+        if (!compact) {
+            output += '-';
+        }
+        append_hex_bytes(bytes + 10, 6);
+        output += '@';
+        output += local_ip;
+    }
+
+    void build_random()
+    {
+        unsigned char bytes[16];
+
+        fill_bytes(bytes, sizeof(bytes));
+        append_number(output, call_number);
+        output += '-';
+        append_hex_bytes(bytes, sizeof(bytes));
+        output += '@';
+        output += local_ip;
+    }
+
+    void build_timestamp()
+    {
+        append_number(output, timestamp_micros());
+        output += '-';
+        append_number(output, call_number);
+        output += '-';
+        append_number(output, pid);
+        output += '@';
+        output += local_ip;
+    }
+
+    void fill_bytes(unsigned char *bytes, size_t size) const
+    {
+        uint64_t seed = timestamp_micros();
+
+        seed ^= static_cast<uint64_t>(call_number) << 32;
+        seed ^= static_cast<uint64_t>(pid) << 8;
+
+        for (size_t i = 0; i < size; ++i) {
+            seed ^= static_cast<uint64_t>(rand()) << ((i % 4) * 8);
+            seed = seed * 2862933555777941757ULL + 3037000493ULL + i;
+            bytes[i] = static_cast<unsigned char>((seed >> ((i % 8) * 8)) & 0xff);
+        }
+    }
+
+    void append_hex_bytes(const unsigned char *bytes, size_t size)
+    {
+        static const char hex[] = "0123456789abcdef";
+
+        for (size_t i = 0; i < size; ++i) {
+            output += hex[bytes[i] >> 4];
+            output += hex[bytes[i] & 0x0f];
+        }
+    }
+
+    static uint64_t timestamp_micros()
+    {
+        using clock = std::chrono::system_clock;
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                clock::now().time_since_epoch()).count());
+    }
+
+    void copy_to(char *call_id) const
+    {
+        size_t length = std::min(output.size(), static_cast<size_t>(MAX_HEADER_LEN - 1));
+        memcpy(call_id, output.data(), length);
+        call_id[length] = '\0';
+    }
+
+    unsigned int call_number;
+    std::string output;
+};
+
+static void build_call_id(char *call_id, unsigned int call_number)
+{
+    CallIdBuilder(call_number).build(call_id);
+}
 
 static unsigned int get_tdm_map_number()
 {
@@ -137,8 +338,8 @@ static unsigned int get_tdm_map_number()
     interval = (tdm_map_a+1) * (tdm_map_b+1) * (tdm_map_c+1);
     random = rand() % interval;
     while ((i<interval) && (!found)) {
-        if (tdm_map[(random + i - 1) % interval] == false) {
-            nb = (random + i - 1) % interval;
+        if (tdm_map[(random + i) % interval] == false) {
+            nb = (random + i) % interval;
             found = true;
         }
         i++;
@@ -182,55 +383,149 @@ unsigned int call::wake()
         wake = s8_wake;
     }
 #endif
+    if (rtpstream_wait_check && (!wake || (rtpstream_wait_check < wake))) {
+        wake = rtpstream_wait_check;
+    }
 
     return wake;
 }
 
-static std::string find_in_sdp(std::string const &pattern, std::string const &msg)
+/* Is the media type of a Content-Type application/sdp? Its case does not
+ * matter, nor its blanks, and parameters (";charset=utf-8") may follow. */
+static bool is_sdp_content_type(std::string_view ct)
 {
-    std::string::size_type begin, end;
+    const char *sdp = "application/sdp";
+
+    for (const char c : ct) {
+        if (c == ';') {
+            break;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            continue;
+        }
+        if (!*sdp || tolower((unsigned char)c) != *sdp) {
+            return false;
+        }
+        sdp++;
+    }
+    return !*sdp;
+}
+
+static std::string find_in_sdp(std::string_view pattern, std::string_view msg)
+{
+    std::string_view::size_type begin, end;
 
     begin = msg.find(pattern);
-    if (begin == std::string::npos) {
+    if (begin == std::string_view::npos) {
         return "";
     }
 
     begin += pattern.size();
-    end = msg.find_first_of(" \r\n", begin);
-    if (end == std::string::npos || begin == end) {
+    /* A port count ("m=audio 30000/2") or a TTL ("c=IN IP4 224.2.1.1/127")
+     * follows a slash. */
+    end = msg.find_first_of(" /\r\n", begin);
+    if (end == std::string_view::npos || begin == end) {
         return "";
     }
 
-    return msg.substr(begin, end - begin);
+    return std::string(msg.substr(begin, end - begin));
+}
+
+/* The address of the c= line of a part of an SDP, "" if it has none; ipv6
+ * tells whether it is an IPv6 one. */
+static std::string sdp_connection(std::string_view part, bool &ipv6)
+{
+    std::string host = find_in_sdp("c=IN IP4 ", part);
+    ipv6 = host.empty();
+    if (ipv6) {
+        host = find_in_sdp("c=IN IP6 ", part);
+    }
+    return host;
+}
+
+/* The media section of an SDP from its m= line at pos to the next one */
+static std::string_view sdp_media_section(std::string_view sdp, size_t pos)
+{
+    const size_t end = sdp.find("\nm=", pos + 1);
+    return sdp.substr(pos, end == std::string_view::npos ? end : end - pos);
+}
+
+/* The connection address of a media section of an SDP: that of its own c=
+ * line, else that of the session part before the first m= line (RFC 4566
+ * 5.7). */
+static std::string sdp_media_connection(std::string_view sdp, std::string_view section, bool &ipv6)
+{
+    std::string host = sdp_connection(section, ipv6);
+    if (host.empty()) {
+        host = sdp_connection(sdp.substr(0, sdp.find("\nm=")), ipv6);
+    }
+    return host;
 }
 
 #ifdef PCAPPLAY
+/* A stream's own, made on its first use: most calls have only audio */
+play_args_t& call::playArgs(rtpstream_pcap_t stream)
+{
+    std::unique_ptr<play_args_t>& args = pcap_play_args[stream];
+    if (!args) {
+        args.reset(new play_args_t());
+        if (stream == RTPSTREAM_PCAP_AUDIO) {
+            args->last_seq_no = 1200;
+        } else if (stream == RTPSTREAM_PCAP_VIDEO) {
+            args->last_seq_no = 2400;
+        }
+    }
+    return *args;
+}
+
 void call::get_remote_media_addr(std::string const &msg)
 {
-    std::string host = find_in_sdp(media_ip_is_ipv6 ? "c=IN IP6 " : "c=IN IP4 ", msg);
-    if (host.empty()) {
+    if (find_in_sdp(media_ip_is_ipv6 ? "c=IN IP6 " : "c=IN IP4 ", msg).empty()) {
         return;
     }
 
     hasMediaInformation = 1;
+    /* where pcap plays go: none to keep without them */
+    if (!pcap_plays) {
+        return;
+    }
     const int family = media_ip_is_ipv6 ? AF_INET6 : AF_INET;
 
-    std::string port = find_in_sdp("m=audio ", msg);
-    if (!port.empty()) {
-        gai_getsockaddr(&play_args_a.to, host.c_str(), port.c_str(),
+    static const struct {
+        const char* prefix;
+        rtpstream_pcap_t stream;
+    } media[] = {
+        {"\nm=audio ", RTPSTREAM_PCAP_AUDIO},
+        {"\nm=image ", RTPSTREAM_PCAP_IMAGE},
+        {"\nm=video ", RTPSTREAM_PCAP_VIDEO},
+        {"\nm=text ", RTPSTREAM_PCAP_TEXT},
+    };
+    for (const auto& m : media) {
+        /* If the first m-line of the kind has port ZERO (a stream
+         * refused, RFC 3264 6), use the second one, as rtp_stream does. */
+        std::string port;
+        std::string_view section;
+        size_t pos = msg.find(m.prefix);
+        for (int i = 0; i < 2 && pos != std::string::npos; i++) {
+            section = sdp_media_section(msg, pos);
+            port = find_in_sdp(m.prefix + 1, section);
+            if (port != "0") {
+                break;
+            }
+            pos = msg.find(m.prefix, pos + 1);
+        }
+        if (port.empty() || port == "0") {
+            continue;
+        }
+        bool ipv6;
+        const std::string host = sdp_media_connection(msg, section, ipv6);
+        /* none to play to on an address of the other IP version */
+        if (host.empty() || ipv6 != media_ip_is_ipv6) {
+            continue;
+        }
+        gai_getsockaddr(&playArgs(m.stream).to, host.c_str(), port.c_str(),
                         AI_NUMERICHOST | AI_NUMERICSERV, family);
-    }
-
-    port = find_in_sdp("m=image ", msg);
-    if (!port.empty()) {
-        gai_getsockaddr(&play_args_i.to, host.c_str(), port.c_str(),
-                        AI_NUMERICHOST | AI_NUMERICSERV, family);
-    }
-
-    port = find_in_sdp("m=video ", msg);
-    if (!port.empty()) {
-        gai_getsockaddr(&play_args_v.to, host.c_str(), port.c_str(),
-                        AI_NUMERICHOST | AI_NUMERICSERV, family);
+        rtpstream_update_pcap(&rtpstream_callinfo, m.stream, &playArgs(m.stream));
     }
 }
 #endif
@@ -239,187 +534,268 @@ void call::get_remote_media_addr(std::string const &msg)
 /***** Similar to the routines used by the PCAP play code *****/
 
 #define SDP_AUDIOPORT_PREFIX "\nm=audio"
-#define SDP_IMAGEPORT_PREFIX "\nm=image"
 #define SDP_VIDEOPORT_PREFIX "\nm=video"
-std::string call::extract_rtp_remote_addr(const char* msg, int &ip_ver, int &audio_port, int &video_port)
+
+/* Port of the first media line with the given prefix at or after pos, or 0,
+ * and its media section. Leaves pos after that port, so that the next call
+ * finds the next line. */
+static int sdp_media_port(std::string_view sdp, std::string_view prefix, size_t &pos,
+                          std::string_view &section)
 {
-    const char* search;
-    int image_port = 0;
-    std::size_t pos1 = 0;
-    std::size_t pos2 = 0;
-    std::string msgstr;
-    std::string sub;
-    std::string host;
+    pos = sdp.find(prefix, pos);
+    if (pos == std::string_view::npos) {
+        return 0;
+    }
+    section = sdp_media_section(sdp, pos);
+    pos += prefix.size() + 1; /* skip the prefix and the whitespace after it */
+    const size_t end = sdp.find(' ', pos);
+    int port = 0;
+    if (end != std::string_view::npos) {
+        std::from_chars(sdp.data() + pos, sdp.data() + end, port);
+    }
+    pos = end;
+    return port;
+}
 
-    if (msg) {
-        msgstr = msg;
+/* The connection address and the port of the media of a kind, "" and 0 if
+ * there is none. If the first m-line of the kind has port ZERO, use the
+ * second one. */
+static std::string sdp_media_remote(std::string_view sdp, std::string_view prefix, int &port)
+{
+    size_t pos = 0;
+    std::string_view section;
+    port = sdp_media_port(sdp, prefix, pos, section);
+    if (port == 0) {
+        port = sdp_media_port(sdp, prefix, pos, section);
+    }
+    if (port == 0) {
+        return "";
     }
 
-    /* Look for start of message body */
-    search = strstr(msg, "\r\n\r\n");
-    if (!search) {
-        ERROR("extract_rtp_remote_addr: SDP message body not found");
-    }
-    msg = search + 2; /* skip past header. point to blank line before body */
-
-    /* Now search for IP address field */
-    host = find_in_sdp("c=IN IP4 ", msg);
+    bool ipv6;
+    std::string host = sdp_media_connection(sdp, section, ipv6);
     if (host.empty()) {
-        host = find_in_sdp("c=IN IP6 ", msg);
-        if (host.empty()) {
-            ERROR("extract_rtp_remote_addr: invalid IP version in SDP message body");
-        }
-        ip_ver = 6;
-    } else {
-        ip_ver = 4;
+        ERROR("extract_rtp_remote_addr: no c= line for %s in SDP message body", prefix.data() + 1);
     }
-
-    /* Find the port number for the image stream */
-    pos1 = msgstr.find(SDP_IMAGEPORT_PREFIX, 0, 8);
-    if (pos1 != std::string::npos)
-    {
-        pos1 += 8; /* skip SDP_IMAGEPORT_PREFIX */
-        pos1 += 1; /* skip first whitespace */
-        pos2 = msgstr.find(" ", pos1); /* find second whitespace AFTER port */
-        if (pos2 != std::string::npos)
-        {
-            sub = msgstr.substr(pos1, pos2-pos1); /* extract port substring */
-            sscanf(sub.c_str(), "%d", &image_port); /* parse port substring as integer */
-        }
-    }
-
-    /* Now try to find the port number for the audio stream */
-    pos1 = msgstr.find(SDP_AUDIOPORT_PREFIX, 0, 8);
-    if (pos1 != std::string::npos)
-    {
-        pos1 += 8; /* skip SDP_AUDIOPORT_PREFIX */
-        pos1 += 1; /* skip first whitespace */
-        pos2 = msgstr.find(" ", pos1); /* find second whitespace AFTER port */
-        if (pos2 != std::string::npos)
-        {
-            sub = msgstr.substr(pos1, pos2-pos1); /* extract port substring */
-            sscanf(sub.c_str(), "%d", &audio_port); /* parse port substring as integer */
-        }
-    }
-
-    /* first audio m-line had port of ZERO -- look for second audio m-line */
-    if (audio_port == 0)
-    {
-        pos1 = msgstr.find(SDP_AUDIOPORT_PREFIX, pos2, 8);
-        if (pos1 != std::string::npos)
-        {
-            pos1 += 8; /* skip SDP_AUDIOPORT_PREFIX  */
-            pos1 += 1; /* skip first whitespace */
-            pos2 = msgstr.find(" ", pos1); /* find second whitespace AFTER port */
-            if (pos2 != std::string::npos)
-            {
-                sub = msgstr.substr(pos1, pos2-pos1); /* extract port substring */
-                sscanf(sub.c_str(), "%d", &audio_port);
-            }
-        }
-    }
-
-    /* And find the port number for the video stream */
-    pos1 = msgstr.find(SDP_VIDEOPORT_PREFIX, 0, 8);
-    if (pos1 != std::string::npos)
-    {
-        pos1 += 8; /* skip SDP_VIDEOPORT_PREFIX */
-        pos1 += 1; /* skip first whitespace */
-        pos2 = msgstr.find(" ", pos1); /* find second whitespace AFTER port */
-        if (pos2 != std::string::npos)
-        {
-            sub = msgstr.substr(pos1, pos2-pos1); /* extract port substring */
-           sscanf(sub.c_str(), "%d", &video_port); /* parse port substring as integer */
-        }
-    }
-
-    /* first video m-line had port of ZERO -- look for second video m-line */
-    if (video_port == 0)
-    {
-        pos1 = msgstr.find(SDP_VIDEOPORT_PREFIX, pos2, 8);
-        if (pos1 != std::string::npos)
-        {
-            pos1 += 8; /* skip SDP_VIDEOPORT_PREFIX  */
-            pos1 += 1; /* skip first whitespace */
-            pos2 = msgstr.find(" ", pos1); /* find second whitespace AFTER port */
-            if (pos2 != std::string::npos)
-            {
-                sub = msgstr.substr(pos1, pos2-pos1); /* extract port substring */
-                sscanf(sub.c_str(), "%d", &video_port);
-            }
-        }
-    }
-
     return host;
 }
 
-int call::check_audio_ciphersuite_match(SrtpInfoParams &pA)
+void call::extract_rtp_remote_addr(const char* msg, std::string &audio_host, int &audio_port,
+                                   std::string &video_host, int &video_port)
 {
-    int audio_cs_len = 0;
-    int audio_ciphersuite_match = 0;
-
-    logSrtpInfo("call::check_audio_ciphersuite_match():  Preferred AUDIO cryptosuite: [%s]\n", _pref_audio_cs_out);
-
-    if (pA.found)
-    {
-        audio_cs_len = strlen(_pref_audio_cs_out);
-        if (!strncmp(_pref_audio_cs_out, "AES_CM_128_HMAC_SHA1_80", audio_cs_len) ||
-            !strncmp(_pref_audio_cs_out, "AES_CM_128_HMAC_SHA1_32", audio_cs_len) ||
-            !strncmp(_pref_audio_cs_out, "NULL_HMAC_SHA1_80", audio_cs_len) ||
-            !strncmp(_pref_audio_cs_out, "NULL_HMAC_SHA1_32", audio_cs_len))
-        {
-            if (!strncmp(pA.primary_cryptosuite, _pref_audio_cs_out, audio_cs_len))
-            {
-                // PRIMARY AUDIO cryptosuite matches preferred AUDIO cryptosuite
-                logSrtpInfo("call::check_audio_ciphersuite_match():  PRIMARY AUDIO cryptosuite matches preferred AUDIO cryptosuite...\n");
-                audio_ciphersuite_match = 1;
-            }
-            else
-            {
-                // PRIMARY AUDIO cryptosuite does NOT match preferred AUDIO cryptosuite
-                logSrtpInfo("call::check_audio_ciphersuite_match():  PRIMARY AUDIO cryptosuite [%s] does NOT match preferred AUDIO cryptosuite [%s]...\n", pA.primary_cryptosuite, _pref_audio_cs_out);
-                audio_ciphersuite_match = 0;
-            }
-        }
+    /* Look for start of message body */
+    const char *search = strstr(msg, "\r\n\r\n");
+    if (!search) {
+        ERROR("extract_rtp_remote_addr: SDP message body not found");
     }
+    /* Point to the blank line before the body, so every SDP line starts with '\n'. */
+    const std::string_view sdp(search + 2);
 
-    return audio_ciphersuite_match;
+    audio_host = sdp_media_remote(sdp, SDP_AUDIOPORT_PREFIX, audio_port);
+    video_host = sdp_media_remote(sdp, SDP_VIDEOPORT_PREFIX, video_port);
 }
 
-int call::check_video_ciphersuite_match(SrtpInfoParams &pV)
+/* The SRTP crypto suites: those of RFC 4568, and AES_192_CM and AES_256_CM
+ * of RFC 6188. NULL ones do not encrypt. */
+struct SrtpSuite {
+    const char* name;
+    CipherType cipher;
+    HashType hash;
+};
+
+enum { AES128_80, AES128_32, NULL_80, NULL_32, AES192_80, AES192_32, AES256_80, AES256_32 };
+
+// clang-format off
+static const SrtpSuite srtp_suites[] = {
+    {"AES_CM_128_HMAC_SHA1_80", AES_CM_128, HMAC_SHA1_80},
+    {"AES_CM_128_HMAC_SHA1_32", AES_CM_128, HMAC_SHA1_32},
+    {"NULL_HMAC_SHA1_80", NULL_CIPHER, HMAC_SHA1_80},
+    {"NULL_HMAC_SHA1_32", NULL_CIPHER, HMAC_SHA1_32},
+    {"AES_192_CM_HMAC_SHA1_80", AES_CM_192, HMAC_SHA1_80},
+    {"AES_192_CM_HMAC_SHA1_32", AES_CM_192, HMAC_SHA1_32},
+    {"AES_256_CM_HMAC_SHA1_80", AES_CM_256, HMAC_SHA1_80},
+    {"AES_256_CM_HMAC_SHA1_32", AES_CM_256, HMAC_SHA1_32},
+};
+// clang-format on
+
+/* The SRTP keywords of a message, in the order of MessageCompType: [cryptotag1audio],
+ * [cryptosuiteaescm128sha1801audio], [ueaescm128sha1321video], [cryptokeyparams2video]... */
+struct SrtpKeyword {
+    MessageCompType type;
+    enum { TAG, SUITE, UNENCRYPTED, KEYPARAMS } what;
+    bool video;
+    ActiveCrypto crypto; // the a=crypto line: the first or the second
+    const SrtpSuite *suite;
+};
+
+static const SrtpKeyword srtp_keywords[] = {
+    {E_Message_CryptoTag1Audio, SrtpKeyword::TAG, false, PRIMARY_CRYPTO, nullptr},
+    {E_Message_CryptoTag2Audio, SrtpKeyword::TAG, false, SECONDARY_CRYPTO, nullptr},
+    {E_Message_CryptoSuiteAesCm128Sha1801Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_CryptoSuiteAesCm128Sha1802Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_CryptoSuiteAesCm128Sha1321Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_CryptoSuiteAesCm128Sha1322Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_CryptoKeyParams1Audio, SrtpKeyword::KEYPARAMS, false, PRIMARY_CRYPTO, nullptr},
+    {E_Message_CryptoKeyParams2Audio, SrtpKeyword::KEYPARAMS, false, SECONDARY_CRYPTO, nullptr},
+    {E_Message_CryptoTag1Video, SrtpKeyword::TAG, true, PRIMARY_CRYPTO, nullptr},
+    {E_Message_CryptoTag2Video, SrtpKeyword::TAG, true, SECONDARY_CRYPTO, nullptr},
+    {E_Message_CryptoSuiteAesCm128Sha1801Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_CryptoSuiteAesCm128Sha1802Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_CryptoSuiteAesCm128Sha1321Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_CryptoSuiteAesCm128Sha1322Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_CryptoKeyParams1Video, SrtpKeyword::KEYPARAMS, true, PRIMARY_CRYPTO, nullptr},
+    {E_Message_CryptoKeyParams2Video, SrtpKeyword::KEYPARAMS, true, SECONDARY_CRYPTO, nullptr},
+    {E_Message_CryptoSuiteNullSha1801Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[NULL_80]},
+    {E_Message_CryptoSuiteNullSha1802Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[NULL_80]},
+    {E_Message_CryptoSuiteNullSha1321Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[NULL_32]},
+    {E_Message_CryptoSuiteNullSha1322Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[NULL_32]},
+    {E_Message_CryptoSuiteNullSha1801Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[NULL_80]},
+    {E_Message_CryptoSuiteNullSha1802Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[NULL_80]},
+    {E_Message_CryptoSuiteNullSha1321Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[NULL_32]},
+    {E_Message_CryptoSuiteNullSha1322Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[NULL_32]},
+    {E_Message_UEAesCm128Sha1801Audio, SrtpKeyword::UNENCRYPTED, false, PRIMARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_UEAesCm128Sha1802Audio, SrtpKeyword::UNENCRYPTED, false, SECONDARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_UEAesCm128Sha1321Audio, SrtpKeyword::UNENCRYPTED, false, PRIMARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_UEAesCm128Sha1322Audio, SrtpKeyword::UNENCRYPTED, false, SECONDARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_UEAesCm128Sha1801Video, SrtpKeyword::UNENCRYPTED, true, PRIMARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_UEAesCm128Sha1802Video, SrtpKeyword::UNENCRYPTED, true, SECONDARY_CRYPTO, &srtp_suites[AES128_80]},
+    {E_Message_UEAesCm128Sha1321Video, SrtpKeyword::UNENCRYPTED, true, PRIMARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_UEAesCm128Sha1322Video, SrtpKeyword::UNENCRYPTED, true, SECONDARY_CRYPTO, &srtp_suites[AES128_32]},
+    {E_Message_CryptoSuiteAesCm192Sha1801Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[AES192_80]},
+    {E_Message_CryptoSuiteAesCm192Sha1802Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[AES192_80]},
+    {E_Message_CryptoSuiteAesCm192Sha1321Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[AES192_32]},
+    {E_Message_CryptoSuiteAesCm192Sha1322Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[AES192_32]},
+    {E_Message_CryptoSuiteAesCm256Sha1801Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[AES256_80]},
+    {E_Message_CryptoSuiteAesCm256Sha1802Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[AES256_80]},
+    {E_Message_CryptoSuiteAesCm256Sha1321Audio, SrtpKeyword::SUITE, false, PRIMARY_CRYPTO, &srtp_suites[AES256_32]},
+    {E_Message_CryptoSuiteAesCm256Sha1322Audio, SrtpKeyword::SUITE, false, SECONDARY_CRYPTO, &srtp_suites[AES256_32]},
+    {E_Message_CryptoSuiteAesCm192Sha1801Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[AES192_80]},
+    {E_Message_CryptoSuiteAesCm192Sha1802Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[AES192_80]},
+    {E_Message_CryptoSuiteAesCm192Sha1321Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[AES192_32]},
+    {E_Message_CryptoSuiteAesCm192Sha1322Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[AES192_32]},
+    {E_Message_CryptoSuiteAesCm256Sha1801Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[AES256_80]},
+    {E_Message_CryptoSuiteAesCm256Sha1802Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[AES256_80]},
+    {E_Message_CryptoSuiteAesCm256Sha1321Video, SrtpKeyword::SUITE, true, PRIMARY_CRYPTO, &srtp_suites[AES256_32]},
+    {E_Message_CryptoSuiteAesCm256Sha1322Video, SrtpKeyword::SUITE, true, SECONDARY_CRYPTO, &srtp_suites[AES256_32]},
+};
+
+static const SrtpKeyword *find_srtp_keyword(MessageCompType type)
 {
-    int video_cs_len = 0;
-    int video_ciphersuite_match = 0;
+    if (type < E_Message_CryptoTag1Audio || type > E_Message_CryptoSuiteAesCm256Sha1322Video) {
+        return nullptr;
+    }
+    return &srtp_keywords[type - E_Message_CryptoTag1Audio];
+}
 
-    logSrtpInfo("call::check_video_ciphersuite_match():  Preferred VIDEO cryptosuite: [%s]\n", _pref_video_cs_out);
-
-    if (pV.found)
-    {
-        video_cs_len = strlen(_pref_video_cs_out);
-        if (!strncmp(_pref_video_cs_out, "AES_CM_128_HMAC_SHA1_80", video_cs_len) ||
-            !strncmp(_pref_video_cs_out, "AES_CM_128_HMAC_SHA1_32", video_cs_len) ||
-            !strncmp(_pref_video_cs_out, "NULL_HMAC_SHA1_80", video_cs_len) ||
-            !strncmp(_pref_video_cs_out, "NULL_HMAC_SHA1_32", video_cs_len))
-        {
-            if (!strncmp(pV.primary_cryptosuite, _pref_video_cs_out, video_cs_len))
-            {
-                // PRIMARY VIDEO cryptosuite matches preferred VIDEO cryptosuite
-                logSrtpInfo("call::check_video_ciphersuite_match():  PRIMARY VIDEO cryptosuite matches preferred VIDEO cryptosuite...\n");
-                video_ciphersuite_match = 1;
-            }
-            else
-            {
-                // PRIMARY VIDEO cryptosuite does NOT match preferred VIDEO cryptosuite
-                logSrtpInfo("call::check_video_ciphersuite_match():  PRIMARY VIDEO cryptosuite [%s] does NOT match preferred VIDEO cryptosuite [%s]...\n", pV.primary_cryptosuite, _pref_video_cs_out);
-                video_ciphersuite_match = 0;
-            }
+static const SrtpSuite *find_srtp_suite(const char *name)
+{
+    for (const SrtpSuite &suite : srtp_suites) {
+        if (!strcmp(name, suite.name)) {
+            return &suite;
         }
     }
+    return nullptr;
+}
 
-    return video_ciphersuite_match;
+/* Selects the cipher and hash of a suite, the NULL cipher for an
+ * UNENCRYPTED_SRTP one; any other suite is left alone. */
+static void select_srtp_suite(JLSRTP &ctx, const char *name, bool unencrypted, ActiveCrypto crypto)
+{
+    const SrtpSuite *suite = find_srtp_suite(name);
+    if (!suite) {
+        return;
+    }
+    if (ctx.selectCipherAlgorithm(unencrypted ? NULL_CIPHER : suite->cipher, crypto) < 0) {
+        ERROR("SRTP crypto suite %s is not supported by the TLS library SIPp is built with", name);
+    }
+    ctx.selectHashAlgorithm(suite->hash, crypto);
+}
+
+/* Decodes the master key and salt of a received a=crypto line into ctx.
+ * The RFC 6188 suites take a key of their AES key size, even without
+ * encryption, the others (NULL ones too) a 128-bit key. Returns false,
+ * with a warning, if it is not such a key and a 14-byte salt. */
+static bool decode_srtp_key(JLSRTP& ctx, std::string& mks, const char* name, ActiveCrypto crypto)
+{
+    const SrtpSuite *suite = find_srtp_suite(name);
+    size_t keyLength = !suite                        ? JLSRTP_ENCRYPTION_KEY_LENGTH
+                       : suite->cipher == AES_CM_192 ? JLSRTP_AES_192_KEY_LENGTH
+                       : suite->cipher == AES_CM_256 ? JLSRTP_AES_256_KEY_LENGTH
+                                                     : JLSRTP_ENCRYPTION_KEY_LENGTH;
+
+    if (ctx.decodeMasterKeySalt(mks, crypto, keyLength) < 0) {
+        WARNING("SRTP: ignoring the %s key %s: not a %zu-byte key and a 14-byte salt",
+                name, mks.c_str(), keyLength);
+        return false;
+    }
+    return true;
+}
+
+/* The a=crypto line in ctx (PRIMARY_CRYPTO or SECONDARY_CRYPTO) of the
+ * suite of an answer: the line of its tag if that is of the suite, else
+ * the first line of the suite, else INVALID_CRYPTO. A line that the SDP
+ * lacked, or whose key was ignored, has tag 0 and is never taken. */
+static ActiveCrypto find_crypto_line(JLSRTP& ctx, unsigned int tag, const char* suite)
+{
+    auto is_suite = [&ctx, suite](ActiveCrypto crypto) {
+        return ctx.getCryptoTag(crypto) != 0 && ctx.getCryptoSuite(crypto) == suite;
+    };
+    for (ActiveCrypto crypto : {PRIMARY_CRYPTO, SECONDARY_CRYPTO}) {
+        if (is_suite(crypto) && ctx.getCryptoTag(crypto) == tag) {
+            return crypto;
+        }
+    }
+    for (ActiveCrypto crypto : {PRIMARY_CRYPTO, SECONDARY_CRYPTO}) {
+        if (is_suite(crypto)) {
+            return crypto;
+        }
+    }
+    return INVALID_CRYPTO;
+}
+
+/* Whether the answerer, which answers suite, swaps to the offer's second
+ * a=crypto line to receive with; it warns if no line of the offer it
+ * took is of that suite. */
+static bool answer_swaps_crypto(JLSRTP& rx, const char* suite)
+{
+    ActiveCrypto crypto = find_crypto_line(rx, 0, suite);
+    if (crypto == INVALID_CRYPTO) {
+        WARNING("SRTP: answering %s, the suite of no a=crypto line taken from the offer", suite);
+    }
+    return crypto == SECONDARY_CRYPTO;
+}
+
+/* The offerer sends with the line of its offer that the answer's
+ * a=crypto line takes. If it takes none, it warns and sends plain RTP
+ * rather than SRTP with a key the answerer did not take. */
+static void take_answered_crypto(JLSRTP& tx, const SrtpInfoParams& p, const char* media)
+{
+    ActiveCrypto crypto = find_crypto_line(tx, p.primary_cryptotag, p.primary_cryptosuite);
+    if (crypto == SECONDARY_CRYPTO) {
+        tx.swapCrypto();
+    } else if (crypto == INVALID_CRYPTO) {
+        WARNING("SRTP: the %s answer a=crypto:%d %s is none of the offered lines, sending plain RTP",
+                media, p.primary_cryptotag, p.primary_cryptosuite);
+        tx.setCryptoTag(0, PRIMARY_CRYPTO);
+        tx.setCryptoTag(0, SECONDARY_CRYPTO);
+    }
 }
 
 /******* Extract SRTP remote media infomartion from SDP  *******/
+
+/* Parse an a=crypto line into its tag, its suite and the key of its first
+ * key-params (without a lifetime or MKI). Returns whether a session
+ * parameter after the key-params is UNENCRYPTED_SRTP. */
+static bool parse_crypto_line(const char* line, int& tag, char* suite, char* key)
+{
+    int end = 0;
+    sscanf(line, "\na=crypto:%d %24[^ ] inline:%64[^ |\r\n]%n", &tag, suite, key, &end);
+    if (!end)
+        return false;
+    // Skip the rest of the key-params: a lifetime, an MKI, more keys
+    const char* session_params = line + end + strcspn(line + end, " \r\n");
+    return strstr(session_params, "UNENCRYPTED_SRTP") != nullptr;
+}
 
 #define SDP_AUDIOCRYPTO_PREFIX "\na=crypto:"
 #define SDP_VIDEOCRYPTO_PREFIX "\na=crypto:"
@@ -452,10 +828,6 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
     std::size_t msection_limit = 0; /* m-line media section limit */
     std::string msgstr; /* std::string representation of SDP body */
 
-    char crypto_audio_sessionparams[64];
-    char crypto_video_sessionparams[64];
-
-    char* checkUESRTP = nullptr;
     bool audioExists = false;
     bool videoExists = false;
     std::size_t cur_pos = 0;
@@ -464,11 +836,6 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
     std::size_t pos1 = 0;
     std::size_t pos2 = 0;
     std::string sub;
-    std::size_t amsection_limit = 0;
-    std::size_t vmsection_limit = 0;
-
-    *crypto_audio_sessionparams = 0;
-    *crypto_video_sessionparams = 0;
 
     // skip past header - point to blank line before body
     // Try CRLF and if not found, try LF (the RFC requires CRLF)
@@ -480,12 +847,6 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
 
     if (msgstr.empty())
         return -1; /* FAILURE -- No SDP body found */
-
-    /* --------------------------------------------------------------
-        * Determine SDP m-line structure
-        * -------------------------------------------------------------- */
-    amsection_limit = msgstr.find("\nm=audio", 0, msgstr.size());
-    vmsection_limit = msgstr.find("\nm=video", 0, msgstr.size());
 
     /* --------------------------------------------------------------
         * Try to find an AUDIO MLINE
@@ -557,28 +918,22 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
 
     cur_pos = pos2;
 
-    if (audioExists &&
-        (((amsection_limit != std::string::npos) && (cur_pos != std::string::npos) && (cur_pos < amsection_limit)) ||
-            ((amsection_limit == std::string::npos) && (vmsection_limit == std::string::npos) && (cur_pos != std::string::npos))))
+    if (audioExists)
     {
         // AUDIO "m=audio" prefix found...
         pA.found = true;
 
+        // Only the audio media section's crypto lines are audio's
+        msection_limit = msgstr.find("\nm=", cur_pos, 3);
+
         mline_sol = msgstr.find(SDP_AUDIOCRYPTO_PREFIX, cur_pos/*0*/, 10);
-        if (mline_sol != std::string::npos) {
+        if (mline_sol < msection_limit) {
             // PRIMARY AUDIO "a:crypto:" crypto prefix found
-            mline_eol = msgstr.find("\n", mline_sol, 1);
+            mline_eol = msgstr.find("\n", mline_sol + 1, 1);
             if (mline_eol != std::string::npos) {
-                mline_contents = msgstr.substr(mline_sol, mline_eol);
-                // %*1[ ] is to skip a single space after the "inline:...." field.
-                // as opposed to literal space, which matches zero or more spaces.
-                sscanf(mline_contents.c_str(), "\na=crypto:%d %24[^ ] inline:%40[^ ]%*1[ ]%63s",
-                        &pA.primary_cryptotag,
-                        pA.primary_cryptosuite,
-                        pA.primary_cryptokeyparams,
-                        crypto_audio_sessionparams);
-                checkUESRTP = strstr(crypto_audio_sessionparams, "UNENCRYPTED_SRTP");
-                if (checkUESRTP) {
+                mline_contents = msgstr.substr(mline_sol, mline_eol - mline_sol);
+                if (parse_crypto_line(mline_contents.c_str(), pA.primary_cryptotag,
+                                      pA.primary_cryptosuite, pA.primary_cryptokeyparams)) {
                     logSrtpInfo("call::extract_srtp_remote_info():  Detected UNENCRYPTED_SRTP token for PRIMARY AUDIO\n");
                     pA.primary_unencrypted_srtp = true;
                 } else {
@@ -586,25 +941,18 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
                     pA.primary_unencrypted_srtp = false;
                 }
             }
+
+            mline_sol = mline_eol == std::string::npos ? mline_eol :
+                        msgstr.find(SDP_AUDIOCRYPTO_PREFIX, mline_eol, 10);
         }
 
-        // Look for end-of-audio-media section
-        msection_limit = msgstr.find("\nm=", mline_eol+1, 3);
-
-        mline_sol = msgstr.find(SDP_AUDIOCRYPTO_PREFIX, mline_eol+1, 10);
-        if (((msection_limit != std::string::npos) && (mline_sol != std::string::npos) && (mline_sol < msection_limit)) ||
-            ((msection_limit == std::string::npos) && (mline_sol != std::string::npos))) {
+        if (mline_sol < msection_limit) {
             // SECONDARY AUDIO "a:crypto:" crypto prefix found
-            mline_eol = msgstr.find("\n", mline_sol, 1);
+            mline_eol = msgstr.find("\n", mline_sol + 1, 1);
             if (mline_eol != std::string::npos) {
-                mline_contents = msgstr.substr(mline_sol, mline_eol);
-                sscanf(mline_contents.c_str(), "\na=crypto:%d %24[^ ] inline:%40[^ ]%*1[ ]%63s",
-                        &pA.secondary_cryptotag,
-                        pA.secondary_cryptosuite,
-                        pA.secondary_cryptokeyparams,
-                        crypto_audio_sessionparams);
-                checkUESRTP = strstr(crypto_audio_sessionparams, "UNENCRYPTED_SRTP");
-                if (checkUESRTP) {
+                mline_contents = msgstr.substr(mline_sol, mline_eol - mline_sol);
+                if (parse_crypto_line(mline_contents.c_str(), pA.secondary_cryptotag,
+                                      pA.secondary_cryptosuite, pA.secondary_cryptokeyparams)) {
                     logSrtpInfo("call::extract_srtp_remote_info():  Detected UNENCRYPTED_SRTP token for SECONDARY AUDIO\n");
                     pA.secondary_unencrypted_srtp = true;
                 } else {
@@ -685,26 +1033,22 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
 
     cur_pos = pos2;
 
-    if (videoExists &&
-        (((vmsection_limit != std::string::npos) && (cur_pos != std::string::npos) && (cur_pos < vmsection_limit)) ||
-            ((vmsection_limit == std::string::npos) && (amsection_limit == std::string::npos) && (cur_pos != std::string::npos))))
+    if (videoExists)
     {
         // VIDEO "m=video" prefix found...
         pV.found = true;
 
+        // Only the video media section's crypto lines are video's
+        msection_limit = msgstr.find("\nm=", cur_pos, 3);
+
         mline_sol = msgstr.find(SDP_VIDEOCRYPTO_PREFIX, cur_pos/*mline_eol+1*/, 10);
-        if (mline_sol != std::string::npos) {
+        if (mline_sol < msection_limit) {
             // PRIMARY VIDEO "a:crypto:" crypto prefix found
-            mline_eol = msgstr.find("\n", mline_sol, 1);
+            mline_eol = msgstr.find("\n", mline_sol + 1, 1);
             if (mline_eol != std::string::npos) {
-                mline_contents = msgstr.substr(mline_sol, mline_eol);
-                sscanf(mline_contents.c_str(), "\na=crypto:%d %24[^ ] inline:%40[^ ]%*1[ ]%63s",
-                        &pV.primary_cryptotag,
-                        pV.primary_cryptosuite,
-                        pV.primary_cryptokeyparams,
-                        crypto_video_sessionparams);
-                checkUESRTP = strstr(crypto_video_sessionparams, "UNENCRYPTED_SRTP");
-                if (checkUESRTP) {
+                mline_contents = msgstr.substr(mline_sol, mline_eol - mline_sol);
+                if (parse_crypto_line(mline_contents.c_str(), pV.primary_cryptotag,
+                                      pV.primary_cryptosuite, pV.primary_cryptokeyparams)) {
                     logSrtpInfo("call::extract_srtp_remote_info():  Detected UNENCRYPTED_SRTP token for PRIMARY VIDEO\n");
                     pV.primary_unencrypted_srtp = true;
                 } else {
@@ -712,25 +1056,18 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
                     pV.primary_unencrypted_srtp = false;
                 }
             }
+
+            mline_sol = mline_eol == std::string::npos ? mline_eol :
+                        msgstr.find(SDP_VIDEOCRYPTO_PREFIX, mline_eol, 10);
         }
 
-        // Look for end-of-video-media section
-        msection_limit = msgstr.find("\nm=", mline_eol+1, 3);
-
-        mline_sol = msgstr.find(SDP_VIDEOCRYPTO_PREFIX, mline_eol+1, 10);
-        if (((msection_limit != std::string::npos) && (mline_sol != std::string::npos) && (mline_sol < msection_limit)) ||
-            ((msection_limit == std::string::npos) && (mline_sol != std::string::npos))) {
+        if (mline_sol < msection_limit) {
             // SECONDARY VIDEO "a:crypto:" crypto prefix found
-            mline_eol = msgstr.find("\n", mline_sol, 1);
+            mline_eol = msgstr.find("\n", mline_sol + 1, 1);
             if (mline_eol != std::string::npos) {
-                mline_contents = msgstr.substr(mline_sol, mline_eol);
-                sscanf(mline_contents.c_str(), "\na=crypto:%d %24[^ ] inline:%40[^ ]%*1[ ]%63s",
-                        &pV.secondary_cryptotag,
-                        pV.secondary_cryptosuite,
-                        pV.secondary_cryptokeyparams,
-                        crypto_video_sessionparams);
-                checkUESRTP = strstr(crypto_video_sessionparams, "UNENCRYPTED_SRTP");
-                if (checkUESRTP) {
+                mline_contents = msgstr.substr(mline_sol, mline_eol - mline_sol);
+                if (parse_crypto_line(mline_contents.c_str(), pV.secondary_cryptotag,
+                                      pV.secondary_cryptosuite, pV.secondary_cryptokeyparams)) {
                     logSrtpInfo("call::extract_srtp_remote_info():  Detected UNENCRYPTED_SRTP token for SECONDARY VIDEO\n");
                     pV.secondary_unencrypted_srtp = true;
                 } else {
@@ -744,7 +1081,40 @@ int call::extract_srtp_remote_info(const char * msg, SrtpInfoParams &pA, SrtpInf
     return 0; /* SUCCESS -- parsed SDP SRTP INFO */
 }
 
+/* Whether two messages have the same CSeq, number and method. */
+static bool same_cseq(const char* a, const char* b)
+{
+    return get_header_content(a, "CSeq:").view() == get_header_content(b, "CSeq:").view();
+}
+
+/* Free the text s holds, whose buffer clear() would keep */
+static void release(std::string &s)
+{
+    if (!s.empty()) {
+        std::string().swap(s);
+    }
+}
+
 /******* Very simple hash for retransmission detection  *******/
+
+/* The hash of the loop below (hash * 65599 + c for each character) of
+ * the len characters of s, taken four at a time: each step then waits
+ * for one multiplication of the step before, not four. */
+static unsigned long sdbm_hash(const char *s, size_t len)
+{
+    const unsigned long p1 = 65599, p2 = p1 * p1, p3 = p2 * p1, p4 = p3 * p1;
+    unsigned long hash = 0;
+    size_t i = 0;
+
+    for (; i + 4 <= len; i += 4) {
+        hash = hash * p4 + (unsigned long)s[i] * p3 + (unsigned long)s[i + 1] * p2 + (unsigned long)s[i + 2] * p1 +
+               (unsigned long)s[i + 3];
+    }
+    for (; i < len; i++) {
+        hash = hash * p1 + (unsigned long)s[i];
+    }
+    return hash;
+}
 
 unsigned long call::hash(const char * msg)
 {
@@ -752,28 +1122,21 @@ unsigned long call::hash(const char * msg)
     int c;
 
     if (rtcheck == RTCHECK_FULL) {
-        while ((c = *msg++))
-            hash = c + (hash << 6) + (hash << 16) - hash;
+        hash = sdbm_hash(msg, strlen(msg));
     } else if (rtcheck == RTCHECK_LOOSE) {
         /* Based on section 11.5 (bullet 2) of RFC2543 we only take into account
          * the To, From, Call-ID, and CSeq values. */
-        const char *hdr = get_header_content(msg, "To:");
-        while ((c = *hdr++))
-            hash = c + (hash << 6) + (hash << 16) - hash;
-        hdr = get_header_content(msg, "From:");
-        while ((c = *hdr++))
-            hash = c + (hash << 6) + (hash << 16) - hash;
-        hdr = get_header_content(msg, "Call-ID:");
-        while ((c = *hdr++))
-            hash = c + (hash << 6) + (hash << 16) - hash;
-        hdr = get_header_content(msg, "CSeq:");
-        while ((c = *hdr++))
-            hash = c + (hash << 6) + (hash << 16) - hash;
+        for (const char *name : {"To:", "From:", "Call-ID:", "CSeq:"}) {
+            const header_value value = get_header_content(msg, name);
+            for (const char v : value.view()) {
+                hash = v + (hash << 6) + (hash << 16) - hash;
+            }
+        }
         /* For responses, we should also consider the code and body (if any),
          * because they are not nearly as well defined as the request retransmission. */
         if (!strncmp(msg, "SIP/2.0", strlen("SIP/2.0"))) {
             /* Add the first line into the hash. */
-            hdr = msg + strlen("SIP/2.0");
+            const char *hdr = msg + strlen("SIP/2.0");
             while ((c = *hdr++) && (c != '\r'))
                 hash = c + (hash << 6) + (hash << 16) - hash;
             /* Add the body (if any) into the hash. */
@@ -792,63 +1155,44 @@ unsigned long call::hash(const char * msg)
 }
 
 /******************* Call class implementation ****************/
-call::call(scenario *call_scenario, const char *p_id, bool use_ipv6, int userId, struct sockaddr_storage *dest) : listener(p_id, true)
+call::call(scenario *call_scenario, std::string_view p_id, bool use_ipv6, int userId, struct sockaddr_storage *dest)
+    : listener(p_id, true)
 {
     init(call_scenario, nullptr, dest, p_id, userId, use_ipv6, false, false);
 }
 
-call::call(scenario *call_scenario, const char *p_id, SIPpSocket *socket, struct sockaddr_storage *dest) : listener(p_id, true)
+call::call(scenario *call_scenario, std::string_view p_id, SIPpSocket *socket, struct sockaddr_storage *dest)
+    : listener(p_id, true)
 {
     init(call_scenario, socket, dest, p_id, 0 /* No User. */, socket->ss_ipv6, false /* Not Auto. */, false);
 }
 
-call::call(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_storage *dest, const char * p_id, int userId, bool ipv6, bool isAutomatic, bool isInitialization) : listener(p_id, true)
+call::call(scenario *call_scenario, SIPpSocket *socket, struct sockaddr_storage *dest, std::string_view p_id,
+           int userId, bool ipv6, bool isAutomatic, bool isInitialization)
+    : listener(p_id, true)
 {
     init(call_scenario, socket, dest, p_id, userId, ipv6, isAutomatic, isInitialization);
 }
 
-call *call::add_call(int userId, bool ipv6, struct sockaddr_storage *dest)
+call *call::add_call(int userId, bool ipv6, struct sockaddr_storage *dest,
+                     remote_address *remote)
 {
     static char call_id[MAX_HEADER_LEN];
-
-    const char * src = call_id_string;
-    int count = 0;
 
     if(!next_number) {
         next_number ++;
     }
 
-    while (*src && count < MAX_HEADER_LEN-1) {
-        if (*src == '%') {
-            ++src;
-            switch(*src++) {
-            case 'u':
-                count += snprintf(&call_id[count], MAX_HEADER_LEN-count-1, "%u", next_number);
-                break;
-            case 'p':
-                count += snprintf(&call_id[count], MAX_HEADER_LEN-count-1, "%u", pid);
-                break;
-            case 's':
-                count += snprintf(&call_id[count], MAX_HEADER_LEN-count-1, "%s", local_ip);
-                break;
-            case 'r':
-                count += snprintf(&call_id[count], MAX_HEADER_LEN-count-1, "%u", rand());
-                break;
-            default:      // treat all unknown sequences as %%
-                call_id[count++] = '%';
-                break;
-            }
-        } else {
-            call_id[count++] = *src++;
-        }
-    }
-    call_id[count] = 0;
+    build_call_id(call_id, next_number);
 
-    return new call(main_scenario, nullptr, dest, call_id, userId, ipv6, false /* Not Auto. */, false);
+    call *new_call = new call(main_scenario, nullptr, dest, call_id, userId, ipv6, false /* Not Auto. */, false);
+    new_call->remote = remote;
+    return new_call;
 }
 
 
-void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_storage *dest, const char * p_id, int userId, bool ipv6, bool isAutomatic, bool isInitCall)
+void call::init(scenario *call_scenario, SIPpSocket *socket, struct sockaddr_storage *dest, std::string_view p_id,
+                int userId, bool ipv6, bool isAutomatic, bool isInitCall)
 {
     _srtpctxdebugfile = nullptr;
 
@@ -876,26 +1220,19 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     this->call_scenario = call_scenario;
     zombie = false;
 
-    debugBuffer = nullptr;
-    debugLength = 0;
-
     msg_index = 0;
     last_send_index = 0;
-    last_send_msg = nullptr;
-    last_send_len = 0;
+    last_send_unanswered = false;
+    recv_retrans_last = false;
 
     last_recv_hash = 0;
     last_recv_index = -1;
-    last_recv_msg = nullptr;
 
     last_recv_invite_cseq = 0;
 
     recv_retrans_hash = 0;
     recv_retrans_recv_index = -1;
     recv_retrans_send_index = -1;
-
-    dialog_route_set = nullptr;
-    next_req_url = nullptr;
 
     cseq = 0;
 
@@ -904,22 +1241,20 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     nb_last_delay = 0;
 
     paused_until = 0;
+    rtpstream_wait_check = 0;
+    rtpstream_wait_until = 0;
+    rtpstream_wait_msg = nullptr;
+    verify_pending = 0;
 
     call_port = 0;
 
     start_time = clock_tick;
     call_established=false ;
     ack_is_pending=false ;
-    last_recv_msg = nullptr;
+    bye_after_peer_request = false;
     cseq = base_cseq;
     nb_last_delay = 0;
     use_ipv6 = ipv6;
-    queued_msg = nullptr;
-
-    dialog_authentication = nullptr;
-    dialog_challenge_type = 0;
-
-    next_nonce_count = 1;
 
 #ifdef USE_IPSEC
     memset(&ipsec_params, 0, sizeof(ipsec_params));
@@ -958,13 +1293,13 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
         if (sendMode == MODE_CLIENT)
         {
             logSrtpInfo("call::init():  (a) TX-UAC-AUDIO SRTP context - CLIENT setting SRTP header size to 12\n");
-            _txUACAudio.setSrtpHeaderSize(12);
+            _srtpAudio.txUAC->setSrtpHeaderSize(12);
             logSrtpInfo("call::init():  (a) TX-UAC-VIDEO SRTP context - CLIENT setting SRTP header size to 12\n");
-            _txUACVideo.setSrtpHeaderSize(12);
+            _srtpVideo.txUAC->setSrtpHeaderSize(12);
             logSrtpInfo("call::init():  (b) RX-UAC-AUDIO SRTP context - CLIENT setting SRTP header size to 12\n");
-            _rxUACAudio.setSrtpHeaderSize(12);
+            _srtpAudio.rxUAC->setSrtpHeaderSize(12);
             logSrtpInfo("call::init():  (b) RX-UAC-VIDEO SRTP context - CLIENT setting SRTP header size to 12\n");
-            _rxUACVideo.setSrtpHeaderSize(12);
+            _srtpVideo.rxUAC->setSrtpHeaderSize(12);
         }
     }
 
@@ -976,31 +1311,29 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
         if (sendMode == MODE_SERVER)
         {
             logSrtpInfo("call::init():  (c) RX-UAS-AUDIO SRTP context - SERVER setting SRTP header size to 12\n");
-            _rxUASAudio.setSrtpHeaderSize(12);
+            _srtpAudio.rxUAS->setSrtpHeaderSize(12);
             logSrtpInfo("call::init():  (c) RX-UAS-VIDEO SRTP context - SERVER setting SRTP header size to 12\n");
-            _rxUASVideo.setSrtpHeaderSize(12);
+            _srtpVideo.rxUAS->setSrtpHeaderSize(12);
             logSrtpInfo("call::init():  (d) TX-UAS-AUDIO SRTP context - SERVER setting SRTP header size to 12\n");
-            _txUASAudio.setSrtpHeaderSize(12);
+            _srtpAudio.txUAS->setSrtpHeaderSize(12);
             logSrtpInfo("call::init():  (d) TX-UAS-VIDEO SRTP context - SERVER setting SRTP header size to 12\n");
-            _txUASVideo.setSrtpHeaderSize(12);
+            _srtpVideo.txUAS->setSrtpHeaderSize(12);
         }
     }
 
-    *_pref_audio_cs_out = 0;
-    *_pref_video_cs_out = 0;
     /* check and warn on rtpstream_new_call result? -> error alloc'ing mem */
     rtpstream_new_call(&rtpstream_callinfo);
 
 #ifdef PCAPPLAY
     hasMediaInformation = 0;
-    play_args_a.last_seq_no = 1200;
-    play_args_v.last_seq_no = 2400;
 #endif
 
     call_remote_socket = nullptr;
     if (socket) {
         associate_socket(socket);
         socket->ss_count++;
+        /* [local_port] is the socket's, as for a shared call socket. */
+        call_port = socket->ss_port;
     } else {
         call_socket = nullptr;
     }
@@ -1009,6 +1342,7 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     } else {
         memset(&call_peer, 0, sizeof(call_peer));
     }
+    remote = nullptr;
 
     // initialising the CallVariable with the Scenario variable
     int i;
@@ -1039,22 +1373,22 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     }
 
     if (call_scenario->transactions.size() > 0) {
-        transactions = (struct txnInstanceInfo *)malloc(sizeof(txnInstanceInfo) * call_scenario->transactions.size());
-        memset(transactions, 0, sizeof(struct txnInstanceInfo) * call_scenario->transactions.size());
-    } else {
-        transactions = nullptr;
+        transactions = std::make_unique<txnInstanceInfo[]>(call_scenario->transactions.size());
+    }
+
+    if (call_scenario->dialogs) {
+        dialogs = std::make_unique<call_dialogs>();
+        dialogs->dialogs[1];
+        if (call_scenario->new_dialogs && !isInitCall) {
+            dialogs->waiting = new_dialog_calls.insert(new_dialog_calls.end(), this);
+            dialogs->waits_new = true;
+        }
     }
 
     // If not updated by a message we use the start time
     // information to compute rtd information
-    start_time_rtd = (unsigned long long *)malloc(sizeof(unsigned long long) * call_scenario->stats->nRtds());
-    if (!start_time_rtd) {
-        ERROR("Could not allocate RTD times!");
-    }
-    rtd_done = (bool *)malloc(sizeof(bool) * call_scenario->stats->nRtds());
-    if (!start_time_rtd) {
-        ERROR("Could not allocate RTD done!");
-    }
+    start_time_rtd.resize(call_scenario->stats->nRtds());
+    rtd_done.resize(call_scenario->stats->nRtds());
     for (i = 0; i < call_scenario->stats->nRtds(); i++) {
         start_time_rtd[i] = getmicroseconds();
         rtd_done[i] = false;
@@ -1068,13 +1402,14 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     /* For automatic answer calls to an out of call request, we must not */
     /* increment the input files line numbers to not disturb */
     /* the input files read mechanism (otherwise some lines risk */
-    /* to be systematically skipped */
+    /* to be systematically skipped. An <init> reads the line the */
+    /* first call will read, and leaves it to that call. */
     if (!isAutomatic) {
         m_lineNumber = new file_line_map();
         for (file_map::iterator file_it = inFiles.begin();
                 file_it != inFiles.end();
                 file_it++) {
-            (*m_lineNumber)[file_it->first] = file_it->second->nextLine(userId);
+            (*m_lineNumber)[file_it->first] = file_it->second->nextLine(userId, !isInitCall);
         }
     } else {
         m_lineNumber = nullptr;
@@ -1082,17 +1417,9 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     this->initCall = isInitCall;
 
 #ifdef PCAPPLAY
-    memset(&(play_args_a.to), 0, sizeof(struct sockaddr_storage));
-    memset(&(play_args_i.to), 0, sizeof(struct sockaddr_storage));
-    memset(&(play_args_v.to), 0, sizeof(struct sockaddr_storage));
-    memset(&(play_args_a.from), 0, sizeof(struct sockaddr_storage));
-    memset(&(play_args_i.from), 0, sizeof(struct sockaddr_storage));
-    memset(&(play_args_v.from), 0, sizeof(struct sockaddr_storage));
     hasMediaInformation = 0;
-    media_thread = 0;
 #endif
 
-    peer_tag = nullptr;
     recv_timeout = 0;
     send_timeout = 0;
     timewait = false;
@@ -1100,8 +1427,9 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     if (!isAutomatic) {
         /* Not advancing the number is safe, because for automatic calls we do not
          * assign the identifier,  the only other place it is used is for the auto
-         * media port. */
-        number = next_number++;
+         * media port. An <init> is not a call of the scenario either: the
+         * first call is number 1 all the same. */
+        number = isInitCall ? 0 : next_number++;
 
         if (use_tdmmap) {
             tdm_map_number = get_tdm_map_number();
@@ -1175,17 +1503,17 @@ int call::_callDebug(const char *fmt, ...)
     int ret = vsnprintf(nullptr, 0, fmt, ap);
     va_end(ap);
 
-    debugBuffer = (char *)realloc(debugBuffer, debugLength + ret + TIME_LENGTH + 2);
-    if (!debugBuffer) {
-        ERROR("Could not allocate buffer (%d bytes) for callDebug file!", debugLength + ret + TIME_LENGTH + 2);
-    }
-
     struct timeval now;
     gettimeofday(&now, nullptr);
-    debugLength += snprintf(debugBuffer + debugLength, TIME_LENGTH + 2, "%s ", CStat::formatTime(&now, rfc3339));
+    std::string &debug = cold().debugBuffer;
+    debug += CStat::formatTime(&now, rfc3339);
+    debug += ' ';
 
+    /* Written in place: vsnprintf() ends it with the string's own NUL */
+    const size_t at = debug.size();
+    debug.resize(at + ret);
     va_start(ap, fmt);
-    debugLength += vsnprintf(debugBuffer + debugLength, ret + 1, fmt, ap);
+    vsnprintf(debug.data() + at, ret + 1, fmt, ap);
     va_end(ap);
 
     return ret;
@@ -1197,6 +1525,9 @@ call::~call()
 
     if (call_remote_socket && (call_remote_socket != main_remote_socket)) {
         call_remote_socket->close();
+    }
+    while (!peekCold().request_sources.empty()) {
+        forget_request_source(cold_state->request_sources.begin());
     }
 
     /* Deletion of the call variable */
@@ -1210,35 +1541,23 @@ call::~call()
         CallGenerationTask::free_user(userId);
     }
 
-    if (transactions) {
-        for (unsigned int i = 0; i < call_scenario->transactions.size(); i++) {
-            free(transactions[i].txnID);
+    if (dialogs) {
+        if (dialogs->waits_new) {
+            new_dialog_calls.erase(dialogs->waiting);
         }
-        free(transactions);
-    }
-
-    if (last_recv_msg) {
-        free(last_recv_msg);
-    }
-    if (last_send_msg) {
-        free(last_send_msg);
-    }
-    if (peer_tag) {
-        free(peer_tag);
-    }
-
-    if (dialog_route_set) {
-        free(dialog_route_set);
-    }
-
-    if (next_req_url) {
-        free(next_req_url);
+        for (auto &[dialog, d] : dialogs->dialogs) {
+            if (!d.call_id.empty()) {
+                unlisten(d.call_id.c_str());
+            }
+        }
     }
 
     rtpstream_end_call(&rtpstream_callinfo);
 
-    if (dialog_authentication) {
-        free(dialog_authentication);
+    /* tdm_map_number counts from 1, and is 0 for a call that got no
+     * circuit. */
+    if (use_tdmmap && tdm_map_number) {
+        tdm_map[tdm_map_number - 1] = false;
     }
 
 #ifdef USE_IPSEC
@@ -1274,23 +1593,16 @@ call::~call()
     delete s6a;
 #endif
 
-    if (use_tdmmap) {
-        tdm_map[tdm_map_number] = false;
+    if (verify_pending) {
+        /* Its commands run on, and their end is ignored */
+        for (auto& v : verify_commands) {
+            if (v.second.waiting == this) {
+                v.second.waiting = nullptr;
+            }
+        }
     }
 
-# ifdef PCAPPLAY
-    if (media_thread != 0) {
-        pthread_cancel(media_thread);
-        pthread_join(media_thread, nullptr);
-    }
-#endif
-
-    free(start_time_rtd);
-    free(rtd_done);
-    free(debugBuffer);
-
-    if (srtpcheck_debug)
-    {
+    if (_srtpctxdebugfile) {
         fclose(_srtpctxdebugfile);
         _srtpctxdebugfile = nullptr;
     }
@@ -1357,6 +1669,12 @@ void call::dump()
     if (recv_timeout) {
         written += snprintf(s + written, slen - written, " (recv timeout %u)", recv_timeout);
     }
+    if (rtpstream_wait_check) {
+        written += snprintf(s + written, slen - written, " (rtp_stream wait until %u)", rtpstream_wait_until);
+    }
+    if (verify_pending) {
+        written += snprintf(s + written, slen - written, " (%d exec verify running)", verify_pending);
+    }
     if (send_timeout) {
         written += snprintf(s + written, slen - written, " (send timeout %u)", send_timeout);
     }
@@ -1376,44 +1694,50 @@ bool call::connect_socket_if_needed()
         if(sendMode != MODE_CLIENT)
             return true;
 
-        char peripaddr[256];
         if (!peripsocket) {
             if ((associate_socket(SIPpSocket::new_sipp_call_socket(use_ipv6, transport, &existing))) == nullptr) {
                 ERROR_NO("Unable to get a UDP socket (1)");
             }
         } else {
-            char *tmp = peripaddr;
-            getFieldFromInputFile(ip_file, peripfield, nullptr, tmp);
+            const std::string peripaddr = getFieldFromInputFile(ip_file, peripfield, nullptr);
             auto i = map_perip_fd.find(peripaddr);
-            if (i == map_perip_fd.end()) {
+            SIPpSocket *sock = i != map_perip_fd.end() ? i->second : nullptr;
+            if (!sock) {
+                if (gai_getsockaddr(&saddr, peripaddr.c_str(), local_port, AI_PASSIVE, AF_UNSPEC) != 0) {
+                    ERROR("Unknown host '%s' in the -ip_field of %s", peripaddr.c_str(), ip_file.c_str());
+                }
+                sock = find_perip_socket(peripaddr, &saddr);
+            }
+            if (sock) {
+                // Socket exists already
+                associate_socket(sock);
+                existing = true;
+                sock->ss_count++;
+            } else {
                 // Socket does not exist
                 if ((associate_socket(SIPpSocket::new_sipp_call_socket(use_ipv6, transport, &existing))) == nullptr) {
                     ERROR_NO("Unable to get a UDP socket (2)");
                 } else {
                     /* Ensure that it stays persistent, because it is recorded in the map. */
                     call_socket->ss_count++;
-                    map_perip_fd[peripaddr] = call_socket;
+                    add_perip_socket(peripaddr, &saddr, call_socket);
                 }
-            } else {
-                // Socket exists already
-                associate_socket(i->second);
-                existing = true;
-                i->second->ss_count++;
             }
         }
         if (existing) {
+            /* [local_port] is the shared socket's. */
+            call_port = call_socket->ss_port;
             return true;
         }
 
-        memcpy(&saddr, &local_addr_storage, sizeof(struct sockaddr_storage));
-        if (use_ipv6) {
-            saddr.ss_family       = AF_INET6;
-        } else {
-            saddr.ss_family       = AF_INET;
-        }
-
-        if (peripsocket) {
-            gai_getsockaddr(&saddr, peripaddr, local_port, AI_PASSIVE, AF_UNSPEC);
+        /* -t ui: saddr is the -ip_field address */
+        if (!peripsocket) {
+            memcpy(&saddr, &local_addr_storage, sizeof(struct sockaddr_storage));
+            if (use_ipv6) {
+                saddr.ss_family = AF_INET6;
+            } else {
+                saddr.ss_family = AF_INET;
+            }
         }
 #ifdef USE_IPSEC
         if (tunnel_ip()) {
@@ -1426,14 +1750,14 @@ bool call::connect_socket_if_needed()
             ERROR_NO("Unable to bind UDP socket");
         }
     } else { /* TCP, SCTP or TLS. */
-        struct sockaddr_storage *L_dest = &remote_sockaddr;
+        struct sockaddr_storage *L_dest = remote ? &remote->addr : &remote_sockaddr;
 
         if ((associate_socket(SIPpSocket::new_sipp_call_socket(use_ipv6, transport, &existing))) == nullptr) {
             ERROR_NO("Unable to get a TCP/SCTP/TLS socket");
         }
-        call_socket->ss_count++;
 
         if (existing) {
+            call_port = call_socket->ss_port;
             return true;
         }
 
@@ -1441,6 +1765,9 @@ bool call::connect_socket_if_needed()
 
         if (use_remote_sending_addr) {
             L_dest = &remote_sending_sockaddr;
+        }
+        if (L_dest->ss_family == AF_UNSPEC) {
+            ERROR("Call '%s' has no remote host to connect to", id);
         }
 
         if (call_socket->connect(L_dest)) {
@@ -1480,7 +1807,6 @@ bool call::connect_socket_if_needed()
 
 bool call::lost(int index)
 {
-    static int inited = 0;
     double percent = global_lost;
 
     if(!lose_packets) return false;
@@ -1491,11 +1817,6 @@ bool call::lost(int index)
 
     if (percent == 0) {
         return false;
-    }
-
-    if(!inited) {
-        srand((unsigned int) time(nullptr));
-        inited = 1;
     }
 
     return (((double)rand() / (double)RAND_MAX) < (percent / 100.0));
@@ -1561,12 +1882,33 @@ int call::send_raw(const char * msg, int index, int len)
 
     assert(sock);
 
-    rc = sock->write(msg, len, WS_BUFFER, &call_peer);
+    /* A response to a request that came from elsewhere goes back there. */
+    struct sockaddr_storage *dest = &call_peer;
+    if (!peekCold().request_sources.empty() && !strncmp(msg, "SIP/2.0 ", 8)) {
+        char branch[MAX_HEADER_LEN];
+        extract_transaction(branch, sizeof(branch), msg);
+        for (request_source &rs : cold_state->request_sources) {
+            if (rs.branch == branch) {
+                if (!rs.socket) {
+                    dest = &rs.addr;
+                } else if (rs.socket->ss_fd != -1) {
+                    sock = rs.socket;
+                }
+                break;
+            }
+        }
+    }
+
+    /* A message of the scenario waits for the connection to be made
+     * again, if it failed; one of our own reports the failure. */
+    rc = sock->write(msg, len, index != -1 ? WS_BUFFER | WS_KEEP : WS_BUFFER, dest);
     if(rc < 0 && errno == EWOULDBLOCK) {
         return rc;
     }
 
-    if(rc < 0) {
+    /* A message of our own (index -1) is sent by code that carries on
+     * with the call, so it stays; sendBuffer() reports the failure. */
+    if(rc < 0 && index != -1) {
         computeStat(CStat::E_CALL_FAILED);
         computeStat(CStat::E_FAILED_CANNOT_SEND_MSG);
         delete this;
@@ -1589,91 +1931,42 @@ void call::sendBuffer(char * msg, int len)
     }
 }
 
-char * call::get_header_field_code(const char *msg, const char * name)
+/* The header of name, "From" or "From:", of the last message received, or
+ * nothing when none was */
+header_value call::get_last_header(std::string_view name)
 {
-    static char code[MAX_HEADER_LEN];
-    const char * last_header;
-    int i;
-
-    last_header = nullptr;
-    i = 0;
-    /* If we find the field in msg */
-    last_header = get_header_content(msg, name);
-    if(last_header) {
-        /* Extract the integer value of the field */
-        while(isspace(*last_header)) last_header++;
-        sscanf(last_header, "%d", &i);
-        sprintf(code, "%s %d", name, i);
+    if (last_recv_msg.empty()) {
+        return header_value();
     }
-    return code;
-}
-
-char * call::get_last_header(const char * name)
-{
-    int len;
-
-    if((!last_recv_msg) || (!strlen(last_recv_msg))) {
-        return nullptr;
-    }
-
-    len = strlen(name);
 
     /* Ideally this check should be moved to the XML parser so that it is not
      * along a critical path.  We could also handle lowercasing there. */
-    if (len > MAX_HEADER_LEN) {
-        ERROR("call::get_last_header: Header to parse bigger than %d (%zu)", MAX_HEADER_LEN, strlen(name));
+    if (name.size() > MAX_HEADER_LEN) {
+        ERROR("call::get_last_header: Header to parse bigger than %d (%zu)", MAX_HEADER_LEN, name.size());
     }
 
-    if (name[len - 1] == ':') {
-        return get_header(last_recv_msg, name, false);
-    } else {
-        char with_colon[MAX_HEADER_LEN+2];
-        snprintf(with_colon, MAX_HEADER_LEN+2, "%s:", name);
-        return get_header(last_recv_msg, with_colon, false);
+    if (!name.empty() && name.back() == ':') {
+        return get_header(last_recv_msg.c_str(), name, false);
     }
+    char with_colon[MAX_HEADER_LEN + 1];
+    memcpy(with_colon, name.data(), name.size());
+    with_colon[name.size()] = ':';
+    return get_header(last_recv_msg.c_str(), std::string_view(with_colon, name.size() + 1), false);
 }
 
 /* Return the last request URI from the To header. On any error returns the
- * empty string.  The caller must free the result. */
-char * call::get_last_request_uri()
+ * empty string. */
+std::string call::get_last_request_uri()
 {
-    char * tmp;
-    char * tmp2;
-    char * last_request_uri;
-    int tmp_len;
-
-    char * last_To = get_last_header("To:");
-    if (!last_To) {
-        return strdup("");
+    const header_value last_To = get_last_header("To:");
+    const std::string_view to = last_To.view();
+    const size_t begin = to.find('<');
+    const size_t end = to.find('>', begin);
+    if (begin == std::string_view::npos || end == std::string_view::npos) {
+        return "";
     }
 
-    tmp = strchr(last_To, '<');
-    if (!tmp) {
-        return strdup("");
-    }
-    tmp++;
-
-    tmp2 = strchr(last_To, '>');
-    if (!tmp2) {
-        return strdup("");
-    }
-
-    tmp_len = strlen(tmp) - strlen(tmp2);
-    if (tmp_len < 0) {
-        return strdup("");
-    }
-
-    if (!(last_request_uri = (char *)malloc(tmp_len + 1))) {
-        ERROR("Cannot allocate!");
-    }
-
-    last_request_uri[0] = '\0';
-    if (tmp_len > 0) {
-        memcpy(last_request_uri, tmp, tmp_len);
-    }
-    last_request_uri[tmp_len] = '\0';
-
-    return last_request_uri;
+    return std::string(to.substr(begin + 1, end - begin - 1));
 }
 
 char * call::send_scene(int index, int *send_status, int *len)
@@ -1692,7 +1985,11 @@ char * call::send_scene(int index, int *send_status, int *len)
         return nullptr;
     }
 
-    assert(call_socket);
+    if (!call_socket) {
+        ERROR("Call '%s' has no socket to send on: a call that a 3PCC command "
+              "creates in a scenario starting with a <recv> needs a remote host",
+              id);
+    }
 
     assert(call_scenario->messages[index]->send_scheme);
 
@@ -1734,16 +2031,21 @@ void call::do_bookkeeping(message *curmsg)
         computeStat(CStat::E_ADD_GENERIC_COUNTER, 1, curmsg->counter - 1);
     }
 
-    /* If this message can be used to compute RTD, do it now */
-    if (curmsg->start_rtd) {
-        start_time_rtd[curmsg->start_rtd - 1] = getmicroseconds();
+    if (curmsg->start_rtd.empty() && curmsg->stop_rtd.empty()) {
+        return;
     }
 
-    if (curmsg->stop_rtd) {
-        int rtd = curmsg->stop_rtd;
+    /* If this message can be used to compute RTD, do it now, at the same
+     * time for all its timers */
+    unsigned long long now = getmicroseconds();
+    for (int rtd : curmsg->start_rtd) {
+        start_time_rtd[rtd - 1] = now;
+    }
+
+    for (int rtd : curmsg->stop_rtd) {
         if (!rtd_done[rtd - 1]) {
             unsigned long long start = start_time_rtd[rtd - 1];
-            unsigned long long end = getmicroseconds();
+            unsigned long long end = now;
 
             if (dumpInRtt) {
                 call_scenario->stats->computeRtt(start, end, rtd);
@@ -1759,14 +2061,60 @@ void call::do_bookkeeping(message *curmsg)
     }
 }
 
-void call::tcpClose()
+/* Its connection failed and was made again, with the calls kept: a
+ * request that the old one took, with no response yet, may have been
+ * lost with it, and goes on the new one (see
+ * SIPpSocket::resume_calls()). */
+void call::tcpReconnected()
 {
+    if (last_send_unanswered) {
+        callDebug("Sending the unanswered request again on a new connection\n");
+        send_raw(last_send_msg.c_str(), last_send_index, last_send_msg.size());
+    }
+}
+
+bool call::tcpClose()
+{
+    /* A call whose next step is its <timewait> is done, even if it has not
+     * run that step yet: the peer closing the connection after the last
+     * message (a client exiting after its final 200, say) ends it
+     * successfully, as it does once the timewait has started. */
+    msgvec *msgs = initCall ? &call_scenario->initmessages : &call_scenario->messages;
+    if (msg_index >= 0 && msg_index < (int)msgs->size() && (*msgs)[msg_index]->timewait) {
+        timewait = true;
+    }
+    bool failed = last_action_result != E_AR_NO_ERROR || !timewait;
     terminate(CStat::E_FAILED_TCP_CLOSED);
+    return failed;
+}
+
+int call::close_twin_calls()
+{
+    /* No call uses the twin connection as its socket, but a call waiting
+     * at a <recvCmd> waits for a command it would have brought: it fails
+     * as a call on a closed TCP connection does. */
+    std::vector<call *> waiting;
+    for (task *t : *get_all_tasks()) {
+        call *c = dynamic_cast<call *>(t);
+        if (c && !c->initCall && c->msg_index >= 0 &&
+                c->msg_index < (int)c->call_scenario->messages.size() &&
+                c->call_scenario->messages[c->msg_index]->M_type == MSG_TYPE_RECVCMD) {
+            waiting.push_back(c);
+        }
+    }
+
+    int failed = 0;
+    for (call *c : waiting) {
+        if (c->tcpClose()) {
+            failed++;
+        }
+    }
+    return failed;
 }
 
 void call::terminate(CStat::E_Action reason)
 {
-    char reason_str[100];
+    const char *dead_reason = nullptr; /* of the dead call to leave */
 
     stopListening();
 
@@ -1777,40 +2125,41 @@ void call::terminate(CStat::E_Action reason)
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_REGEXP_DOESNT_MATCH);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "regexp match failure at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "regexp match failure at index %d";
             }
             break;
         case call::E_AR_REGEXP_SHOULDNT_MATCH:
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_REGEXP_SHOULDNT_MATCH);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "regexp matched, but shouldn't at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "regexp matched, but shouldn't at index %d";
             }
             break;
         case call::E_AR_HDR_NOT_FOUND:
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_REGEXP_HDR_NOT_FOUND);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "regexp header not found at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "regexp header not found at index %d";
             }
             break;
         case E_AR_CONNECT_FAILED:
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_TCP_CONNECT);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "connection failed %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "connection failed %d";
             }
             break;
         case E_AR_RTPECHO_ERROR:
             computeStat(CStat::E_CALL_FAILED);
             setRtpEchoErrors(1);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "rtp echo error %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "rtp echo error %d";
+            }
+            break;
+        case E_AR_VERIFY_FAILED:
+            computeStat(CStat::E_CALL_FAILED);
+            if (deadcall_wait && !initCall) {
+                dead_reason = "exec verify failure at index %d";
             }
             break;
         case call::E_AR_NO_ERROR:
@@ -1821,32 +2170,28 @@ void call::terminate(CStat::E_Action reason)
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_TEST_DOESNT_MATCH);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "test failure at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "test failure at index %d";
             }
             break;
         case call::E_AR_TEST_SHOULDNT_MATCH:
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_TEST_SHOULDNT_MATCH);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "test succeeded, but shouldn't at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "test succeeded, but shouldn't at index %d";
             }
             break;
         case call::E_AR_STRCMP_DOESNT_MATCH:
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_STRCMP_DOESNT_MATCH);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "test failure at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "test failure at index %d";
             }
             break;
         case call::E_AR_STRCMP_SHOULDNT_MATCH:
             computeStat(CStat::E_CALL_FAILED);
             computeStat(CStat::E_FAILED_STRCMP_SHOULDNT_MATCH);
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "test succeeded, but shouldn't at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "test succeeded, but shouldn't at index %d";
             }
             break;
         }
@@ -1854,7 +2199,7 @@ void call::terminate(CStat::E_Action reason)
         if (reason == CStat::E_CALL_SUCCESSFULLY_ENDED || timewait) {
             computeStat(CStat::E_CALL_SUCCESSFULLY_ENDED);
             if (deadcall_wait && !initCall) {
-                new deadcall(id, "successful");
+                dead_reason = "successful";
             }
         } else {
             computeStat(CStat::E_CALL_FAILED);
@@ -1862,12 +2207,25 @@ void call::terminate(CStat::E_Action reason)
                 computeStat(reason);
             }
             if (deadcall_wait && !initCall) {
-                sprintf(reason_str, "failed at index %d", msg_index);
-                new deadcall(id, reason_str);
+                dead_reason = "failed at index %d";
             }
         }
     }
-    delete this;
+
+    if (dead_reason) {
+        /* Made once the call is gone, the dead call takes the place of
+         * what the call freed, as it has the same small allocations */
+        std::string dead_id(id);
+        std::vector<std::string> dead_ids = dialogIds();
+        int dead_index = msg_index;
+        delete this;
+        new deadcall(dead_id.c_str(), dead_reason, dead_index);
+        for (const std::string &dialog_id : dead_ids) {
+            new deadcall(dialog_id.c_str(), dead_reason, dead_index);
+        }
+    } else {
+        delete this;
+    }
 }
 
 bool call::next()
@@ -1895,6 +2253,14 @@ bool call::next()
     msg_index = new_msg_index;
     recv_timeout = 0;
     if (msg_index >= (int)((*msgs).size())) {
+        if (verify_pending) {
+            /* verifyDone() ends the call, which has nothing left to wait
+             * for but the commands. */
+            next_retrans = 0;
+            rtpstream_wait_check = 0;
+            setPaused();
+            return true;
+        }
         terminate(CStat::E_CALL_SUCCESSFULLY_ENDED);
         return false;
     }
@@ -1920,7 +2286,7 @@ bool call::executeMessage(message *curmsg)
             };
         } else {
             int varId = curmsg->pause_variable;
-            pause = (int) M_callVariableTable->getVar(varId)->getDouble();
+            pause = (int) get_var_double(varId);
         }
         if (pause > INT_MAX) {
             pause = INT_MAX;
@@ -1935,7 +2301,9 @@ bool call::executeMessage(message *curmsg)
         /* Increment the number of sessions in pause state */
         curmsg->sessions++;
         do_bookkeeping(curmsg);
-        executeAction(nullptr, curmsg);
+        if (!handleActionResult(executeAction(nullptr, curmsg))) {
+            return false; /* call deleted */
+        }
         callDebug("Pausing call until %d (is now %ld).\n", paused_until, clock_tick);
         setPaused();
         return true;
@@ -1955,16 +2323,16 @@ bool call::executeMessage(message *curmsg)
         next_retrans = 0;
 
         do_bookkeeping(curmsg);
-        executeAction(nullptr, curmsg);
+        if (!handleActionResult(executeAction(nullptr, curmsg))) {
+            return false; /* call deleted */
+        }
         return(next());
     } else if(curmsg -> M_type == MSG_TYPE_NOP) {
         callDebug("Executing NOP at index %d.\n", curmsg->index);
         do_bookkeeping(curmsg);
         actionResult = executeAction(nullptr, curmsg);
-        if (actionResult != call::E_AR_NO_ERROR) {
-            // Store last action result if it is an error
-            // and go on with the scenario
-            call::last_action_result = actionResult;
+        if (!handleActionResult(actionResult)) {
+            return false; /* call deleted */
         }
         if (actionResult == E_AR_RTPECHO_ERROR)
         {
@@ -1990,6 +2358,10 @@ bool call::executeMessage(message *curmsg)
             return true;
         }
 
+        if (dialogs) {
+            switchDialog(msgDialog(curmsg));
+        }
+
         /* Handle counters and RTDs for this message. */
         do_bookkeeping(curmsg);
 
@@ -2007,14 +2379,29 @@ bool call::executeMessage(message *curmsg)
             incr_cseq = 1;
         }
 
+        /* A response in a transaction a received request started: the
+         * [last_*] keywords are of that request. */
+        txnInstanceInfo *answered = nullptr;
+        if (curmsg->response_txn && !transactions[curmsg->response_txn - 1].request.empty()) {
+            answered = &transactions[curmsg->response_txn - 1];
+            std::swap(last_recv_msg, answered->request);
+        }
         msg_snd = send_scene(msg_index, &send_status, &msgLen);
         if (!msg_snd) {
-            /* This will hit connect_if_needed, and if it fails, the
-               entire call is deleted... */
-            ERROR("Call failed, cannot continue safely...");
+            /* The connection failed and connect_socket_if_needed() deleted
+             * the call, so we should no longer access members. */
+            return false;
+        }
+        if (send_status < 0 && errno != EWOULDBLOCK) { /* Send error */
+            /* The call was already deleted by send_raw, so we should no
+             * longer access members. */
+            return false;
+        }
+        if (answered) {
+            std::swap(last_recv_msg, answered->request);
         }
 
-        if(send_status < 0 && errno == EWOULDBLOCK) {
+        if (send_status < 0) {
             if (incr_cseq) --cseq;
             /* Have we set the timeout yet? */
             if (send_timeout) {
@@ -2039,41 +2426,55 @@ bool call::executeMessage(message *curmsg)
                 send_timeout = clock_tick + defl_send_timeout;
             }
             return true; /* No step, nothing done, retry later */
-        } else if(send_status < 0) { /* Send error */
-            /* The call was already deleted by connect_socket_if_needed or send_raw,
-             * so we should no longer access members. */
-            return false;
         }
         /* We have sent the message, so the timeout is no longer needed. */
         send_timeout = 0;
 
+        keepRecvRetransMsg();
         last_send_index = curmsg->index;
-        last_send_len = msgLen;
-        realloc_ptr = (char *) realloc(last_send_msg, msgLen+1);
-        if (realloc_ptr) {
-            last_send_msg = realloc_ptr;
-        } else {
-            free(last_send_msg);
-            ERROR("Out of memory!");
-            return false;
-        }
-        memcpy(last_send_msg, msg_snd, msgLen);
-        last_send_msg[msgLen] = '\0';
+        assign_exact(last_send_msg, msg_snd, msgLen);
+        /* Not one that waits for the connection to be made again: that
+         * sends it (see SIPpSocket::keep()). */
+        last_send_unanswered = !curmsg->send_scheme->isResponse() &&
+                               !curmsg->send_scheme->isAck() &&
+                               call_socket && call_socket->all_written();
 
         if (curmsg->start_txn) {
-            transactions[curmsg->start_txn - 1].txnID = (char *)realloc(transactions[curmsg->start_txn - 1].txnID, MAX_HEADER_LEN);
-            extract_transaction(transactions[curmsg->start_txn - 1].txnID, last_send_msg);
+            char branch[MAX_HEADER_LEN];
+            extract_transaction(branch, sizeof(branch), last_send_msg.c_str());
+            transactions[curmsg->start_txn - 1].txnID = branch;
+            transactions[curmsg->start_txn - 1].dialog = dialogs ? dialogs->current : 1;
+        }
+        if (dialogs && !dialogKnown(dialogs->current)) {
+            /* A Call-ID written without [call_id] */
+            const std::string_view sent_id = get_call_id(last_send_msg.c_str());
+            if (!sent_id.empty()) {
+                setDialogCallId(dialogs->current, sent_id);
+            }
         }
         if (curmsg->ack_txn) {
             transactions[curmsg->ack_txn - 1].ackIndex = curmsg->index;
         }
+        if (answered) {
+            /* A retransmission of the request gets it again */
+            assign_exact(answered->response, msg_snd, msgLen);
+            answered->responseIndex = curmsg->index;
+        }
 
-        if(last_recv_index >= 0) {
+        /* A response to an earlier request than the last received is
+         * not what a retransmission of the last one should get. */
+        if(last_recv_index >= 0 && last_recv_hash &&
+                (!answered || answered->requestHash == last_recv_hash)) {
             /* We are sending just after msg reception. There is a great
              * chance that we will be asked to retransmit this message */
             recv_retrans_hash       = last_recv_hash;
             recv_retrans_recv_index = last_recv_index;
             recv_retrans_send_index = curmsg->index;
+            /* Only UDP retransmissions of the request get it again. */
+            if (transport == T_UDP && retrans_enabled) {
+                release(recv_retrans_msg);
+                recv_retrans_last = true;
+            }
 
             callDebug("Set Retransmission Hash: %lu (recv index %d, send index %d)\n",
                       recv_retrans_hash, recv_retrans_recv_index, recv_retrans_send_index);
@@ -2081,6 +2482,18 @@ bool call::executeMessage(message *curmsg)
             /* Prevent from detecting the cause relation between send and recv
              * in the next valid send */
             last_recv_hash = 0;
+        } else if (last_recv_index >= 0 && recv_retrans_recv_index == last_recv_index &&
+                   call_scenario->messages[last_recv_index]->recv_request && curmsg->send_scheme->isResponse() &&
+                   same_cseq(last_send_msg.c_str(), last_recv_msg.c_str())) {
+            /* A later response to the same request (a 200 after a 180): a
+             * retransmission of the request gets the most recent one. A
+             * response to another request, such as the 200 of an INVITE
+             * sent after the 200 of a PRACK, is not one. */
+            recv_retrans_send_index = curmsg->index;
+            if (transport == T_UDP && retrans_enabled) {
+                release(recv_retrans_msg);
+                recv_retrans_last = true;
+            }
         }
 
         /* Update retransmission information */
@@ -2094,21 +2507,23 @@ bool call::executeMessage(message *curmsg)
             next_retrans = 0;
         }
 
-        executeAction(msg_snd, curmsg);
-
         /* Update scenario statistics */
         curmsg -> nb_sent++;
+
+        if (!handleActionResult(executeAction(msg_snd, curmsg))) {
+            return false; /* call deleted */
+        }
 
         return next();
     } else if (curmsg->M_type == MSG_TYPE_RECV
                || curmsg->M_type == MSG_TYPE_RECVCMD
               ) {
-        if (queued_msg) {
-            char *msg = queued_msg;
-            queued_msg = nullptr;
-            bool ret = process_incoming(msg);
-            free(msg);
-            return ret;
+        if (curmsg->M_type == MSG_TYPE_RECVCMD && !peekCold().queued_cmd.empty()) {
+            std::string cmd = std::exchange(cold_state->queued_cmd, std::string());
+            return process_twinSippCom(cmd.data());
+        } else if (!peekCold().queued_msg.empty()) {
+            std::string msg = std::exchange(cold_state->queued_msg, std::string());
+            return process_incoming(msg.c_str(), nullptr, nullptr, cold_state->queued_sdp_read);
         } else if (recv_timeout) {
             if(recv_timeout > getmilliseconds()) {
                 setPaused();
@@ -2145,10 +2560,10 @@ bool call::executeMessage(message *curmsg)
                 delete this;
                 return false;
             }
-        } else if (curmsg->timeout || defl_recv_timeout) {
-            if (curmsg->timeout)
+        } else if (unsigned int timeout = recvTimeout(curmsg); timeout || defl_recv_timeout) {
+            if (timeout)
                 // If timeout is specified on message receive, use it
-                recv_timeout = getmilliseconds() + curmsg->timeout;
+                recv_timeout = getmilliseconds() + timeout;
             else
                 // Else use the default timeout if specified
                 recv_timeout = getmilliseconds() + defl_recv_timeout;
@@ -2276,6 +2691,11 @@ bool call::run()
     }
 #endif
 
+    if (verify_pending && pastLastMessage()) {
+        setPaused();
+        return true;
+    }
+
     message *curmsg;
     if (initCall) {
         if(msg_index >= (int)call_scenario->initmessages.size()) {
@@ -2306,13 +2726,13 @@ bool call::run()
     if(next_retrans && (next_retrans < clock_tick)) {
         nb_retrans++;
 
-        if ( (0 == strncmp (last_send_msg, "INVITE", 6)) ) {
+        if ((0 == strncmp(last_send_msg.c_str(), "INVITE", 6))) {
             bInviteTransaction = true;
         }
 
         int rtAllowed = std::min(bInviteTransaction ? max_invite_retrans : max_non_invite_retrans, max_udp_retrans);
 
-        callDebug("Retransmisison required (%d retransmissions, max %d)\n", nb_retrans, rtAllowed);
+        callDebug("Retransmission required (%d retransmissions, max %d)\n", nb_retrans, rtAllowed);
 
         if(nb_retrans > rtAllowed) {
             call_scenario->messages[last_send_index] -> nb_timeout ++;
@@ -2356,7 +2776,7 @@ bool call::run()
                     nb_last_delay = global_t2;
                 }
             }
-            if(send_raw(last_send_msg, last_send_index, last_send_len) < -1) {
+            if (send_raw(last_send_msg.c_str(), last_send_index, last_send_msg.size()) < 0) {
                 return false;
             }
             call_scenario->messages[last_send_index] -> nb_sent_retrans++;
@@ -2378,6 +2798,28 @@ bool call::run()
         paused_until = 0;
         return next();
     }
+
+    if (rtpstream_wait_check) {
+        /* Hold the next message until the rtp_stream playback is over */
+        unsigned long play_end = rtpstream_play_end(&rtpstream_callinfo);
+        if (!play_end) {
+            callDebug("rtp_stream playback over, waking up.\n");
+            rtpstream_wait_check = 0;
+        } else if (rtpstream_wait_until && rtpstream_wait_until <= clock_tick) {
+            return rtpstreamWaitTimeout();
+        } else {
+            rtpstreamWaitNextCheck(play_end);
+            setPaused();
+            return true;
+        }
+    }
+
+    if (verify_pending) {
+        /* Hold the next message until verifyDone() wakes the call */
+        callDebug("Waiting for %d exec verify commands.\n", verify_pending);
+        setPaused();
+        return true;
+    }
     return executeMessage(curmsg);
 }
 
@@ -2389,7 +2831,7 @@ const char *default_message_names[] = {
     "cancel",
     "200",
 };
-const char *default_message_strings[] = {
+std::string default_message_strings[] = {
     /* 3pcc_abort */
     "call-id: [call_id]\ninternal-cmd: abort_call\n\n",
     /* ack */
@@ -2443,8 +2885,7 @@ const char *default_message_strings[] = {
     "[last_Call-ID:]\n"
     "[last_CSeq:]\n"
     "Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "Content-Length: 0\n\n"
-};
+    "Content-Length: 0\n\n"};
 
 SendingMessage **default_messages;
 
@@ -2453,7 +2894,7 @@ void init_default_messages()
     int messages = sizeof(default_message_strings)/sizeof(default_message_strings[0]);
     default_messages = new SendingMessage* [messages];
     for (int i = 0; i < messages; i++) {
-        default_messages[i] = new SendingMessage(main_scenario, const_cast<char*>(default_message_strings[i]));
+        default_messages[i] = new SendingMessage(main_scenario, default_message_strings[i].c_str());
     }
 }
 
@@ -2480,12 +2921,12 @@ SendingMessage *get_default_message(const char *which)
     ERROR("Internal Error: Unknown default message: %s!", which);
 }
 
-void set_default_message(const char *which, char *msg)
+void set_default_message(const char *which, std::string msg)
 {
     int messages = sizeof(default_message_names)/sizeof(default_message_names[0]);
     for (int i = 0; i < messages; i++) {
         if (!strcmp(which, default_message_names[i])) {
-            default_message_strings[i] = msg;
+            default_message_strings[i] = std::move(msg);
             return;
         }
     }
@@ -2510,9 +2951,9 @@ bool call::process_unexpected(const char* msg)
 
     if (curmsg -> M_type == MSG_TYPE_RECV) {
         if (curmsg -> recv_request) {
-            sb << "while expecting '" << curmsg -> recv_request << "' ";
+            sb << "while expecting '" << *curmsg->recv_request << "' ";
         } else {
-            sb << "while expecting '" << curmsg -> recv_response << "' ";
+            sb << "while expecting '" << curmsg->recv_response.value_or("") << "' ";
         }
     } else if (curmsg -> M_type == MSG_TYPE_SEND) {
         sb << "while sending ";
@@ -2552,16 +2993,7 @@ bool call::process_unexpected(const char* msg)
         }
 
         // usage of last_ keywords => for call aborting
-        realloc_ptr = (char *) realloc(last_recv_msg, strlen(msg) + 1);
-        if (realloc_ptr) {
-            last_recv_msg = realloc_ptr;
-        } else {
-            free(last_recv_msg);
-            ERROR("Out of memory!");
-            return false;
-        }
-
-        strcpy(last_recv_msg, msg);
+        assign_exact(last_recv_msg, msg);
 
         computeStat(CStat::E_CALL_FAILED);
         computeStat(CStat::E_FAILED_UNEXPECTED_MSG);
@@ -2584,28 +3016,41 @@ void call::abort()
     abortCall(false);
 }
 
+/* Does this call send the request that creates its dialog? Only then does
+ * an abort end the dialog. It is the call's and not the process's role: a
+ * 3PCC controller B takes commands like a server, but sends the INVITE. */
+bool call::createsDialog()
+{
+    for (message *m : call_scenario->messages) {
+        if (m->M_type == MSG_TYPE_RECV) {
+            return false;
+        } else if (m->send_scheme) {
+            return !m->send_scheme->isResponse();
+        }
+    }
+    return false;
+}
+
 bool call::abortCall(bool writeLog)
 {
     int is_inv;
-
-    char * src_recv = nullptr ;
+    bool sent_bye = false, sent_cancel = false;
 
     callDebug("Aborting call %s (index %d).\n", id, msg_index);
 
-    if (last_send_msg != nullptr) {
-        is_inv = !strncmp(last_send_msg, "INVITE", 6);
-    } else {
-        is_inv = false;
-    }
-    if ((creationMode != MODE_SERVER) && (msg_index > 0)) {
-        if ((call_established == false) && (is_inv)) {
-            src_recv = last_recv_msg ;
+    is_inv = !strncmp(last_send_msg.c_str(), "INVITE", 6);
+    /* The BYE starts a transaction of its own: its [branch] is that of an
+     * index no step has, not that of the step before it, which would be
+     * the ACK's after a 2xx. */
+    int byeIndex = call_scenario->messages.size();
 
+    if (createsDialog() && (msg_index > 0)) {
+        if ((call_established == false) && (is_inv)) {
             // Answer unexpected errors (4XX, 5XX and beyond) with an ACK
             // Contributed by F. Tarek Rogers
-            if((src_recv) && (get_reply_code(src_recv) >= 400)) {
+            if (!last_recv_msg.empty() && (get_reply_code(last_recv_msg.c_str()) >= 400)) {
                 sendBuffer(createSendingMessage(get_default_message("ack")));
-            } else if (src_recv) {
+            } else if (!last_recv_msg.empty()) {
                 /* Call is not established and the reply is not a 4XX, 5XX */
                 /* And we already received a message. */
                 if (ack_is_pending == true) {
@@ -2615,10 +3060,12 @@ bool call::abortCall(bool writeLog)
                     sendBuffer(createSendingMessage(get_default_message("ack")));
 
                     /* Send the BYE */
-                    sendBuffer(createSendingMessage(get_default_message("bye")));
+                    sendBuffer(createSendingMessage(get_default_message("bye"), byeIndex));
+                    sent_bye = true;
                 } else {
                     /* Send a CANCEL */
                     sendBuffer(createSendingMessage(get_default_message("cancel")));
+                    sent_cancel = true;
                 }
             } else {
                 /* Call is not established and the reply is not a 4XX, 5XX */
@@ -2627,28 +3074,39 @@ bool call::abortCall(bool writeLog)
                 /* any answer. */
                 /* Do nothing ! */
             }
-        } else if (last_recv_msg) {
+        } else if (!last_recv_msg.empty()) {
             /* The call may not be established, if we haven't yet received a message,
              * because the earlier check depends on the first message being an INVITE
              * (although it could be something like a message message, therefore we
              * check that we received a message. */
-            sendBuffer(createSendingMessage(get_default_message("bye")));
+            /* The peer's own request has its From and To the other way
+             * round from ours, and a CSeq of the peer's. */
+            bye_after_peer_request = !get_reply_code(last_recv_msg.c_str());
+            sendBuffer(createSendingMessage(get_default_message("bye"), byeIndex));
+            sent_bye = true;
         }
     }
 
     if (writeLog && useCallDebugf) {
         TRACE_CALLDEBUG ("-------------------------------------------------------------------------------\n");
         TRACE_CALLDEBUG ("Call debugging information for call %s:\n", id);
-        TRACE_CALLDEBUG("%s", debugBuffer);
+        TRACE_CALLDEBUG("%s", peekCold().debugBuffer.c_str());
     }
 
     stopListening();
     if (deadcall_wait && !initCall) {
-        char reason[100];
-        sprintf(reason, "aborted at index %d", msg_index);
-        new deadcall(id, reason);
+        /* made once the call is gone, as in terminate() */
+        std::string dead_id(id);
+        std::vector<std::string> dead_ids = dialogIds();
+        int dead_index = msg_index;
+        delete this;
+        new deadcall(dead_id.c_str(), "aborted at index %d", dead_index, sent_bye, sent_cancel);
+        for (const std::string &dialog_id : dead_ids) {
+            new deadcall(dialog_id.c_str(), "aborted at index %d", dead_index, sent_bye, sent_cancel);
+        }
+    } else {
+        delete this;
     }
-    delete this;
 
     return false;
 }
@@ -2670,7 +3128,6 @@ int call::sendCmdMessage(message *curmsg)
     delimitor[1]=0;
 
     /* 3pcc extended mode */
-    char * peer_dest;
     SIPpSocket **peer_socket;
 
     if(curmsg -> M_sendCmdData) {
@@ -2682,12 +3139,16 @@ int call::sendCmdMessage(message *curmsg)
         int rc;
 
         /* 3pcc extended mode */
-        peer_dest = curmsg->peer_dest;
-        if(peer_dest) {
-            peer_socket = get_peer_socket(peer_dest);
+        if (!curmsg->peer_dest.empty()) {
+            peer_socket = get_peer_socket(curmsg->peer_dest.c_str());
             rc = (*peer_socket)->write(dest, strlen(dest), WS_BUFFER, &call_peer);
-        } else {
+        } else if (twinSippSocket) {
             rc = twinSippSocket->write(dest, strlen(dest), WS_BUFFER, &call_peer);
+        } else {
+            /* Controller B until A connects again, or A once B ended. */
+            WARNING("Unable to send TCP message: %s", strerror(ENOTCONN));
+            nb_net_send_errors++;
+            rc = -1;
         }
         if(rc <  0) {
             computeStat(CStat::E_CALL_FAILED);
@@ -2730,17 +3191,42 @@ int call::sendCmdBuffer(char* cmd)
 char* call::createSendingMessage(SendingMessage *src, int P_index, int *msgLen)
 {
     static char msg_buffer[SIPP_MAX_MSG_SIZE+2];
-    return createSendingMessage(src, P_index, msg_buffer, sizeof(msg_buffer), msgLen);
+    /* Keep one byte spare: sendCmdMessage() and sendCmdBuffer() strcat() a
+     * one-character delimiter onto the rendered message. */
+    return createSendingMessage(src, P_index, msg_buffer, sizeof(msg_buffer) - 1, msgLen);
 }
 
 char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buffer, int buf_len, int *msgLen)
 {
-    char * length_marker = nullptr;
-    char * auth_marker = nullptr;
+    /* Room for most messages, rather than growing it a piece at a time */
+    const std::string out = buildSendingMessage(src, P_index, msg_buffer, buf_len, 2048);
+    memcpy(msg_buffer, out.c_str(), out.size() + 1);
+    if (msgLen) {
+        *msgLen = out.size();
+    }
+    return msg_buffer;
+}
+
+std::string call::createSendingString(SendingMessage *src, int P_index)
+{
+    /* Not the buffer createSendingMessage() returns, which holds the
+     * message sent while its actions run. */
+    static char scratch[SIPP_MAX_MSG_SIZE + 1];
+    return buildSendingMessage(src, P_index, scratch, sizeof(scratch), 0);
+}
+
+/* The message, cut to buf_len - 1 bytes. The keywords that fill a char
+ * buffer use scratch, of buf_len bytes. */
+std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *scratch, int buf_len, size_t reserve)
+{
+    const size_t max_len = buf_len - 1;
+    std::string out;
+    out.reserve(std::min(max_len, reserve));
+    size_t length_marker = std::string::npos;
+    size_t auth_marker = std::string::npos;
     MessageComponent *auth_comp = nullptr;
     bool auth_comp_allocated = false;
     int    len_offset = 0;
-    char *dest = msg_buffer;
     bool suppresscrlf = false;
 
 #ifdef USE_IPSEC
@@ -2763,45 +3249,21 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
     SrtpInfoParams pA;
     SrtpInfoParams pV;
 
-    pA.found = false;
-    pA.primary_cryptotag = 0;
-    *pA.primary_cryptosuite = 0;
-    *pA.primary_cryptokeyparams = 0;
-    pA.secondary_cryptotag = 0;
-    *pA.secondary_cryptosuite = 0;
-    *pA.secondary_cryptokeyparams = 0;
-    pA.primary_unencrypted_srtp = false;
-    pA.secondary_unencrypted_srtp = false;
-
-    pV.found = false;
-    pV.primary_cryptotag = 0;
-    *pV.primary_cryptosuite = 0;
-    *pV.primary_cryptokeyparams = 0;
-    pV.secondary_cryptotag = 0;
-    *pV.secondary_cryptosuite = 0;
-    *pV.secondary_cryptokeyparams = 0;
-    pV.primary_unencrypted_srtp = false;
-    pV.secondary_unencrypted_srtp = false;
-
-    msg_buffer[0] = '\0';
-
-    for (int i = 0; i < src->numComponents(); i++) {
+    /* Set wherever a keyword is cut short to fit; the size check after the
+     * loop catches the rest. */
+    bool truncated = false;
+    int i = 0;
+    for (; i < src->numComponents() && out.size() < max_len; i++) {
         MessageComponent *comp = src->getComponent(i);
-        int left = buf_len - (dest - msg_buffer);
-        if (left <= 0) {
-            break;
-        }
         switch(comp->type) {
         case E_Message_Literal:
             if (suppresscrlf) {
-                char *ptr = comp->literal;
+                const char *ptr = comp->literal.c_str();
                 while (isspace(*ptr)) ptr++;
-                dest += snprintf(dest, left, "%s", ptr);
+                out += ptr;
                 suppresscrlf = false;
             } else {
-                memcpy(dest, comp->literal, comp->literalLen);
-                dest += comp->literalLen;
-                *dest = '\0';
+                out += comp->literal;
             }
             break;
         case E_Message_Remote_IP:
@@ -2809,46 +3271,45 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             if (tunnel_pcscf()) {
                 /* An IPv6 address goes into SIP in brackets (RFC 3261 §25.1) */
                 bool v6 = strchr(tunnel_pcscf(), ':') != nullptr;
-                dest += snprintf(dest, left, v6 ? "[%s]" : "%s", tunnel_pcscf());
+                out += v6 ? "[" : "";
+                out += tunnel_pcscf();
+                out += v6 ? "]" : "";
                 break;
             }
 #endif
-            dest += snprintf(dest, left, "%s", remote_ip_w_brackets);
+            out += remote ? remote->ip_w_brackets : remote_ip_w_brackets;
             break;
         case E_Message_Remote_Host:
-            dest += snprintf(dest, left, "%s", remote_host);
+            out += remote_host;
             break;
         case E_Message_Remote_Port:
 #ifdef USE_IPSEC
             if (ipsec_params.state >= IPSEC_STATE_ACTIVE && ipsec_params.port_ps != 0) {
-                dest += snprintf(dest, left, "%d", ipsec_params.port_ps + comp->offset);
-            } else {
-                if (ipsec_enabled && num_port_fixups < MAX_PORT_FIXUPS) {
-                    port_fixups[num_port_fixups].offset = dest - msg_buffer;
-                    port_fixups[num_port_fixups].is_local = false;
-                }
-                int written = snprintf(dest, left, "%d", remote_port + comp->offset);
-                if (ipsec_enabled && num_port_fixups < MAX_PORT_FIXUPS) {
-                    port_fixups[num_port_fixups].len = written;
-                    num_port_fixups++;
-                }
-                dest += written;
+                append_number(out, ipsec_params.port_ps + comp->offset);
+                break;
             }
-#else
-            {
-                dest += snprintf(dest, left, "%d", remote_port + comp->offset);
+            if (ipsec_enabled && num_port_fixups < MAX_PORT_FIXUPS) {
+                port_fixups[num_port_fixups].offset = out.size();
+                port_fixups[num_port_fixups].is_local = false;
+                append_number(out, remote_port + comp->offset);
+                port_fixups[num_port_fixups].len = out.size() - port_fixups[num_port_fixups].offset;
+                num_port_fixups++;
+                break;
             }
 #endif
+            append_number(out, remote_port + comp->offset);
             break;
         case E_Message_Local_IP:
 #ifdef USE_IPSEC
             if (tunnel_ip()) {
                 bool v6 = strchr(tunnel_ip(), ':') != nullptr;
-                dest += snprintf(dest, left, v6 ? "[%s]" : "%s", tunnel_ip());
+                out += v6 ? "[" : "";
+                out += tunnel_ip();
+                out += v6 ? "]" : "";
                 break;
             }
 #endif
-            dest += snprintf(dest, left, "%s", local_ip_w_brackets);
+            out += local_ip_w_brackets;
             break;
         case E_Message_Local_Port: {
             int port;
@@ -2865,32 +3326,28 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
 #ifdef USE_IPSEC
             if (ipsec_enabled && ipsec_params.state < IPSEC_STATE_ACTIVE
                     && num_port_fixups < MAX_PORT_FIXUPS) {
-                port_fixups[num_port_fixups].offset = dest - msg_buffer;
+                port_fixups[num_port_fixups].offset = out.size();
                 port_fixups[num_port_fixups].is_local = true;
-            }
-#endif
-            int written = snprintf(dest, left, "%d", port + comp->offset);
-#ifdef USE_IPSEC
-            if (ipsec_enabled && ipsec_params.state < IPSEC_STATE_ACTIVE
-                    && num_port_fixups < MAX_PORT_FIXUPS) {
-                port_fixups[num_port_fixups].len = written;
+                append_number(out, port + comp->offset);
+                port_fixups[num_port_fixups].len = out.size() - port_fixups[num_port_fixups].offset;
                 num_port_fixups++;
+                break;
             }
 #endif
-            dest += written;
+            append_number(out, port + comp->offset);
             break;
         }
         case E_Message_Transport:
-            dest += snprintf(dest, left, "%s", TRANSPORT_TO_STRING(transport));
+            out += TRANSPORT_TO_STRING(transport);
             break;
         case E_Message_Local_IP_Type:
 #ifdef USE_IPSEC
             if (tunnel_ip()) {
-                dest += snprintf(dest, left, strchr(tunnel_ip(), ':') ? "6" : "4");
+                out += (strchr(tunnel_ip(), ':') ? "6" : "4");
                 break;
             }
 #endif
-            dest += snprintf(dest, left, "%s", (local_ip_is_ipv6 ? "6" : "4"));
+            out += (local_ip_is_ipv6 ? "6" : "4");
             break;
         case E_Message_Server_IP: {
             /* We should do this conversion once per socket creation, rather than
@@ -2898,60 +3355,62 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             struct sockaddr_storage server_sockaddr;
 
             sipp_socklen_t len = sizeof(server_sockaddr);
-            getsockname(call_socket->ss_fd,
-                        (sockaddr *)(void *)&server_sockaddr, &len);
-
-            char address[INET6_ADDRSTRLEN];
-            if (getnameinfo(_RCAST(sockaddr*, &server_sockaddr), len, address, sizeof(address),
-                            nullptr, 0, NI_NUMERICHOST) < 0) {
-                ERROR_NO("Unable to get socket name information");
+            if (getsockname(call_socket->ss_fd,
+                            (sockaddr *)(void *)&server_sockaddr, &len) < 0) {
+                ERROR_NO("Unable to get the socket name");
             }
 
-            dest += snprintf(dest, left, "%s", address);
+            char address[INET6_ADDRSTRLEN];
+            if (int err = getnameinfo(_RCAST(sockaddr*, &server_sockaddr), len, address, sizeof(address),
+                                      nullptr, 0, NI_NUMERICHOST)) {
+                ERROR("Unable to get socket name information: %s", gai_strerror(err));
+            }
+
+            out += address;
         }
         break;
 #ifdef USE_S8
         case E_Message_S8_Cause:
-            dest += snprintf(dest, left, "%d", s8_result.cause);
+            append_number(out, s8_result.cause);
             break;
         case E_Message_S8_PGW_C_IP:
-            dest += snprintf(dest, left, "%s", s8_result.pgw_c_ip.c_str());
+            out += s8_result.pgw_c_ip.c_str();
             break;
         case E_Message_S8_PGW_C_TEID:
-            dest += snprintf(dest, left, "%u", s8_result.pgw_c_teid);
+            append_number(out, s8_result.pgw_c_teid);
             break;
         case E_Message_S8_PGW_U_IP:
-            dest += snprintf(dest, left, "%s", s8_result.pgw_u_ip.c_str());
+            out += s8_result.pgw_u_ip.c_str();
             break;
         case E_Message_S8_PGW_U_TEID:
-            dest += snprintf(dest, left, "%u", s8_result.pgw_u_teid);
+            append_number(out, s8_result.pgw_u_teid);
             break;
         case E_Message_S8_UE_IP:
-            dest += snprintf(dest, left, "%s", s8_result.ue_ip.c_str());
+            out += s8_result.ue_ip.c_str();
             break;
         case E_Message_S8_UE_IP6:
-            dest += snprintf(dest, left, "%s", s8_result.ue_ip6.c_str());
+            out += s8_result.ue_ip6.c_str();
             break;
         case E_Message_S6A_Result:
-            dest += snprintf(dest, left, "%d", s6a_result);
+            append_number(out, s6a_result);
             break;
         case E_Message_S6A_MSISDN:
-            dest += snprintf(dest, left, "%s", s6a_sub.msisdn.c_str());
+            out += s6a_sub.msisdn.c_str();
             break;
         case E_Message_S6A_QCI:
-            dest += snprintf(dest, left, "%d", s6a_sub.qci);
+            append_number(out, s6a_sub.qci);
             break;
         case E_Message_S6A_ARP:
-            dest += snprintf(dest, left, "%d", s6a_sub.arp);
+            append_number(out, s6a_sub.arp);
             break;
         case E_Message_S6A_APN_AMBR_UL:
-            dest += snprintf(dest, left, "%u", s6a_sub.apn_ambr_ul);
+            append_number(out, s6a_sub.apn_ambr_ul);
             break;
         case E_Message_S6A_APN_AMBR_DL:
-            dest += snprintf(dest, left, "%u", s6a_sub.apn_ambr_dl);
+            append_number(out, s6a_sub.apn_ambr_dl);
             break;
         case E_Message_S6A_PDN_Type:
-            dest += snprintf(dest, left, "%d", s6a_sub.pdn_type);
+            append_number(out, s6a_sub.pdn_type);
             break;
 #else
         case E_Message_S8_Cause:
@@ -2974,11 +3433,11 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         case E_Message_Media_IP:
 #ifdef USE_IPSEC
             if (tunnel_ip()) {
-                dest += snprintf(dest, left, "%s", tunnel_ip());
+                out += tunnel_ip();
                 break;
             }
 #endif
-            dest += snprintf(dest, left, "%s", media_ip);
+            out += media_ip;
             break;
         case E_Message_Auto_Media_Port:
         case E_Message_Media_Port: {
@@ -2987,23 +3446,26 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
                 port += (4 * (number - 1)) % 10000;
             }
 #ifdef PCAPPLAY
-            char *begin = dest;
-            while (begin > msg_buffer) {
-                if (*begin == '\n') {
-                    break;
-                }
-                begin--;
-            }
-            if (begin == msg_buffer) {
-                ERROR("Can not find beginning of a line for the media port!");
-            }
+            // Outside a message, e.g. in a <log>, the text is one line.
+            const size_t line_start = out.rfind('\n');
+            const char *begin = out.c_str() +
+                (line_start == std::string::npos ? 0 : line_start);
             play_args_t* play_args = nullptr;
-            if (strstr(begin, "audio")) {
-                play_args = &play_args_a;
+            rtpstream_pcap_t stream = RTPSTREAM_PCAP_AUDIO;
+            if (!hasMedia || !pcap_plays) {
+                /* The port of a pcap play, which a scenario without media
+                 * or pcap plays has none of */
+            } else if (strstr(begin, "audio")) {
+                play_args = &playArgs(RTPSTREAM_PCAP_AUDIO);
             } else if (strstr(begin, "image")) {
-                play_args = &play_args_i;
+                play_args = &playArgs(RTPSTREAM_PCAP_IMAGE);
+                stream = RTPSTREAM_PCAP_IMAGE;
             } else if (strstr(begin, "video")) {
-                play_args = &play_args_v;
+                play_args = &playArgs(RTPSTREAM_PCAP_VIDEO);
+                stream = RTPSTREAM_PCAP_VIDEO;
+            } else if (strstr(begin, "m=text")) {
+                play_args = &playArgs(RTPSTREAM_PCAP_TEXT);
+                stream = RTPSTREAM_PCAP_TEXT;
             } else {
                 // This check will not do, as we use the media_port in other places too.
                 //ERROR("media_port keyword with no audio or video on the current line (%s)", begin);
@@ -3014,9 +3476,10 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
                 } else {
                     (_RCAST(struct sockaddr_in *, &(play_args->from)))->sin_port = htons(port);
                 }
+                rtpstream_update_pcap(&rtpstream_callinfo, stream, play_args);
             }
 #endif
-            dest += snprintf(dest, left, "%u", port);
+            append_number(out, port);
             break;
         }
         case E_Message_RTPStream_Audio_Port:
@@ -3033,7 +3496,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
               temp_audio_port = rtpstream_callinfo.local_audioport + comp->offset;
           }
           logSrtpInfo("call::createSendingMessage():  E_Message_RTPStream_Audio_Port: %d\n", temp_audio_port);
-          dest += snprintf(dest, left, "%d", temp_audio_port);
+          append_number(out, temp_audio_port);
         }
         break;
         case E_Message_RTPStream_Video_Port:
@@ -3050,1099 +3513,96 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
               temp_video_port = rtpstream_callinfo.local_videoport + comp->offset;
           }
           logSrtpInfo("call::createSendingMessage():  E_Message_RTPStream_Video_Port: %d\n", temp_video_port);
-          dest += snprintf(dest, left, "%d", temp_video_port);
-        }
-        break;
-        case E_Message_CryptoTag1Audio:
-        {
-            pA.found = true;
-            pA.primary_cryptotag = 1;
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag1Audio() - PRIMARY - CLIENT: %d\n", pA.primary_cryptotag);
-                _txUACAudio.setCryptoTag(pA.primary_cryptotag, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag1Audio() - PRIMARY - SERVER: %d\n", pA.primary_cryptotag);
-                _txUASAudio.setCryptoTag(pA.primary_cryptotag, PRIMARY_CRYPTO);
-            }
-            dest += snprintf(dest, left, "%d", pA.primary_cryptotag);
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoTag2Audio:
-        {
-            pA.found = true;
-            pA.secondary_cryptotag = 2;
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag2Audio() - SECONDARY - CLIENT: %d\n", pA.secondary_cryptotag);
-                _txUACAudio.setCryptoTag(pA.secondary_cryptotag, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag2Audio() - SECONDARY - SERVER: %d\n", pA.secondary_cryptotag);
-                _txUASAudio.setCryptoTag(pA.secondary_cryptotag, SECONDARY_CRYPTO);
-            }
-            dest += snprintf(dest, left, "%d", pA.secondary_cryptotag);
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1801Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1801Audio() - PRIMARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1801Audio() - PRIMARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_audio_cs_out, "AES_CM_128_HMAC_SHA1_80");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACAudio.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_80", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACAudio.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASAudio.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_80", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASAudio.swapCrypto();
-                    }
-                }
-            }
-
-            pA.found = true;
-            strcpy(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_80");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1802Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1802Audio() - SECONDARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1802Audio() - SECONDARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            pA.found = true;
-            strcpy(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_80");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1321Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1321Audio() - PRIMARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1321Audio() - PRIMARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_audio_cs_out, "AES_CM_128_HMAC_SHA1_32");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACAudio.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_32", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACAudio.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASAudio.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_32", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASAudio.swapCrypto();
-                    }
-                }
-            }
-
-            pA.found = true;
-            strcpy(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_32");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1322Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1322Audio() - SECONDARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1322Audio() - SECONDARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            pA.found = true;
-            strcpy(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_32");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1801Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1801Audio() - PRIMARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1801Audio() - PRIMARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_audio_cs_out, "NULL_HMAC_SHA1_80");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACAudio.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_80", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACAudio.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASAudio.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_80", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASAudio.swapCrypto();
-                    }
-                }
-            }
-
-            pA.found = true;
-            strcpy(pA.primary_cryptosuite, "NULL_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_80");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1802Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1802Audio() - SECONDARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1802Audio() - SECONDARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            pA.found = true;
-            strcpy(pA.secondary_cryptosuite, "NULL_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_80");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1321Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1321Audio() - PRIMARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1321Audio() - PRIMARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_audio_cs_out, "NULL_HMAC_SHA1_32");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACAudio.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_32", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACAudio.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASAudio.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_32", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASAudio.swapCrypto();
-                    }
-                }
-            }
-
-            pA.found = true;
-            strcpy(pA.primary_cryptosuite, "NULL_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_32");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1322Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1322Audio() - SECONDARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1322Audio() - SECONDARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            pA.found = true;
-            strcpy(pA.secondary_cryptosuite, "NULL_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_32");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoKeyParams1Audio:
-        {
-            std::string mks;
-
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Audio() - PRIMARY - CLIENT - component offset:%d\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUACAudio.generateMasterKey(PRIMARY_CRYPTO);
-                    _txUACAudio.generateMasterSalt(PRIMARY_CRYPTO);
-                    _txUACAudio.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Audio() - PRIMARY - CLIENT - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUACAudio.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Audio() - PRIMARY - CLIENT - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Audio() - PRIMARY - SERVER - component offset:%d\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUASAudio.generateMasterKey(PRIMARY_CRYPTO);
-                    _txUASAudio.generateMasterSalt(PRIMARY_CRYPTO);
-                    _txUASAudio.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Audio() - PRIMARY - SERVER - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUASAudio.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Audio() - PRIMARY - SERVER - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            pA.found = true;
-            memcpy(pA.primary_cryptokeyparams, mks.c_str(), 40);
-            pA.primary_cryptokeyparams[40] = '\0';
-            dest += snprintf(dest, left, "%s", pA.primary_cryptokeyparams);
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoKeyParams2Audio:
-        {
-            std::string mks;
-
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Audio() - SECONDARY - CLIENT - component offset:%d\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUACAudio.generateMasterKey(SECONDARY_CRYPTO);
-                    _txUACAudio.generateMasterSalt(SECONDARY_CRYPTO);
-                    _txUACAudio.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Audio() - SECONDARY - CLIENT - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUACAudio.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Audio() - SECONDARY - CLIENT - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Audio() - SECONDARY - SERVER - component offset:%d\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUASAudio.generateMasterKey(SECONDARY_CRYPTO);
-                    _txUASAudio.generateMasterSalt(SECONDARY_CRYPTO);
-                    _txUASAudio.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Audio() - SECONDARY - SERVER - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUASAudio.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Audio() - SECONDARY - SERVER - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            pA.found = true;
-            memcpy(pA.secondary_cryptokeyparams, mks.c_str(), 40);
-            pA.secondary_cryptokeyparams[40] = '\0';
-            dest += snprintf(dest, left, "%s", pA.secondary_cryptokeyparams);
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1801Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1801Audio() - PRIMARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1801Audio() - PRIMARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            pA.found = true;
-            pA.primary_unencrypted_srtp = true;
-            strcpy(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1802Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1802Audio() - SECONDARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1802Audio() - SECONDARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            pA.found = true;
-            pA.secondary_unencrypted_srtp = true;
-            strcpy(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1321Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1321Audio() - PRIMARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1321Audio() - PRIMARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            pA.found = true;
-            pA.primary_unencrypted_srtp = true;
-            strcpy(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1322Audio:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1322Audio() - SECONDARY - CLIENT\n");
-                _txUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1322Audio() - SECONDARY - SERVER\n");
-                _txUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            pA.found = true;
-            pA.secondary_unencrypted_srtp = true;
-            strcpy(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_audio_updated = true;
-        }
-        break;
-        case E_Message_CryptoTag1Video:
-        {
-            pV.found = true;
-            pV.primary_cryptotag = 1;
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag1Video() - PRIMARY - CLIENT: %d\n", pV.primary_cryptotag);
-                _txUACVideo.setCryptoTag(pV.primary_cryptotag, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag1Video() - PRIMARY - SERVER: %d\n", pV.primary_cryptotag);
-                _txUASVideo.setCryptoTag(pV.primary_cryptotag, PRIMARY_CRYPTO);
-            }
-            dest += snprintf(dest, left, "%d", pV.primary_cryptotag);
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoTag2Video:
-        {
-            pV.found = true;
-            pV.secondary_cryptotag = 2;
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag2Video() - SECONDARY - CLIENT: %d\n", pV.secondary_cryptotag);
-                _txUACVideo.setCryptoTag(pV.secondary_cryptotag, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoTag2Video() - SECONDARY - SERVER: %d\n", pV.secondary_cryptotag);
-                _txUASVideo.setCryptoTag(pV.secondary_cryptotag, SECONDARY_CRYPTO);
-            }
-            dest += snprintf(dest, left, "%d", pV.secondary_cryptotag);
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1801Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1801Video() - PRIMARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1801Video() - PRIMARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_video_cs_out, "AES_CM_128_HMAC_SHA1_80");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACVideo.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_80", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACVideo.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASVideo.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_80", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASVideo.swapCrypto();
-                    }
-                }
-            }
-
-            pV.found = true;
-            strcpy(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_80");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1802Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1802Video() - SECONDARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1802Video() - SECONDARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            pV.found = true;
-            strcpy(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_80");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1321Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1321Video() - PRIMARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1321Video() - PRIMARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_video_cs_out, "AES_CM_128_HMAC_SHA1_32");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACVideo.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_32", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACVideo.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASVideo.getCryptoSuite().c_str(), "AES_CM_128_HMAC_SHA1_32", 23))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASVideo.swapCrypto();
-                    }
-                }
-            }
-
-            pV.found = true;
-            strcpy(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_32");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteAesCm128Sha1322Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1322Video() - SECONDARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteAesCm128Sha1322Video() - SECONDARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            pV.found = true;
-            strcpy(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "AES_CM_128_HMAC_SHA1_32");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1801Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1801Video() - PRIMARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1801Video() - PRIMARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_video_cs_out, "NULL_HMAC_SHA1_80");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACVideo.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_80", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACVideo.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASVideo.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_80", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASVideo.swapCrypto();
-                    }
-                }
-            }
-
-            pV.found = true;
-            strcpy(pV.primary_cryptosuite, "NULL_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_80");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1802Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1802Video() - SECONDARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1802Video() - SECONDARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            pV.found = true;
-            strcpy(pV.secondary_cryptosuite, "NULL_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_80");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1321Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1321Video() - PRIMARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1321Video() - PRIMARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-
-            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted))
-            {
-                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
-                strcpy(_pref_video_cs_out, "NULL_HMAC_SHA1_32");
-            }
-            else if (getSessionStateCurrent() == eOfferReceived)
-            {
-                if (sendMode == MODE_CLIENT)
-                {
-                    if (!strncmp(_rxUACVideo.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_32", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- CLIENT -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- CLIENT -- SWAPPING...\n");
-                        _rxUACVideo.swapCrypto();
-                    }
-                }
-                else if (sendMode == MODE_SERVER)
-                {
-                    if (!strncmp(_rxUASVideo.getCryptoSuite().c_str(), "NULL_HMAC_SHA1_32", 17))
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite match -- SERVER -- NO-OP...\n");
-                    }
-                    else
-                    {
-                        logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SERVER -- SWAPPING...\n");
-                        _rxUASVideo.swapCrypto();
-                    }
-                }
-            }
-
-            pV.found = true;
-            strcpy(pV.primary_cryptosuite, "NULL_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_32");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoSuiteNullSha1322Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1322Video() - SECONDARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoSuiteNullSha1322Video() - SECONDARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            pV.found = true;
-            strcpy(pV.secondary_cryptosuite, "NULL_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "NULL_HMAC_SHA1_32");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoKeyParams1Video:
-        {
-            std::string mks;
-
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Video() - PRIMARY - CLIENT - component offset:%d\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUACVideo.generateMasterKey(PRIMARY_CRYPTO);
-                    _txUACVideo.generateMasterSalt(PRIMARY_CRYPTO);
-                    _txUACVideo.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Video() - PRIMARY - CLIENT - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUACVideo.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Video() - PRIMARY - CLIENT - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Video() - PRIMARY - SERVER - component offset:\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUASVideo.generateMasterKey(PRIMARY_CRYPTO);
-                    _txUASVideo.generateMasterSalt(PRIMARY_CRYPTO);
-                    _txUASVideo.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Video() - PRIMARY - SERVER - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUASVideo.encodeMasterKeySalt(mks, PRIMARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams1Video() - PRIMARY - SERVER - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            pV.found = true;
-            memcpy(pV.primary_cryptokeyparams, mks.c_str(), 40);
-            pV.primary_cryptokeyparams[40] = '\0';
-            dest += snprintf(dest, left, "%s", pV.primary_cryptokeyparams);
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_CryptoKeyParams2Video:
-        {
-            std::string mks;
-
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Video() - SECONDARY - CLIENT - component offset:%d\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUACVideo.generateMasterKey(SECONDARY_CRYPTO);
-                    _txUACVideo.generateMasterSalt(SECONDARY_CRYPTO);
-                    _txUACVideo.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Video() - SECONDARY - CLIENT - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUACVideo.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Video() - SECONDARY - CLIENT - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Video() - SECONDARY - SERVER - component offset:%d\n", comp->offset);
-                if (comp->offset >= 0)
-                {
-                    _txUASVideo.generateMasterKey(SECONDARY_CRYPTO);
-                    _txUASVideo.generateMasterSalt(SECONDARY_CRYPTO);
-                    _txUASVideo.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Video() - SECONDARY - SERVER - generating new concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-                else
-                {
-                    _txUASVideo.encodeMasterKeySalt(mks, SECONDARY_CRYPTO);
-                    logSrtpInfo("call::createSendingMessage():  E_Message_CryptoKeyParams2Video() - SECONDARY - SERVER - reusing old concatenated base64-encoded master key/salt:%s\n", mks.c_str());
-                }
-            }
-            pV.found = true;
-            memcpy(pV.secondary_cryptokeyparams, mks.c_str(), 40);
-            pV.secondary_cryptokeyparams[40] = '\0';
-            dest += snprintf(dest, left, "%s", pV.secondary_cryptokeyparams);
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1801Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1801Video() - PRIMARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1801Video() - PRIMARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-            }
-            pV.found = true;
-            pV.primary_unencrypted_srtp = true;
-            strcpy(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1802Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1802Video() - SECONDARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1802Video() - SECONDARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-            }
-            pV.found = true;
-            pV.secondary_unencrypted_srtp = true;
-            strcpy(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1321Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1321Video() - PRIMARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1321Video() - PRIMARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-            }
-            pV.found = true;
-            pV.primary_unencrypted_srtp = true;
-            strcpy(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_video_updated = true;
-        }
-        break;
-        case E_Message_UEAesCm128Sha1322Video:
-        {
-            if (sendMode == MODE_CLIENT)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1322Video() - SECONDARY - CLIENT\n");
-                _txUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUACVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            else if (sendMode == MODE_SERVER)
-            {
-                logSrtpInfo("call::createSendingMessage():  E_Message_UEAesCm128Sha1322Video() - SECONDARY - SERVER\n");
-                _txUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to encrypt */
-                _txUASVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-            }
-            pV.found = true;
-            pV.secondary_unencrypted_srtp = true;
-            strcpy(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
-            dest += snprintf(dest, left, "%s", "UNENCRYPTED_SRTP");
-            srtp_video_updated = true;
-        }
-        break;
+          append_number(out, temp_video_port);
+        } break;
         case E_Message_Media_IP_Type:
 #ifdef USE_IPSEC
             if (tunnel_ip()) {
                 /* [media_ip] is the tunnel address then, without brackets
                  * as SDP wants it */
-                dest += snprintf(dest, left, strchr(tunnel_ip(), ':') ? "6" : "4");
+                out += (strchr(tunnel_ip(), ':') ? "6" : "4");
                 break;
             }
 #endif
-            dest += snprintf(dest, left, "%s", (media_ip_is_ipv6 ? "6" : "4"));
+            out += (media_ip_is_ipv6 ? "6" : "4");
             break;
         case E_Message_Call_Number:
-            dest += snprintf(dest, left, "%u", number);
+            append_number(out, number);
             break;
         case E_Message_DynamicId:
-            dest += snprintf(dest, left, "%u", call::dynamicId);
-            // increment at each request
-            dynamicId += stepDynamicId;
-            if ( this->dynamicId > maxDynamicId ) {
-                call::dynamicId = call::startDynamicId;
-            } ;
+            append_number(out, call::dynamicId);
+            // increment at each request, back to the start past the maximum
+            // or below the lowest int
+            {
+                long long next = (long long)dynamicId + stepDynamicId;
+                dynamicId = next > maxDynamicId || next < INT_MIN ? startDynamicId : (int)next;
+            }
             break;
         case E_Message_Call_ID:
-            dest += snprintf(dest, left, "%s", id);
+            out += dialogs ? dialogCallId() : id;
             break;
         case E_Message_CSEQ:
-            dest += snprintf(dest, left, "%u", cseq + comp->offset);
+            append_number(out, cseq + comp->offset);
             break;
         case E_Message_PID:
-            dest += snprintf(dest, left, "%d", pid);
+            append_number(out, pid);
             break;
         case E_Message_Service:
-            dest += snprintf(dest, left, "%s", service);
+            out += service;
             break;
         case E_Message_Branch:
             /* Branch is magic cookie + call number + message index in scenario */
-            if (P_index == -1) {
-                dest += snprintf(dest, left, "z9hG4bK-%u-%u-%d", pid, number, msg_index - 1 + comp->offset);
-            } else {
-                dest += snprintf(dest, left, "z9hG4bK-%u-%u-%d", pid, number, P_index + comp->offset);
-            }
+            out += "z9hG4bK-";
+            append_number(out, pid);
+            out += '-';
+            append_number(out, number);
+            out += '-';
+            append_number(out, (P_index == -1 ? msg_index - 1 : P_index) + comp->offset);
             break;
         case E_Message_Index:
-            dest += snprintf(dest, left, "%d", P_index);
+            append_number(out, P_index);
             break;
         case E_Message_Next_Url:
-            if (next_req_url && *next_req_url) {
-                dest += sprintf(dest, "%s", next_req_url);
+            if (!peekCold().next_req_url.empty()) {
+                out += peekCold().next_req_url;
             } else {
-                char * last_request_uri = get_last_request_uri();
-                dest += sprintf(dest, "%s", last_request_uri);
-                free(last_request_uri);
+                out += get_last_request_uri();
             }
             break;
         case E_Message_Len:
-            length_marker = dest;
-            dest += snprintf(dest, left, "     ");
+            length_marker = out.size();
+            out += "     ";
             len_offset = comp->offset;
             break;
         case E_Message_Authentication:
-            if (auth_marker) {
+            if (auth_marker != std::string::npos) {
                 ERROR("Only one [authentication] keyword is currently supported!");
             }
-            auth_marker = dest;
-            dest += snprintf(dest, left, "[authentication place holder]");
+            auth_marker = out.size();
+            out += "[authentication place holder]";
             auth_comp = comp;
             break;
         case E_Message_Peer_Tag_Param:
             if (peer_tag) {
-                dest += snprintf(dest, left, ";tag=%s", peer_tag);
+                out += ";tag=";
+                out += *peer_tag;
             }
             break;
         case E_Message_Routes:
-            if (dialog_route_set) {
-                dest += sprintf(dest, "Route: %s", dialog_route_set);
-            } else if (*(dest - 1) == '\n') {
+            if (peekCold().dialog_route_set) {
+                out += "Route: ";
+                out += *peekCold().dialog_route_set;
+            } else if (!out.empty() && out.back() == '\n') {
                 suppresscrlf = true;
             }
             break;
         case E_Message_ClockTick:
-            dest += snprintf(dest, left, "%lu", clock_tick);
+            append_number(out, clock_tick);
             break;
         case E_Message_Timestamp:
             struct timeval currentTime;
             gettimeofday(&currentTime, nullptr);
-            dest += snprintf(dest, left, "%s", CStat::formatTime(&currentTime, rfc3339));
+            out += CStat::formatTime(&currentTime, rfc3339);
             break;
         case E_Message_Date:
             char buf[256];
@@ -4153,17 +3613,17 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             tm = gmtime(&t);
             /* changed %Z to hardcoded GMT since in some OS like FreeBSD it could return UTC instead, see issue #535 */
             strftime(buf, 256, "%a, %d %b %Y %T GMT", tm);
-            dest += snprintf(dest, left, "%s", buf);
+            out += buf;
             break;
         case E_Message_Users:
-            dest += snprintf(dest, left, "%d", users);
+            append_number(out, users);
             break;
         case E_Message_UserID:
-            dest += snprintf(dest, left, "%d", userId);
+            append_number(out, userId);
             break;
         case E_Message_SippVersion:
             /* Drop the initial "v" from the SIPP_VERSION string for legacy reasons. */
-            dest += snprintf(dest, left, "%s", (const char*)SIPP_VERSION + 1);
+            out += (const char *)SIPP_VERSION + 1;
             break;
 #ifdef USE_IPSEC
         case E_Message_Security_Client: {
@@ -4180,7 +3640,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             if (ipsec_params.state >= IPSEC_STATE_PARAMS_ALLOCATED) {
                 int len = build_security_client_header(ipsec_params, sec_client_buf, sizeof(sec_client_buf));
                 if (len > 0)
-                    dest += snprintf(dest, left, "%s", sec_client_buf);
+                    out += sec_client_buf;
             }
             break;
         }
@@ -4189,7 +3649,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
                 char sec_verify_buf[512];
                 int len = build_security_verify_header(security_server_value, sec_verify_buf, sizeof(sec_verify_buf));
                 if (len > 0)
-                    dest += snprintf(dest, left, "%s", sec_verify_buf);
+                    out += sec_verify_buf;
             }
             break;
         }
@@ -4197,167 +3657,212 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         case E_Message_Variable: {
             int varId = comp->varId;
             CCallVariable *var = M_callVariableTable->getVar(varId);
-            if(var->isSet()) {
+            if (var->isSet()) {
                 if (var->isRegExp()) {
-                    dest += sprintf(dest, "%s", var->getMatchingValue());
+                    out += var->getMatchingValue();
                 } else if (var->isDouble()) {
-                    dest += sprintf(dest, "%lf", var->getDouble());
+                    out += std::to_string(var->getDouble());
                 } else if (var->isString()) {
-                    dest += sprintf(dest, "%s", var->getString());
+                    out += var->getString();
                 } else if (var->isBool()) {
-                    dest += sprintf(dest, "true");
+                    out += "true";
                 }
             } else if (var->isBool()) {
-                dest += sprintf(dest, "false");
+                out += "false";
             }
-            if (*(dest - 1) == '\n') {
+            if (!out.empty() && out.back() == '\n') {
                 suppresscrlf = true;
             }
             break;
         }
         case E_Message_Fill: {
             int varId = comp->varId;
-            int length = (int) M_callVariableTable->getVar(varId)->getDouble();
+            int length = (int)M_callVariableTable->getVar(varId)->getDouble();
             if (length < 0) {
                 length = 0;
             }
-            char *filltext = comp->literal;
+            const char *filltext = comp->literal.c_str();
             int filllen = strlen(filltext);
             if (filllen == 0) {
                 ERROR("Internal error: [fill] keyword has zero-length text.");
             }
-            for (int i = 0, j = 0; i < length; i++, j++) {
-                *dest++ = filltext[j % filllen];
+            /* Never grow the message past what can be sent. */
+            if ((size_t)length > max_len - out.size()) {
+                length = max_len - out.size();
+                truncated = true;
             }
-            *dest = '\0';
+            for (int j = 0; j < length; j++) {
+                out += filltext[j % filllen];
+            }
             break;
         }
         case E_Message_File: {
             char buffer[MAX_HEADER_LEN];
+            char chunk[4096];
             createSendingMessage(comp->comp_param.filename, SM_UNUSED, buffer, sizeof(buffer));
             FILE *f = fopen(buffer, "r");
             if (!f) {
                 ERROR("Could not open '%s': %s", buffer, strerror(errno));
             }
             int ret;
-            while ((ret = fread(dest, 1, left, f)) > 0) {
-                left -= ret;
-                dest += ret;
+            while ((ret = fread(chunk, 1, std::min(sizeof(chunk), max_len - out.size()), f)) > 0) {
+                out.append(chunk, ret);
             }
-            if (ret < 0) {
+            if (ferror(f)) {
                 ERROR("Error reading '%s': %s", buffer, strerror(errno));
+            }
+            if (out.size() == max_len && fgetc(f) != EOF) {
+                truncated = true;
             }
             fclose(f);
             break;
         }
         case E_Message_Injection: {
-            char *orig_dest = dest;
-            getFieldFromInputFile(comp->comp_param.field_param.filename, comp->comp_param.field_param.field, comp->comp_param.field_param.line, dest);
+            const size_t orig_len = out.size();
+            out += getFieldFromInputFile(comp->field_param.filename, comp->field_param.field, comp->field_param.line);
             /* We are injecting an authentication line. */
-            if (char *tmp = strstr(orig_dest, "[authentication")) {
-                if (auth_marker) {
+            if (size_t tmp = out.find("[authentication", orig_len); tmp != std::string::npos) {
+                if (auth_marker != std::string::npos) {
                     ERROR("Only one [authentication] keyword is currently supported!");
                 }
                 auth_marker = tmp;
-                auth_comp = (struct MessageComponent *)calloc(1, sizeof(struct MessageComponent));
-                if (!auth_comp) {
-                    ERROR("Out of memory!");
-                }
+                auth_comp = new MessageComponent();
                 auth_comp_allocated = true;
 
-                tmp = strchr(auth_marker, ']');
-                char c = *tmp;
-                *tmp = '\0';
-                SendingMessage::parseAuthenticationKeyword(call_scenario, auth_comp, auth_marker);
-                *tmp = c;
+                const size_t end = out.find(']', auth_marker);
+                if (end == std::string::npos) {
+                    ERROR("Unterminated [authentication] keyword!");
+                }
+                /* Without its brackets, as the scenario's own keywords are
+                 * parsed: a parameter is not looked for inside a '['. */
+                std::string keyword = out.substr(auth_marker + 1, end - auth_marker - 1);
+                SendingMessage::parseAuthenticationKeyword(call_scenario, auth_comp, keyword.data());
             }
-            if (*(dest - 1) == '\n') {
+            if (!out.empty() && out.back() == '\n') {
                 suppresscrlf = true;
             }
             break;
         }
-        case E_Message_Last_Header: {
-            char * last_header = get_last_header(comp->literal);
-            if(last_header) {
-                dest += sprintf(dest, "%s", last_header);
+        case E_Message_Last_Header:
+        case E_Message_Last_Header_Value: {
+            /* "From" or "From:" (the name without the colon) */
+            std::string_view name = comp->literal;
+            if (!name.empty() && name.back() == ':') {
+                name.remove_suffix(1);
             }
-            if (*(dest - 1) == '\n') {
+            const bool value_only = comp->type == E_Message_Last_Header_Value;
+            const char *other = nullptr;
+            if (bye_after_peer_request && name.size() == 4 && !strncasecmp(name.data(), "From", 4)) {
+                other = "To:";
+            } else if (bye_after_peer_request && name.size() == 2 && !strncasecmp(name.data(), "To", 2)) {
+                other = "From:";
+            }
+            if (other) {
+                const header_value value = get_header_content(last_recv_msg.c_str(), other);
+                if (!value.empty()) {
+                    if (!value_only) {
+                        out += name;
+                        out += ": ";
+                    }
+                    out += value.view();
+                }
+            } else if (value_only) {
+                out += get_header_content(last_recv_msg.c_str(), std::string(name) + ":").view();
+            } else {
+                out += get_last_header(comp->literal).view();
+            }
+            if (!out.empty() && out.back() == '\n') {
                 suppresscrlf = true;
             }
             break;
         }
         case E_Message_Custom: {
-            dest += comp->comp_param.fxn(this, comp, dest, left);
+            /* Keywords registered by plugins: don't trust the returned
+             * length to stay inside the space we gave them. */
+            const int room = max_len - out.size() + 1;
+            const int n = comp->comp_param.fxn(this, comp, scratch, room);
+            out.append(scratch, std::clamp(n, 0, room - 1));
+            if (n >= room) {
+                truncated = true;
+            }
             break;
         }
         case E_Message_Last_Message:
-            if(last_recv_msg && strlen(last_recv_msg)) {
-                dest += sprintf(dest, "%s", last_recv_msg);
-            }
+            out += last_recv_msg;
             break;
         case E_Message_Last_Request_URI: {
-            char * last_request_uri = get_last_request_uri();
-            dest += sprintf(dest, "%s", last_request_uri);
-            free(last_request_uri);
+            out += get_last_request_uri();
             break;
         }
         case E_Message_Last_CSeq_Number: {
             int last_cseq = 0;
 
-            char *last_header = get_last_header("CSeq:");
-            if(last_header) {
-                last_header += 5;
+            const header_value last_header = get_last_header("CSeq:");
+            if (bye_after_peer_request) {
+                last_cseq = cseq;
+            } else if (!last_header.empty()) {
                 /* Extract the integer value of the field */
-                while(isspace(*last_header)) last_header++;
-                sscanf(last_header, "%d", &last_cseq);
+                last_cseq = header_number(last_header.view().substr(strlen("CSeq:")));
             }
-            dest += sprintf(dest, "%d", last_cseq + comp->offset);
+            append_number(out, last_cseq + comp->offset);
             break;
         }
         case E_Message_TDM_Map:
             if (!use_tdmmap)
                 ERROR("[tdmmap] keyword without -tdmmap parameter on command line");
-            dest += snprintf(dest, left, "%d.%d.%d/%d",
-                             tdm_map_x+(int((tdm_map_number)/((tdm_map_b+1)*(tdm_map_c+1))))%(tdm_map_a+1),
-                             tdm_map_h,
-                             tdm_map_y+(int((tdm_map_number)/(tdm_map_c+1)))%(tdm_map_b+1),
-                             tdm_map_z+(tdm_map_number)%(tdm_map_c+1)
-                            );
+            out += std::to_string(tdm_map_x+(int((tdm_map_number)/((tdm_map_b+1)*(tdm_map_c+1))))%(tdm_map_a+1)) + "."
+                   + std::to_string(tdm_map_h) + "."
+                   + std::to_string(tdm_map_y+(int((tdm_map_number)/(tdm_map_c+1)))%(tdm_map_b+1)) + "/"
+                   + std::to_string(tdm_map_z+(tdm_map_number)%(tdm_map_c+1));
+            break;
+        default:
+            /* The SRTP keywords: all that is left of the enum */
+            if (const SrtpKeyword *keyword = find_srtp_keyword(comp->type)) {
+                appendSrtpKeyword(*keyword, *comp, out, keyword->video ? pV : pA);
+                (keyword->video ? srtp_video_updated : srtp_audio_updated) = true;
+            }
             break;
         }
     }
-    /* Need the body for length and auth-int calculation */
-    char *body = nullptr;
-    const char *auth_body = nullptr;
-    if (length_marker || auth_marker) {
-        body = strstr(msg_buffer, "\r\n\r\n");
-        if (body) {
-            auth_body = body;
-            auth_body += strlen("\r\n\r\n");
-        }
+    /* Components skipped because the message was already full. */
+    if (out.size() > max_len || i < src->numComponents()) {
+        truncated = true;
     }
-    if (!auth_body) {
-        auth_body = "";
+    if (out.size() > max_len) {
+        out.resize(max_len);
+    }
+    /* Placeholders cut off by the truncation can't be filled in. */
+    if (length_marker != std::string::npos && length_marker + 5 > out.size()) {
+        length_marker = std::string::npos;
+    }
+    if (auth_marker != std::string::npos && out.find(']', auth_marker) == std::string::npos) {
+        auth_marker = std::string::npos;
+    }
+
+    /* Need the body for length and auth-int calculation */
+    size_t body = std::string::npos;
+    if (length_marker != std::string::npos || auth_marker != std::string::npos) {
+        body = out.find("\r\n\r\n");
     }
 
     /* Fix up the length. */
-    if (length_marker) {
-        if (auth_marker > body) {
+    if (length_marker != std::string::npos) {
+        if (auth_marker != std::string::npos && (body == std::string::npos || auth_marker > body)) {
             ERROR("The authentication keyword should appear in the message header, not the body!");
         }
 
-        if (body && dest - body > 4 && dest - body < 100004) {
-            char tmp = length_marker[5];
-            sprintf(length_marker, "%5u", (unsigned)(dest - body - 4 + len_offset));
-            length_marker[5] = tmp;
+        const size_t body_len = out.size() - body;
+        if (body != std::string::npos && body_len > 4 && body_len < 100004) {
+            char len[16];
+            snprintf(len, sizeof(len), "%5u", (unsigned)(body_len - 4 + len_offset));
+            out.replace(length_marker, 5, len);
+        } else if (body != std::string::npos) {
+            // Empty body: Content-Length is 0
+            out.replace(length_marker, 5, "    0");
         } else {
-            // Other cases: Content-Length is 0
-            sprintf(length_marker, "    0\r\n\r\n");
+            // No end of headers: Content-Length is 0 and ends them
+            out.replace(length_marker, std::string::npos, "    0\r\n\r\n");
         }
-    }
-
-    if (msgLen) {
-        *msgLen = dest - msg_buffer;
     }
 
     /*
@@ -4365,29 +3870,19 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
      * loop because auth-int will use the body (which must have already
      * been keyword substituted) to build the md5 hash
      */
-    if (auth_marker) {
-        if (!dialog_authentication) {
+    if (auth_marker != std::string::npos) {
+        if (peekCold().dialog_authentication.empty()) {
             ERROR("Authentication keyword without dialog_authentication!");
         }
+        call_cold &auth = *cold_state;
 
-        int  auth_marker_len;
-        int  authlen;
-
-        auth_marker_len = (strchr(auth_marker, ']') + 1) - auth_marker;
-
-        /* Determine the type of credentials. */
-        char result[MAX_HEADER_LEN];
-        if (dialog_challenge_type == 401) {
-            /* Registrars use Authorization */
-            authlen = sprintf(result, "Authorization: ");
-        } else {
-            /* Proxies use Proxy-Authorization */
-            authlen = sprintf(result, "Proxy-Authorization: ");
-        }
+        const size_t auth_marker_len = out.find(']', auth_marker) + 1 - auth_marker;
+        /* Determine the type of credentials: registrars use
+         * Authorization, proxies Proxy-Authorization. */
+        std::string result = auth.dialog_challenge_type == 401 ? "Authorization: " : "Proxy-Authorization: ";
 
         /* Build the auth credenticals */
-        char uri[MAX_HEADER_LEN];
-        sprintf (uri, "%s:%d", remote_ip, remote_port);
+        const std::string uri = (remote ? remote->ip : remote_ip) + ":" + std::to_string(remote_port);
         char my_auth_user[MAX_HEADER_LEN + 2];
         char my_auth_pass[MAX_HEADER_LEN + 2];
         char my_aka_OP[MAX_HEADER_LEN + 2];
@@ -4411,13 +3906,12 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         unsigned char *ik_ptr = nullptr;
 #endif
 
-        if (createAuthHeader(
-                my_auth_user, my_auth_pass, src->getMethod(), uri,
-                auth_body, dialog_authentication, my_aka_OP, my_aka_AMF,
-                my_aka_K, next_nonce_count++, result + authlen,
-                MAX_HEADER_LEN - authlen, ck_ptr, ik_ptr,
-                my_aka_OPc) == 0) {
-            ERROR("%s", result + authlen);
+        std::string credentials;
+        if (!createAuthHeader(my_auth_user, my_auth_pass, src->getMethod(), uri,
+                              body == std::string::npos ? "" : out.c_str() + body + 4,
+                              auth.dialog_authentication.c_str(), my_aka_OP, my_aka_AMF, my_aka_K,
+                              auth.next_nonce_count++, credentials, ck_ptr, ik_ptr, my_aka_OPc)) {
+            ERROR("%s", credentials.c_str());
         }
 
 #ifdef USE_IPSEC
@@ -4432,19 +3926,13 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
             }
         }
 #endif
-        authlen = strlen(result);
+        result += credentials;
 
-        /* Shift the end of the message to its rightful place. */
-        memmove(auth_marker + authlen, auth_marker + auth_marker_len, strlen(auth_marker + auth_marker_len) + 1);
-        /* Copy our result into the hole. */
-        memcpy(auth_marker, result, authlen);
-        if (msgLen) {
-            *msgLen += (authlen -  auth_marker_len);
-        }
 #ifdef USE_IPSEC
-        auth_marker_offset = auth_marker - msg_buffer;
-        auth_marker_delta = authlen - auth_marker_len;
+        auth_marker_offset = auth_marker;
+        auth_marker_delta = (int)result.size() - (int)auth_marker_len;
 #endif
+        out.replace(auth_marker, auth_marker_len, result);
     }
 
 #ifdef USE_IPSEC
@@ -4457,75 +3945,47 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
      */
     if (ipsec_params.state >= IPSEC_STATE_ACTIVE && num_port_fixups > 0) {
         for (int i = num_port_fixups - 1; i >= 0; i--) {
-            char new_port_str[8];
             int new_port = port_fixups[i].is_local
                 ? ipsec_params.port_uc
                 : ipsec_params.port_ps;
-            int new_len = snprintf(new_port_str, sizeof(new_port_str), "%d", new_port);
 
             int adj_offset = port_fixups[i].offset;
             if (auth_marker_offset >= 0 && adj_offset > auth_marker_offset) {
                 adj_offset += auth_marker_delta;
             }
 
-            int old_len = port_fixups[i].len;
-            int delta = new_len - old_len;
-
-            if (delta != 0) {
-                memmove(msg_buffer + adj_offset + new_len,
-                        msg_buffer + adj_offset + old_len,
-                        strlen(msg_buffer + adj_offset + old_len) + 1);
-            }
-            memcpy(msg_buffer + adj_offset, new_port_str, new_len);
-
-            if (msgLen) {
-                *msgLen += delta;
-            }
+            out.replace(adj_offset, port_fixups[i].len, std::to_string(new_port));
         }
     }
 #endif
 
+    if (out.size() > max_len) {
+        out.resize(max_len);
+        truncated = true;
+    }
+    if (truncated) {
+        static bool warned = false;
+        if (!warned) {
+            WARNING("Outgoing message truncated to the %zu-byte message buffer (further truncations are not reported)", max_len);
+            warned = true;
+        }
+    }
     if (auth_comp_allocated) {
         SendingMessage::freeMessageComponent(auth_comp);
     }
 
     // PASS OUTGOING SRTP PARAMETERS...
-    if (srtp_audio_updated && (pA.primary_cryptotag != 0))
-    {
-        rtpstream_set_srtp_audio_local(&rtpstream_callinfo, pA);
-        if (sendMode == MODE_CLIENT)
-        {
-            //
-            // RX-UAC-AUDIO SRTP context (b) -- SSRC/IPADDRESS/PORT
-            //
-            CryptoContextID rxUACA;
-            rxUACA.ssrc = rtpstream_callinfo.taskinfo->audio_ssrc_id;
-            rxUACA.address = media_ip;
-            rxUACA.port = rtpstream_callinfo.local_audioport;
-            logSrtpInfo("call::createSendingMessage():  (b) RX-UAC-AUDIO SRTP context - ssrc:0x%08x address:%s port:%d\n", rxUACA.ssrc, rxUACA.address.c_str(), rxUACA.port);
-            _rxUACAudio.setID(rxUACA);
-        }
+    if (srtp_audio_updated) {
+        passLocalSrtp(false, pA);
     }
-    if (srtp_video_updated && (pV.primary_cryptotag != 0))
-    {
-        rtpstream_set_srtp_video_local(&rtpstream_callinfo, pV);
-        if (sendMode == MODE_CLIENT)
-        {
-            //
-            // RX-UAC-VIDEO SRTP context (b) -- SSRC/IPADDRESS/PORT
-            //
-            CryptoContextID rxUACV;
-            rxUACV.ssrc = rtpstream_callinfo.taskinfo->video_ssrc_id;
-            rxUACV.address = media_ip;
-            rxUACV.port = rtpstream_callinfo.local_videoport;
-            logSrtpInfo("call::createSendingMessage():  (b) RX-UAC-VIDEO SRTP context - ssrc:0x%08x address:%s port:%d\n", rxUACV.ssrc, rxUACV.address.c_str(), rxUACV.port);
-            _rxUACVideo.setID(rxUACV);
-        }
+    if (srtp_video_updated) {
+        passLocalSrtp(true, pV);
     }
 
-    if (body &&
-        !strcmp(get_header_content(msg_buffer, (char*)"Content-Type:"), "application/sdp"))
-    {
+    /* An SDP is an offer or an answer, whether or not a [len] or an
+     * [authentication] had its body found above */
+    if (out.find("\r\n\r\n") != std::string::npos &&
+        is_sdp_content_type(get_header_content(out.c_str(), "Content-Type:").view())) {
         if (getSessionStateCurrent() == eNoSession)
         {
             logSrtpInfo("call::createSendingMessage():  Switching session state:  eNoSession --> eOfferSent\n");
@@ -4545,14 +4005,27 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         }
     }
 
-    return msg_buffer;
+    return out;
+}
+
+/* Is there a <recvCmd> after the step at index, before the call sends
+ * another command? */
+bool call::recvCmdFollows(int index)
+{
+    for (int i = index + 1; i < (int)call_scenario->messages.size(); i++) {
+        if (call_scenario->messages[i]->M_type == MSG_TYPE_RECVCMD) {
+            return true;
+        } else if (call_scenario->messages[i]->M_type == MSG_TYPE_SENDCMD) {
+            return false;
+        }
+    }
+    return false;
 }
 
 bool call::process_twinSippCom(char * msg)
 {
     int             search_index;
     bool            found = false;
-    T_ActionResult  actionResult;
 
     callDebug("Processing incoming command for call-ID %s:\n%s\n\n", id, msg);
 
@@ -4568,6 +4041,19 @@ bool call::process_twinSippCom(char * msg)
                     (call_scenario->messages[search_index] -> M_type == MSG_TYPE_NOP)) {
                     continue;
                 }
+                /* The peer can answer a <sendCmd> before the SIP message
+                 * the call waits for comes, or before the call has sent
+                 * the one after the <sendCmd>, which runs on its next
+                 * turn. Keep the command for the <recvCmd> that follows,
+                 * as a message that comes before a <sendCmd> has run is
+                 * kept for its <recv>. */
+                int type = call_scenario->messages[search_index]->M_type;
+                if ((type == MSG_TYPE_RECV || type == MSG_TYPE_SEND) && peekCold().queued_cmd.empty() &&
+                    recvCmdFollows(search_index)) {
+                    callDebug("Keeping the command for the <recvCmd> after index %d.\n", search_index);
+                    cold().queued_cmd = msg;
+                    return true;
+                }
                 /* The received message is different from the expected one */
                 TRACE_MSG("Unexpected control message received (I was expecting a different type of message):\n%s\n", msg);
                 callDebug("Unexpected control message received (I was expecting a different type of message):\n%s\n\n", msg);
@@ -4578,7 +4064,7 @@ bool call::process_twinSippCom(char * msg)
                         found = true;
                         break;
                     } else {
-                        WARNING("Unexpected sender for the received peer message\n%s\n", msg);
+                        WARNING("Unexpected sender for the received peer message\n%s", msg);
                         return rejectCall();
                     }
                 } else {
@@ -4593,24 +4079,15 @@ bool call::process_twinSippCom(char * msg)
             do_bookkeeping(call_scenario->messages[search_index]);
 
             // variable treatment
-            // Remove \r, \n at the end of a received command
-            // (necessary for transport, to be removed for usage)
-            while ( (msg[strlen(msg)-1] == '\n') &&
-                    (msg[strlen(msg)-2] == '\r') ) {
-                msg[strlen(msg)-2] = 0;
+            // Remove the blank line a command without a body ends with
+            // (necessary for transport, to be removed for usage), but
+            // not the CRLF a body variable at its end ends with.
+            size_t len = strlen(msg);
+            if (len >= 4 && !strcmp(msg + len - 4, "\r\n\r\n")) {
+                msg[len - 4] = 0;
             }
-            actionResult = executeAction(msg, call_scenario->messages[search_index]);
-
-            if(actionResult != call::E_AR_NO_ERROR) {
-                // Store last action result if it is an error
-                // and go on with the scenario
-                call::last_action_result = actionResult;
-                if (actionResult == E_AR_STOP_CALL) {
-                    return rejectCall();
-                } else if (actionResult == E_AR_CONNECT_FAILED) {
-                    terminate(CStat::E_FAILED_TCP_CONNECT);
-                    return false;
-                }
+            if (!handleActionResult(executeAction(msg, call_scenario->messages[search_index]))) {
+                return false; /* call deleted */
             }
         } else {
             TRACE_MSG("Unexpected control message received (no such message found):\n%s\n", msg);
@@ -4693,7 +4170,7 @@ bool call::check_peer_src(char * msg, int search_index)
     }
     L_backup = *L_ptr2;
     *L_ptr2 = 0;
-    if (strcmp(L_ptr1, call_scenario->messages[search_index] -> peer_src) == 0) {
+    if (strcmp(L_ptr1, call_scenario->messages[search_index]->peer_src.c_str()) == 0) {
         *L_ptr2 = L_backup;
         return(true);
     }
@@ -4703,46 +4180,40 @@ bool call::check_peer_src(char * msg, int search_index)
 }
 
 
-void call::extract_cseq_method(char* method, const char* msg)
+void call::extract_cseq_method(char* method, size_t size, const char* msg)
 {
-    const char* cseq;
-    if ((cseq = strstr (msg, "CSeq"))) {
-        const char* value;
-        if ((value = strchr(cseq, ':'))) {
-            value++;
-            while (isspace(*value)) value++;  // ignore any white spaces after the :
-            while (!isspace(*value)) value++;  // ignore the CSEQ number
-            while (isspace(*value)) value++;  // ignore spaces after CSEQ number
-            const char* end = value;
-            int nbytes = 0;
-            /* A '\r' terminates the line, so we want to catch that too. */
-            while ((*end != '\r') && (*end != '\n')) {
-                end++;
-                nbytes++;
-            }
-            if (nbytes > 0) strncpy (method, value, nbytes);
-            method[nbytes] = '\0';
-        }
+    /* The CSeq header, in any case, not "CSeq" elsewhere in the message */
+    const header_value cseq = get_header_content(msg, "CSeq:");
+    std::string_view value = cseq.view();
+    /* Skip the CSeq number, and the blanks around it */
+    value.remove_prefix(std::min(value.find_first_not_of(" \t\r\n"), value.size()));
+    value.remove_prefix(std::min(value.find_first_of(" \t\r\n"), value.size()));
+    value.remove_prefix(std::min(value.find_first_not_of(" \t\r\n"), value.size()));
+    /* A '\r' terminates the line, so we want to catch that too. */
+    size_t nbytes = std::min(value.find_first_of("\r\n"), value.size());
+    if (nbytes >= size) {
+        nbytes = size - 1;
     }
+    memcpy(method, value.data(), nbytes);
+    method[nbytes] = '\0';
 }
 
-void call::extract_transaction(char* txn, const char* msg)
+/* The first branch in the Via headers of msg, cut to fit in size bytes */
+void call::extract_transaction(char *txn, size_t size, const char *msg)
 {
-    char *via = get_header_content(msg, "via:");
-    if (!via) {
-        txn[0] = '\0';
-        return;
-    }
-
-    char *branch = strstr(via, ";branch=");
-    if (!branch) {
+    const header_value via = get_header_content(msg, "via:");
+    const std::string_view text = via.view();
+    size_t branch = text.find(";branch=");
+    if (branch == std::string_view::npos) {
         txn[0] = '\0';
         return;
     }
 
     branch += strlen(";branch=");
-    while (*branch && *branch != ';' && *branch != ',' && !isspace(*branch)) {
-        *txn++ = *branch++;
+    const char *end = txn + size - 1;
+    while (txn < end && branch < text.size() && text[branch] != ';' && text[branch] != ',' &&
+           !isspace((unsigned char)text[branch])) {
+        *txn++ = text[branch++];
     }
     *txn = '\0';
 }
@@ -4758,12 +4229,9 @@ void call::formatNextReqUrl(const char* contact)
     if ((start && end)  && (start < end)) {
         contact = start;
         contact++;
-        next_req_url[0] = '\0';
-        strncat(next_req_url, contact,
-                std::min(MAX_HEADER_LEN - 1, (int)(end - contact))); /* fits MAX_HEADER_LEN */
+        cold().next_req_url.assign(contact, end - contact);
     } else {
-        next_req_url[0] = '\0';
-        strncat(next_req_url, contact, MAX_HEADER_LEN - 1);
+        cold().next_req_url.assign(contact);
     }
 }
 
@@ -4814,70 +4282,176 @@ void call::computeRouteSetAndRemoteTargetUri(const char* rr, const char* contact
             targetUri = header;
         } else {
             first = false;
-            routes.push_back(trim(header));
+            routes.emplace_back(trim(header));
         }
     }
 
     /* If target URI is set, the first hop is a strict router.  Add the
      * Contact as tailing route. */
     if (targetUri.length()) {
-        routes.push_back(trim(contact));
+        routes.emplace_back(trim(contact));
     } else {
         targetUri = contact;
     }
 
     if (routes.size()) {
-        dialog_route_set = strdup(join(routes, ", ").c_str());
+        cold().dialog_route_set = join(routes, ", ");
     }
 
     formatNextReqUrl(targetUri.c_str());
+}
+
+static call_dialog &dialog_entry(std::map<int, call_dialog> &dialogs, int dialog)
+{
+    std::pair<std::map<int, call_dialog>::iterator, bool> ins = dialogs.try_emplace(dialog);
+    if (ins.second) {
+        ins.first->second.cseq = base_cseq;
+    }
+    return ins.first->second;
+}
+
+void call::switchDialog(int dialog)
+{
+    if (!dialogs || dialogs->current == dialog) {
+        return;
+    }
+    auto swap_state = [this](call_dialog &d) {
+        std::swap(cseq, d.cseq);
+        std::swap(last_recv_invite_cseq, d.last_recv_invite_cseq);
+        std::swap(peer_tag, d.peer_tag);
+        std::swap(last_recv_msg, d.last_recv_msg);
+        std::swap(cold().dialog_route_set, d.dialog_route_set);
+        std::swap(cold().next_req_url, d.next_req_url);
+    };
+    swap_state(dialogs->dialogs[dialogs->current]);
+    swap_state(dialog_entry(dialogs->dialogs, dialog));
+    dialogs->current = dialog;
+}
+
+int call::msgDialog(const message *curmsg)
+{
+    if (curmsg->dialog) {
+        return curmsg->dialog;
+    }
+    int txn = curmsg->response_txn ? curmsg->response_txn : curmsg->ack_txn;
+    if (txn && transactions[txn - 1].dialog) {
+        return transactions[txn - 1].dialog;
+    }
+    return 1;
+}
+
+int call::dialogOf(const char *msg)
+{
+    /* The peer echoes a "///" prefix written before [call_id]: the
+     * Call-ID of the dialog is what follows it, as for the call's */
+    std::string_view full_call_id;
+    const std::string_view call_id = get_trimmed_call_id(msg, &full_call_id);
+    for (const auto &[dialog, d] : dialogs->dialogs) {
+        if (!d.call_id.empty() && (d.call_id == full_call_id || d.call_id == call_id)) {
+            return dialog;
+        }
+    }
+    return 1;
+}
+
+bool call::dialogKnown(int dialog)
+{
+    if (dialog == 1) {
+        return true;
+    }
+    std::map<int, call_dialog>::iterator it = dialogs->dialogs.find(dialog);
+    return it != dialogs->dialogs.end() && !it->second.call_id.empty();
+}
+
+void call::setDialogCallId(int dialog, std::string_view call_id)
+{
+    /* A Call-ID of this call already, such as its own */
+    if (get_listener(call_id) == this) {
+        return;
+    }
+    call_dialog &d = dialog_entry(dialogs->dialogs, dialog);
+    d.call_id = call_id;
+    listen(d.call_id.c_str());
+}
+
+const char *call::dialogCallId()
+{
+    if (dialogs->current == 1) {
+        return id;
+    }
+    call_dialog &d = dialogs->dialogs[dialogs->current];
+    if (d.call_id.empty()) {
+        setDialogCallId(dialogs->current, (std::to_string(dialogs->current) + "-" + id).c_str());
+    }
+    return d.call_id.c_str();
+}
+
+std::vector<std::string> call::dialogIds()
+{
+    std::vector<std::string> ids;
+    if (dialogs) {
+        for (const auto &[dialog, d] : dialogs->dialogs) {
+            if (!d.call_id.empty()) {
+                ids.push_back(d.call_id);
+            }
+        }
+    }
+    return ids;
+}
+
+int call::newDialogFor(const char *msg)
+{
+    char request[65];
+    const char *end = strchr(msg, ' ');
+    if (pastLastMessage() || get_reply_code(msg) || !end || end - msg >= (int)sizeof(request)) {
+        return 0;
+    }
+    memcpy(request, msg, end - msg);
+    request[end - msg] = '\0';
+
+    for (int index = msg_index; index < (int)call_scenario->messages.size(); index++) {
+        message *curmsg = call_scenario->messages[index];
+        if (curmsg->recv_request) {
+            int dialog = msgDialog(curmsg);
+            if (!dialogKnown(dialog) && curmsg->matchesRequest(request)) {
+                return dialog;
+            }
+        }
+        if (!curmsg->optional) {
+            break;
+        }
+    }
+    return 0;
+}
+
+call *call::take_new_dialog(const char *msg)
+{
+    for (call *call_ptr : new_dialog_calls) {
+        if (int dialog = call_ptr->newDialogFor(msg)) {
+            call_ptr->setDialogCallId(dialog, get_call_id(msg));
+            return call_ptr;
+        }
+    }
+    return nullptr;
 }
 
 bool call::matches_scenario(unsigned int index, int reply_code, char * request, char * responsecseqmethod, char *txn)
 {
     message *curmsg = call_scenario->messages[index];
 
+    if (dialogs && msgDialog(curmsg) != dialogs->incoming) {
+        return false;
+    }
+
     if ((curmsg->recv_request)) {
-        if (curmsg->regexp_match) {
-            if (curmsg->regexp_compile == nullptr) {
-                regex_t *re = new regex_t;
-                /* No regex match position needed (NOSUB), we're simply
-                 * looking for the <request method="INVITE|REGISTER"../>
-                 * regex. */
-                if (regcomp(re, curmsg->recv_request, REGCOMP_PARAMS|REG_NOSUB)) {
-                    ERROR("Invalid regular expression for index %d: %s", index, curmsg->recv_request);
-                }
-                curmsg->regexp_compile = re;
-            }
-            return !regexec(curmsg->regexp_compile, request, (size_t)0, nullptr, REGEXEC_PARAMS);
-        } else {
-            return !strcmp(curmsg->recv_request, request);
-        }
+        return curmsg->matchesRequest(request);
     } else if (curmsg->recv_response) {
-        if (curmsg->regexp_match) { // Match response code using regex
-            char reply_code_str[8];
-           snprintf(reply_code_str, 8, "%u", reply_code); // Convert the response code to string
-            if (curmsg->regexp_compile == nullptr) {
-                regex_t *re = new regex_t;
-                /* No regex match position needed (NOSUB), we're simply
-                 * looking for the <request method="INVITE|REGISTER"../>
-                 * regex. */
-                if (regcomp(re, curmsg->recv_response, REGCOMP_PARAMS|REG_NOSUB)) {
-                    ERROR("Invalid regular expression for index %d: %s", index, curmsg->recv_response);
-                }
-                curmsg->regexp_compile = re;
-            }
-            if (regexec(curmsg->regexp_compile, reply_code_str, (size_t)0, nullptr, REGEXEC_PARAMS)) {
-               return false;
-           }
-        } else { // Exact numerical match
-            if (atoi(curmsg->recv_response) != reply_code) {
-               return false;
-           }
+        if (!curmsg->matchesResponse(reply_code)) {
+            return false;
         }
        /* This is a potential candidate, we need to match transactions. */
        if (curmsg->response_txn) {
-           if (transactions[curmsg->response_txn - 1].txnID && !strcmp(transactions[curmsg->response_txn - 1].txnID, txn)) {
+           if (transactions[curmsg->response_txn - 1].txnID && *transactions[curmsg->response_txn - 1].txnID == txn) {
                return true;
            } else {
                return false;
@@ -4885,8 +4459,8 @@ bool call::matches_scenario(unsigned int index, int reply_code, char * request, 
        } else if (index == 0) {
            /* Always true for the first message. */
            return true;
-       } else if (curmsg->recv_response_for_cseq_method_list &&
-                  strstr(curmsg->recv_response_for_cseq_method_list, responsecseqmethod)) {
+       } else if (!curmsg->recv_response_for_cseq_method_list.empty() &&
+                  strstr(curmsg->recv_response_for_cseq_method_list.c_str(), responsecseqmethod)) {
            /* If we do not have a transaction defined, we just check the CSEQ method. */
            return true;
        } else {
@@ -4897,13 +4471,100 @@ bool call::matches_scenario(unsigned int index, int reply_code, char * request, 
     return false;
 }
 
-void call::queue_up(const char* msg)
+void call::queue_up(const char* msg, bool sdp_read)
 {
-    free(queued_msg);
-    queued_msg = strdup(msg);
+    call_cold &c = cold();
+    c.queued_msg = msg;
+    c.queued_sdp_read = sdp_read;
 }
 
-bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
+/* Whether a and b are the same address and port. */
+static bool same_address(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+{
+    if (a->ss_family != b->ss_family) {
+        return false;
+    }
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
+        return a4->sin_port == b4->sin_port && a4->sin_addr.s_addr == b4->sin_addr.s_addr;
+    }
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
+        return a6->sin6_port == b6->sin6_port &&
+               !memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr));
+    }
+    return !memcmp(a, b, sizeof(*a));
+}
+
+void call::forget_request_source(std::vector<request_source>::iterator it)
+{
+    if (it->socket) {
+        it->socket->close();
+    }
+    cold_state->request_sources.erase(it);
+}
+
+/* Remember where a request that did not come from the call's destination
+ * came from, for its responses: RFC 3261 18.2.2 sends a response back to
+ * the source of its request, as rport (RFC 3581) does in practice. It is
+ * found by the request's top Via branch, which the response copies; a
+ * CANCEL has its INVITE's, and comes from the same hop. -rsa sends every
+ * message to its address. */
+void call::remember_request_source(const char *msg, const struct sockaddr_storage *src,
+                                   SIPpSocket *socket)
+{
+    static const size_t max_request_sources = 4;
+
+    if (use_remote_sending_addr || !strncmp(msg, "SIP/2.0 ", 8) || !strncmp(msg, "ACK ", 4)) {
+        return;
+    }
+    bool elsewhere = transport == T_UDP ? !same_address(src, &call_peer)
+                                        : socket && socket != call_socket;
+    if (!elsewhere && peekCold().request_sources.empty()) {
+        return;
+    }
+    std::vector<request_source> &request_sources = cold().request_sources;
+
+    char branch[MAX_HEADER_LEN];
+    extract_transaction(branch, sizeof(branch), msg);
+    if (!*branch) {
+        return;
+    }
+    auto it = request_sources.begin();
+    while (it != request_sources.end() && it->branch != branch) {
+        ++it;
+    }
+    if (it != request_sources.end()) {
+        /* A request of this transaction again: it is answered where the
+         * last one came from. */
+        forget_request_source(it);
+    }
+    if (!elsewhere) {
+        return;
+    }
+    if (request_sources.size() == max_request_sources) {
+        forget_request_source(request_sources.begin());
+    }
+    request_source rs;
+    rs.branch = branch;
+    memcpy(&rs.addr, src, sizeof(rs.addr));
+    rs.socket = nullptr;
+    if (transport != T_UDP) {
+        rs.socket = socket;
+        socket->ss_count++;
+    }
+    request_sources.push_back(std::move(rs));
+}
+
+bool call::process_incoming(const char* msg, const struct sockaddr_storage* src, SIPpSocket *socket)
+{
+    return process_incoming(msg, src, socket, false);
+}
+
+bool call::process_incoming(const char* msg, const struct sockaddr_storage* src, SIPpSocket *socket,
+                            bool sdp_read)
 {
     int             reply_code = 0;
     static char     request[65];
@@ -4913,12 +4574,21 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
     const char*     ptr;
     int             search_index;
     bool            found = false;
-    T_ActionResult  actionResult;
     unsigned long int invite_cseq = 0;
 
     update_clock_tick();
     callDebug("Processing %zu byte incoming message for call-ID %s (hash %lu):\n%s\n\n",
               strlen(msg), id, hash(msg), msg);
+
+    if (last_send_unanswered && !strncmp(msg, "SIP/2.0", 7) && same_cseq(last_send_msg.c_str(), msg)) {
+        last_send_unanswered = false;
+    }
+
+    /* Over but for its <exec verify> commands, the call takes no more
+     * messages. */
+    if (pastLastMessage()) {
+        return true;
+    }
 
     setRunning();
     message *curmsg = call_scenario->messages[msg_index];
@@ -4932,9 +4602,15 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
     if (call_peer.ss_family == AF_UNSPEC && src) {
         memcpy(&call_peer, src, sizeof(call_peer));
     }
+    if (src) {
+        remember_request_source(msg, src, socket);
+    }
 
-    /* Authorize nop as a first command, even in server mode */
-    if (msg_index == 0 && curmsg->M_type == MSG_TYPE_NOP) {
+    /* A <nop> or <sendCmd> runs on the call's next turn, so a message can
+     * arrive before it has, as the first command in server mode or right
+     * after the message sent before it. Run it first and handle the message
+     * once the call waits for one, instead of taking it as unexpected. */
+    if (curmsg->M_type == MSG_TYPE_NOP || curmsg->M_type == MSG_TYPE_SENDCMD) {
         queue_up(msg);
         paused_until = 0;
         return run();
@@ -4942,15 +4618,20 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
     responsecseqmethod[0] = '\0';
     txn[0] = '\0';
 
+    if (dialogs) {
+        dialogs->incoming = dialogOf(msg);
+        switchDialog(dialogs->incoming);
+    }
+
     if (!checkAckCSeq(msg)) {
-        WARNING("ACK CSeq value does NOT match value of related INVITE CSeq -- aborting call\n");
+        WARNING("ACK CSeq value does NOT match value of related INVITE CSeq -- aborting call");
         computeStat(CStat::E_CALL_FAILED);
         delete this;
         return false;
     }
 
     /* Check that we have a To:-header */
-    if (!get_header(msg, "To:", false)[0] && !process_unexpected(msg)) {
+    if (get_header(msg, "To:", false).empty() && !process_unexpected(msg)) {
         return false;
     }
 
@@ -4958,34 +4639,38 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
         /* Detects retransmissions from peer and retransmit the
          * message which was sent just after this one was received */
         cookie = hash(msg);
-        if((recv_retrans_recv_index >= 0) && (recv_retrans_hash == cookie)) {
+        if ((recv_retrans_recv_index >= 0) && (recv_retrans_hash == cookie)) {
 
-            int status;
-
-            if(lost(recv_retrans_recv_index)) {
-                TRACE_MSG("%s message (retrans) lost (recv).",
-                          TRANSPORT_TO_STRING(transport));
+            if (lost(recv_retrans_recv_index)) {
+                TRACE_MSG("%s message (retrans) lost (recv).", TRANSPORT_TO_STRING(transport));
                 callDebug("%s message (retrans) lost (recv) (hash %lu)\n", TRANSPORT_TO_STRING(transport), hash(msg));
 
-                call_scenario->messages[recv_retrans_recv_index] -> nb_lost++;
+                call_scenario->messages[recv_retrans_recv_index]->nb_lost++;
                 return true;
             }
 
-            call_scenario->messages[recv_retrans_recv_index] -> nb_recv_retrans++;
+            call_scenario->messages[recv_retrans_recv_index]->nb_recv_retrans++;
 
-            send_scene(recv_retrans_send_index, &status, nullptr);
+            /* Send it again as it was sent: rendering it again would give
+             * new values to keywords such as the SRTP keys. */
+            int status;
+            if (recv_retrans_last) {
+                status = send_raw(last_send_msg.c_str(), recv_retrans_send_index, last_send_msg.size());
+            } else {
+                status = send_raw(recv_retrans_msg.c_str(), recv_retrans_send_index, recv_retrans_msg.size());
+            }
 
-            if(status >= 0) {
-                call_scenario->messages[recv_retrans_send_index] -> nb_sent_retrans++;
+            if (status >= 0) {
+                call_scenario->messages[recv_retrans_send_index]->nb_sent_retrans++;
                 computeStat(CStat::E_RETRANSMISSION);
-            } else if(status < 0) {
+            } else {
                 return false;
             }
 
             return true;
         }
 
-        if((last_recv_index >= 0) && (last_recv_hash == cookie)) {
+        if ((last_recv_index >= 0) && (last_recv_hash == cookie)) {
             /* This one has already been received, but not processed
              * yet => (has not triggered something yet) so we can discard.
              *
@@ -5002,38 +4687,50 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
             call_scenario->messages[last_recv_index]->nb_recv_retrans++;
             return true;
         }
+
+        /* A request of a transaction started before the last message:
+         * the last response we sent in it, if any, goes again. */
+        for (unsigned int i = 0; i < call_scenario->transactions.size(); i++) {
+            txnInstanceInfo &txn_info = transactions[i];
+            if (txn_info.request.empty() || txn_info.requestHash != cookie) {
+                continue;
+            }
+            call_scenario->messages[txn_info.requestIndex]->nb_recv_retrans++;
+            if (txn_info.response.empty()) {
+                return true;
+            }
+            if (send_raw(txn_info.response.c_str(), txn_info.responseIndex, txn_info.response.size()) < 0) {
+                return false;
+            }
+            call_scenario->messages[txn_info.responseIndex]->nb_sent_retrans++;
+            computeStat(CStat::E_RETRANSMISSION);
+            return true;
+        }
     }
 
-    /* Check if message has a SDP in it; and extract media information. */
-    if (!strcmp(get_header_content(msg, "Content-Type:"), "application/sdp") &&
-          (hasMedia == 1) &&
-          (!curmsg->ignoresdp))
-    {
-        const char* ptr = 0;
-        int ip_ver = 0;
+    /* Check if message has a SDP in it; and extract media information.
+     * Also handle multipart/mixed bodies that contain an application/sdp part
+     * (e.g. SIP messages carrying both SDP and PIDF-LO geolocation).
+     * Its crypto lines and the offer/answer state are taken without
+     * media too, for the crypto keywords of the next SDP. */
+    const header_value content_type = get_header_content(msg, "Content-Type:");
+    const std::string_view ct_hdr = content_type.view();
+    bool has_sdp_content = is_sdp_content_type(ct_hdr) ||
+                           (ct_hdr.find("multipart/") != std::string_view::npos && strstr(msg, "application/sdp"));
+    if (has_sdp_content && !sdp_read && !curmsg->ignoresdp) {
         int audio_port = 0;
         int video_port = 0;
-        std::string host;
+        std::string audio_host;
+        std::string video_host;
 
-        int audio_answer_ciphersuite_match = -1;
-        int video_answer_ciphersuite_match = -1;
-
-        ptr = get_header_content(msg, "Content-Length:");
-
-        if (ptr && atoll(ptr) > 0)
-        {
-            if (getSessionStateCurrent() == eNoSession)
-            {
+        if (header_number(get_header_content(msg, "Content-Length:").view()) > 0) {
+            if (getSessionStateCurrent() == eNoSession) {
                 logSrtpInfo("call::process_incoming():  Switching session state:  eNoSession --> eOfferReceived\n");
                 setSessionState(eOfferReceived);
-            }
-            else if (getSessionStateCurrent() == eCompleted)
-            {
+            } else if (getSessionStateCurrent() == eCompleted) {
                 logSrtpInfo("call::process_incoming():  Switching session state:  eCompleted --> eOfferReceived\n");
                 setSessionState(eOfferReceived);
-            }
-            else if (getSessionStateCurrent() == eOfferSent)
-            {
+            } else if (getSessionStateCurrent() == eOfferSent) {
                 logSrtpInfo("call::process_incoming():  Switching session state:  eOfferSent --> eAnswerReceived\n");
                 setSessionState(eAnswerReceived);
                 logSrtpInfo("call::process_incoming();  Switching session state:  eAnswerReceived --> eCompleted\n");
@@ -5044,537 +4741,30 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
             SrtpInfoParams pA;
             SrtpInfoParams pV;
 
-            pA.found = false;
-            pA.primary_cryptotag = 0;
-            *pA.primary_cryptosuite = 0;
-            *pA.primary_cryptokeyparams = 0;
-            pA.secondary_cryptotag = 0;
-            *pA.secondary_cryptosuite = 0;
-            *pA.secondary_cryptokeyparams = 0;
-            pA.primary_unencrypted_srtp = false;
-            pA.secondary_unencrypted_srtp = false;
-
-            pV.found = false;
-            pV.primary_cryptotag = 0;
-            *pV.primary_cryptosuite = 0;
-            *pV.primary_cryptokeyparams = 0;
-            pV.secondary_cryptotag = 0;
-            *pV.secondary_cryptosuite = 0;
-            *pV.secondary_cryptokeyparams = 0;
-            pV.primary_unencrypted_srtp = false;
-            pV.secondary_unencrypted_srtp = false;
-
-            host = extract_rtp_remote_addr(msg, ip_ver, audio_port, video_port);
-
             if (extract_srtp_remote_info(msg, pA, pV) < 0) {
                 WARNING("extract_rtp_remote_addr: error extracting SRTP parameters from SDP message body");
                 return rejectCall();
             }
 
-            if ((audio_port==0) && (video_port==0)) {
-                WARNING("extract_rtp_remote_addr: no m=audio or m=video or m=image line found in SDP message body");
-            } else {
-                rtpstream_set_remote(&rtpstream_callinfo, ip_ver, host.c_str(), audio_port, video_port);
+            if (hasMedia == 1) {
+                extract_rtp_remote_addr(msg, audio_host, audio_port, video_host, video_port);
+                if ((audio_port == 0) && (video_port == 0)) {
+                    WARNING("extract_rtp_remote_addr: no m=audio or m=video or m=image line found in SDP message body");
+                } else {
+                    rtpstream_set_remote(&rtpstream_callinfo, audio_host.c_str(), audio_port, video_host.c_str(),
+                                         video_port);
+                }
             }
 
             // PASS INCOMING SRTP PARAMETERS...
-            if (pA.found && (pA.primary_cryptotag != 0))
-            {
-                //
-                // INCOMING OFFER -- PERFORM PRIMARY/SECONDARY AUDIO SWAPS IF NEEDED/APPLICABLE
-                //
-                if ((getSessionStateCurrent() == eOfferReceived) && ((getSessionStateOld() == eNoSession || getSessionStateOld() == eCompleted)))
-                {
-                    // NO-OP...
-                }
-                //
-                // INCOMING ANSWER -- PERFORM PRIMARY/SECONDARY AUDIO SWAPS IF NEEDED/APPLICABLE
-                //
-                else if ((getSessionStateCurrent() == eCompleted) && (getSessionStateOld() == eAnswerReceived))
-                {
-                    audio_answer_ciphersuite_match = check_audio_ciphersuite_match(pA);
-                }
-
+            const bool answer = getSessionStateCurrent() == eCompleted && getSessionStateOld() == eAnswerReceived;
+            if (pA.found && (pA.primary_cryptotag != 0)) {
                 rtpstream_set_srtp_audio_remote(&rtpstream_callinfo, pA);
-                if (sendMode == MODE_CLIENT)
-                {
-                    //
-                    // TX-UAC-AUDIO SRTP context (a) -- SSRC/IPADDRESS/PORT
-                    //
-                    CryptoContextID txUACA;
-                    txUACA.ssrc = rtpstream_callinfo.taskinfo->audio_ssrc_id;
-                    txUACA.address = host;
-                    txUACA.port = audio_port;
-                    logSrtpInfo("call::process_incoming():  (a) TX-UAC-AUDIO SRTP context - ssrc:0x%08x address:%s port:%d\n", txUACA.ssrc, txUACA.address.c_str(), txUACA.port);
-                    _txUACAudio.setID(txUACA);
-
-                    if (audio_answer_ciphersuite_match == 0)
-                    {
-                        logSrtpInfo("call::process_incoming():  (a) TX-UAC_AUDIO SRTP context -- CLIENT -- CIPHERSUITE SWAP...\n");
-                        _txUACAudio.swapCrypto();
-                    }
-
-                    //
-                    // RX-UAC-AUDIO SRTP context (b) -- MASTER KEY/SALT PARSE + CRYPTO TAG + CRYPTOSUITE
-                    //
-                    std::string mks1;
-                    mks1 = pA.primary_cryptokeyparams;
-                    if (!mks1.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- primary master key/salt: %s\n", mks1.c_str());
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- primary crypto tag: %d\n", pA.primary_cryptotag);
-                        _rxUACAudio.decodeMasterKeySalt(mks1, PRIMARY_CRYPTO);
-                        _rxUACAudio.setCryptoTag(pA.primary_cryptotag, PRIMARY_CRYPTO);
-
-                        if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "NULL_HMAC_SHA1_80") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "NULL_HMAC_SHA1_32") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                    }
-
-                    std::string mks2;
-                    mks2 = pA.secondary_cryptokeyparams;
-                    if (!mks2.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- secondary master key/salt: %s\n", mks2.c_str());
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- secondary crypto tag: %d\n", pA.secondary_cryptotag);
-                        _rxUACAudio.decodeMasterKeySalt(mks2, SECONDARY_CRYPTO);
-                        _rxUACAudio.setCryptoTag(pA.secondary_cryptotag, SECONDARY_CRYPTO);
-
-                        if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pA.secondary_unencrypted_srtp)
-                        {
-                             logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "NULL_HMAC_SHA1_80") && !pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "NULL_HMAC_SHA1_32") && !pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pA.secondary_unencrypted_srtp)
-                        {
-                             logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-AUDIO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUACAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                    }
-                }
-                if (sendMode == MODE_SERVER)
-                {
-                    //
-                    // TX-UAS-AUDIO SRTP context (d) -- SSRC/IPADDRESS/PORT
-                    //
-                    CryptoContextID txUASA;
-                    txUASA.ssrc = rtpstream_callinfo.taskinfo->audio_ssrc_id;
-                    txUASA.address = host;
-                    txUASA.port = audio_port;
-                    logSrtpInfo("call::process_incoming():  (d) TX-UAS-AUDIO SRTP context - ssrc:0x%08x address:%s port:%d\n", txUASA.ssrc, txUASA.address.c_str(), txUASA.port);
-                    _txUASAudio.setID(txUASA);
-
-                    if (audio_answer_ciphersuite_match == 0)
-                    {
-                        logSrtpInfo("call::process_incoming():  (d) TX-UAS_AUDIO SRTP context -- SERVER -- CIPHERSUITE SWAP...\n");
-                        _txUASAudio.swapCrypto();
-                    }
-
-                    //
-                    // RX-UAS-AUDIO SRTP context (c) -- MASTER KEY/SALT PARSE + CRYPTO TAG + CRYPTOSUITE
-                    //
-                    std::string mks1;
-                    mks1 = pA.primary_cryptokeyparams;
-                    if (!mks1.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- primary master key/salt: %s\n", mks1.c_str());
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- primary crypto tag: %d\n", pA.primary_cryptotag);
-                        _rxUASAudio.decodeMasterKeySalt(mks1, PRIMARY_CRYPTO);
-                        _rxUASAudio.setCryptoTag(pA.primary_cryptotag, PRIMARY_CRYPTO);
-
-                        if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "NULL_HMAC_SHA1_80") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "NULL_HMAC_SHA1_32") && !pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pA.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pA.primary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                    }
-
-                    std::string mks2;
-                    mks2 = pA.secondary_cryptokeyparams;
-                    if (!mks2.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- secondary master key/salt: %s\n", mks2.c_str());
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- secondary crypto tag: %d\n", pA.secondary_cryptotag);
-                        _rxUASAudio.decodeMasterKeySalt(mks2, SECONDARY_CRYPTO);
-                        _rxUASAudio.setCryptoTag(pA.secondary_cryptotag, SECONDARY_CRYPTO);
-
-                        if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "NULL_HMAC_SHA1_80") && !pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "NULL_HMAC_SHA1_32") && !pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pA.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pA.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-AUDIO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pA.secondary_cryptosuite);
-                            _rxUASAudio.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASAudio.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                    }
-                }
+                takeRemoteSrtp(false, pA, audio_host, audio_port, answer);
             }
-            if (pV.found && (pV.primary_cryptotag != 0))
-            {
-                //
-                // INCOMING OFFER -- PERFORM PRIMARY/SECONDARY VIDEO SWAPS IF NEEDED/APPLICABLE
-                //
-                if ((getSessionStateCurrent() == eOfferReceived) && ((getSessionStateOld() == eNoSession || getSessionStateOld() == eCompleted)))
-                {
-                    // NO-OP...
-                }
-                //
-                // INCOMING ANSWER -- PERFORM PRIMARY/SECONDARY VIDEO SWAPS IF NEEDED/APPLICABLE
-                //
-                else if ((getSessionStateCurrent() == eCompleted) && (getSessionStateOld() == eAnswerReceived))
-                {
-                    video_answer_ciphersuite_match = check_video_ciphersuite_match(pV);
-                }
-
+            if (pV.found && (pV.primary_cryptotag != 0)) {
                 rtpstream_set_srtp_video_remote(&rtpstream_callinfo, pV);
-                if (sendMode == MODE_CLIENT)
-                {
-                    //
-                    // TX-UAC-VIDEO SRTP context (a) -- SSRC/IPADDRESS/PORT
-                    //
-                    CryptoContextID txUACV;
-                    txUACV.ssrc = rtpstream_callinfo.taskinfo->video_ssrc_id;
-                    txUACV.address = host;
-                    txUACV.port = video_port;
-                    logSrtpInfo("call::process_incoming():  (a) TX-UAC-VIDEO SRTP context - ssrc:0x%08x address:%s port:%d\n", txUACV.ssrc, txUACV.address.c_str(), txUACV.port);
-                    _txUACVideo.setID(txUACV);
-
-                    if (video_answer_ciphersuite_match == 0)
-                    {
-                        logSrtpInfo("call::process_incoming():  (a) TX-UAC_VIDEO SRTP context -- CLIENT -- CIPHERSUITE SWAP...\n");
-                        _txUACVideo.swapCrypto();
-                    }
-
-                    //
-                    // RX-UAC-VIDEO SRTP context (b) -- MASTER KEY/SALT PARSE + CRYPTO TAG + CRYPTOSUITE
-                    //
-                    std::string mks1;
-                    mks1 = pV.primary_cryptokeyparams;
-                    if (!mks1.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- primary master key/salt: %s\n", mks1.c_str());
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- primary crypto tag: %d\n", pV.primary_cryptotag);
-                        _rxUACVideo.decodeMasterKeySalt(mks1, PRIMARY_CRYPTO);
-                        _rxUACVideo.setCryptoTag(pV.primary_cryptotag, PRIMARY_CRYPTO);
-
-                        if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "NULL_HMAC_SHA1_80") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "NULL_HMAC_SHA1_32") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                    }
-
-                    std::string mks2;
-                    mks2 = pV.secondary_cryptokeyparams;
-                    if (!mks2.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- secondary master key/salt: %s\n", mks2.c_str());
-                        logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- secondary crypto tag: %d\n", pV.secondary_cryptotag);
-                        _rxUACVideo.decodeMasterKeySalt(mks2, SECONDARY_CRYPTO);
-                        _rxUACVideo.setCryptoTag(pV.secondary_cryptotag, SECONDARY_CRYPTO);
-
-                        if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "NULL_HMAC_SHA1_80") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "NULL_HMAC_SHA1_32") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (b) RX-UAC-VIDEO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUACVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUACVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                    }
-                }
-                if (sendMode == MODE_SERVER)
-                {
-                    //
-                    // TX-UAS-VIDEO SRTP context (d) -- SSRC/IPADDRESS/PORT
-                    //
-                    CryptoContextID txUASV;
-                    txUASV.ssrc = rtpstream_callinfo.taskinfo->video_ssrc_id;
-                    txUASV.address = host;
-                    txUASV.port = video_port;
-                    logSrtpInfo("call::process_incoming():  (d) TX-UAS-VIDEO SRTP context - ssrc:0x%08x address:%s port:%d\n", txUASV.ssrc, txUASV.address.c_str(), txUASV.port);
-                    _txUASVideo.setID(txUASV);
-
-                    if (video_answer_ciphersuite_match == 0)
-                    {
-                        logSrtpInfo("call::process_incoming():  (d) TX-UAS_VIDEO SRTP context -- SERVER -- CIPHERSUITE SWAP...\n");
-                        _txUASVideo.swapCrypto();
-                    }
-
-                    //
-                    // RX-UAS-VIDEO SRTP context (c) -- MASTER KEY/SALT PARSE + CRYPTO TAG + CRYPTOSUITE
-                    //
-                    std::string mks1;
-                    mks1 = pV.primary_cryptokeyparams;
-                    if (!mks1.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- primary master key/salt: %s\n", mks1.c_str());
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- primary crypto tag: %d\n", pV.primary_cryptotag);
-                        _rxUASVideo.decodeMasterKeySalt(mks1, PRIMARY_CRYPTO);
-                        _rxUASVideo.setCryptoTag(pV.primary_cryptotag, PRIMARY_CRYPTO);
-
-                        if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(AES_CM_128, PRIMARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "NULL_HMAC_SHA1_80") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "NULL_HMAC_SHA1_32") && !pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_80, PRIMARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pV.primary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- NOENCRYPTION -- primary cryptosuite: [%s]\n", pV.primary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, PRIMARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_32, PRIMARY_CRYPTO);
-                        }
-                    }
-
-                    std::string mks2;
-                    mks2 = pV.secondary_cryptokeyparams;
-                    if (!mks2.empty())
-                    {
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- secondary master key/salt: %s\n", mks2.c_str());
-                        logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- secondary crypto tag: %d\n", pV.secondary_cryptotag);
-                        _rxUASVideo.decodeMasterKeySalt(mks2, SECONDARY_CRYPTO);
-                        _rxUASVideo.setCryptoTag(pV.secondary_cryptotag, SECONDARY_CRYPTO);
-
-                        if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(AES_CM_128, SECONDARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "NULL_HMAC_SHA1_80") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "NULL_HMAC_SHA1_32") && !pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- ENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO);
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_80") && pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_80, SECONDARY_CRYPTO);
-                        }
-                        else if (!strcmp(pV.secondary_cryptosuite, "AES_CM_128_HMAC_SHA1_32") && pV.secondary_unencrypted_srtp)
-                        {
-                            logSrtpInfo("call::process_incoming():  (c) RX-UAS-VIDEO SRTP context -- NOENCRYPTION -- secondary cryptosuite: [%s]\n", pV.secondary_cryptosuite);
-                            _rxUASVideo.selectCipherAlgorithm(NULL_CIPHER, SECONDARY_CRYPTO); /* Request JLSRTP NOT to decrypt */
-                            _rxUASVideo.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
-                        }
-                    }
-                }
+                takeRemoteSrtp(true, pV, video_host, video_port, answer);
             }
         } // ptr
     } // Content-Type
@@ -5594,29 +4784,23 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
                 return false; // Call aborted by unexpected message handling
             }
 #ifdef PCAPPLAY
-        } else if (hasMedia == 1 && !curmsg->ignoresdp && *(strstr(msg, "\r\n\r\n") + 4) != '\0') {
-            /* Get media info if we find something like an SDP */
-            get_remote_media_addr(msg);
+        } else if (!sdp_read && hasMedia == 1 && !curmsg->ignoresdp) {
+            /* Get media info if we find something like an SDP: a
+             * response need not end its headers with a blank line. */
+            const char *body = strstr(msg, "\r\n\r\n");
+            if (body && body[4]) {
+                get_remote_media_addr(msg);
+            }
 #endif
         }
         /* It is a response: update peer_tag */
-        ptr = get_peer_tag(msg);
-        if (ptr) {
-            if(strlen(ptr) > (MAX_HEADER_LEN - 1)) {
-                ERROR("Peer tag too long. Change MAX_HEADER_LEN and recompile sipp");
-            }
-            if(peer_tag) {
-                free(peer_tag);
-            }
-            peer_tag = strdup(ptr);
-            if (!peer_tag) {
-                ERROR("Out of memory allocating peer tag.");
-            }
+        if (const std::optional<std::string_view> tag = get_peer_tag(msg)) {
+            peer_tag = *tag;
         }
         request[0] = 0;
         // extract the cseq method from the response
-        extract_cseq_method(responsecseqmethod, msg);
-        extract_transaction(txn, msg);
+        extract_cseq_method(responsecseqmethod, sizeof(responsecseqmethod), msg);
+        extract_transaction(txn, sizeof(txn), msg);
     } else if ((ptr = strchr(msg, ' '))) {
         if ((ptr - msg) < 64) {
             memcpy(request, msg, ptr - msg);
@@ -5632,7 +4816,7 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
             if (((strncmp(request, "INVITE", 6) == 0)
                     || (strncmp(request, "ACK", 3) == 0)
                     || (strncmp(request, "PRACK", 5) == 0))
-                    && hasMedia == 1 && !curmsg->ignoresdp) {
+                    && !sdp_read && hasMedia == 1 && !curmsg->ignoresdp) {
                 get_remote_media_addr(msg);
             }
 #endif
@@ -5687,7 +4871,7 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
                 } else {
                     if (int checkTxn = call_scenario->messages[search_index]->response_txn) {
                         /* This is a reply to an old transaction. */
-                        if (!strcmp(transactions[checkTxn - 1].txnID, txn)) {
+                        if (*transactions[checkTxn - 1].txnID == txn) {
                             /* This reply is provisional, so it should have no effect if we receive it out-of-order. */
                             if (reply_code >= 100 && reply_code <= 199) {
                                 TRACE_MSG("-----------------------------------------------\n"
@@ -5702,10 +4886,10 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
                                 sendBuffer(createSendingMessage(call_scenario->messages[ackIndex]->send_scheme, ackIndex));
                                 return true;
                             } else {
-                                assert (!call_scenario->transactions[checkTxn - 1].isInvite);
                                 /* This is a non-provisional message for the transaction, and
-                                 * we have already gotten our allowable response.  Just make sure
-                                 * that it is not a retransmission of the final response. */
+                                 * we have already gotten our allowable response (for an INVITE,
+                                 * the ACK is still to be sent).  Just make sure that it is not
+                                 * a retransmission of the final response. */
                                 if (transactions[checkTxn - 1].txnResp == hash(msg)) {
                                     /* We have gotten this retransmission out-of-order, let's just ignore it. */
                                     TRACE_MSG("-----------------------------------------------\n"
@@ -5720,6 +4904,16 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
                             }
                         }
                     } else {
+                        /* A provisional reply that UDP delivered behind the
+                         * final one has no effect either. */
+                        if (reply_code >= 100 && reply_code <= 199) {
+                            TRACE_MSG("-----------------------------------------------\n"
+                                      "Ignoring late provisional %s message:\n\n%s\n",
+                                      TRANSPORT_TO_STRING(transport), msg);
+                            callDebug("Ignoring late provisional %s message (hash %lu):\n\n%s\n",
+                                      TRANSPORT_TO_STRING(transport), hash(msg), msg);
+                            return true;
+                        }
                         /*
                          * we received a non mandatory msg for an old transaction (this could be due to a retransmit.
                          * If this response is for an INVITE transaction, retransmit the ACK to quench retransmits.
@@ -5729,6 +4923,17 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
                                 (call_scenario->messages[search_index+1]->M_type == MSG_TYPE_SEND) &&
                                 (call_scenario->messages[search_index+1]->send_scheme->isAck()) ) {
                             sendBuffer(createSendingMessage(call_scenario->messages[search_index+1]->send_scheme, search_index + 1));
+                            return true;
+                        }
+                        /* The peer ACKs each 200 we retransmit, so an ACK
+                         * can come again after we moved on; nothing answers
+                         * it. */
+                        if (!reply_code && !strcmp(request, "ACK")) {
+                            TRACE_MSG("-----------------------------------------------\n"
+                                      "Ignoring repeated %s ACK:\n\n%s\n",
+                                      TRANSPORT_TO_STRING(transport), msg);
+                            callDebug("Ignoring repeated %s ACK (hash %lu):\n\n%s\n",
+                                      TRANSPORT_TO_STRING(transport), hash(msg), msg);
                             return true;
                         }
                     }
@@ -5754,8 +4959,9 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
                     M_callVariableTable->getVar(call_scenario->pausedaddr)->setDouble(paused_until);
                 }
                 msg_index = call_scenario->unexpected_jump;
-                queue_up(msg);
+                queue_up(msg, true);
                 paused_until = 0;
+                rtpstream_wait_check = 0;
                 return run();
             } else {
                 if (!process_unexpected(msg)) {
@@ -5796,6 +5002,16 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
         transactions[checkTxn - 1].txnResp = hash(msg);
     }
 
+    /* A request that starts a transaction: kept for its responses */
+    if (found && call_scenario->messages[search_index]->start_txn) {
+        txnInstanceInfo &txn_info = transactions[call_scenario->messages[search_index]->start_txn - 1];
+        assign_exact(txn_info.request, msg);
+        txn_info.requestHash = cookie;
+        txn_info.requestIndex = search_index;
+        txn_info.response.clear();
+        txn_info.dialog = dialogs ? dialogs->current : 1;
+    }
+
 
     /* Handle counters and RTDs for this message. */
     do_bookkeeping(call_scenario->messages[search_index]);
@@ -5807,18 +5023,8 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
     if (found) {
         //WARNING("---EXECUTE_ACTION_ON_MSG---%s---", msg);
 
-        actionResult = executeAction(msg, call_scenario->messages[search_index]);
-
-        if(actionResult != call::E_AR_NO_ERROR) {
-            // Store last action result if it is an error
-            // and go on with the scenario
-            call::last_action_result = actionResult;
-            if (actionResult == E_AR_STOP_CALL) {
-                return rejectCall();
-            } else if (actionResult == E_AR_CONNECT_FAILED) {
-                terminate(CStat::E_FAILED_TCP_CONNECT);
-                return false;
-            }
+        if (!handleActionResult(executeAction(msg, call_scenario->messages[search_index]))) {
+            return false; /* call deleted */
         }
     }
 
@@ -5862,26 +5068,14 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
     }
 
     /* store the route set only once. TODO: does not support target refreshes!! */
-    if (call_scenario->messages[search_index]->bShouldRecordRoutes &&
-            dialog_route_set == nullptr) {
-        realloc_ptr = (char*)realloc(next_req_url, MAX_HEADER_LEN);
-        if (realloc_ptr) {
-            next_req_url = realloc_ptr;
-            /* Ensure next_req_url has an empty value in case contact is missing */
-            next_req_url[0] = '\0';
-        } else {
-            free(next_req_url);
-            ERROR("Out of memory!");
-            return false;
-        }
+    if (call_scenario->messages[search_index]->bShouldRecordRoutes && !peekCold().dialog_route_set) {
+        /* Ensure next_req_url has an empty value in case contact is missing */
+        cold().next_req_url.clear();
 
         /* cache the route set and the contact */
-        char rr[MAX_HEADER_LEN], contact[MAX_HEADER_LEN];
-        rr[0] = contact[0] = '\0';
-        /* yuck, get_header_content returns a static buffer :( */
-        strncat(rr, get_header_content(msg, "Record-Route:"), MAX_HEADER_LEN - 1);
-        strncat(contact, get_header_content(msg, "Contact:"), MAX_HEADER_LEN - 1);
-        computeRouteSetAndRemoteTargetUri(rr, contact, !reply_code);
+        const std::string rr(get_header_content(msg, "Record-Route:").view());
+        const std::string contact(get_header_content(msg, "Contact:").view());
+        computeRouteSetAndRemoteTargetUri(rr.c_str(), contact.c_str(), !reply_code);
         // WARNING("next_req_url is [%s]", next_req_url);
     }
 
@@ -5890,32 +5084,20 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
             (reply_code == 401 || reply_code == 407)) {
 
         /* is a challenge */
-        char auth[MAX_HEADER_LEN];
-        *auth = 0;
-        strncat(auth, get_header_content(msg, (char*)"Proxy-Authenticate:"), sizeof(auth) - 1);
-        if (auth[0] == 0) {
-            strncat(auth, get_header_content(msg, (char*)"WWW-Authenticate:"), sizeof(auth) - 1);
+        header_value auth = get_header_content(msg, "Proxy-Authenticate:");
+        if (auth.empty()) {
+            auth = get_header_content(msg, "WWW-Authenticate:");
         }
-        if (auth[0] == 0) {
+        if (auth.empty()) {
             ERROR("Couldn't find 'Proxy-Authenticate' or 'WWW-Authenticate' in 401 or 407!");
         }
-
-        realloc_ptr = (char *) realloc(dialog_authentication, strlen(auth) + 2);
-        if (realloc_ptr) {
-            dialog_authentication = realloc_ptr;
-        } else {
-            free(dialog_authentication);
-            ERROR("Out of memory!");
-            return false;
-        }
-
-
-        sprintf(dialog_authentication, "%s", auth);
+        call_cold &c = cold();
+        c.dialog_authentication = selectAuthChallenge(auth.view());
 
         /* Store the code of the challenge for building the proper header */
-        dialog_challenge_type = reply_code;
+        c.dialog_challenge_type = reply_code;
 
-        next_nonce_count = 1;
+        c.next_nonce_count = 1;
     }
 
     /* If we are not advancing state, we should quite before we change this stuff. */
@@ -5929,17 +5111,7 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
     last_recv_index = search_index;
     last_recv_hash = cookie;
     callDebug("Set Last Recv Hash: %lu (recv index %d)\n", last_recv_hash, last_recv_index);
-    realloc_ptr = (char *) realloc(last_recv_msg, strlen(msg) + 1);
-    if (realloc_ptr) {
-        last_recv_msg = realloc_ptr;
-    } else {
-        free(last_recv_msg);
-        ERROR("Out of memory!");
-        return false;
-    }
-
-
-    strcpy(last_recv_msg, msg);
+    assign_exact(last_recv_msg, msg);
 
     /* If this was a mandatory message, or if there is an explicit next label set
      * we must update our state machine.  */
@@ -5948,6 +5120,10 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
              (test == -1 || M_callVariableTable->getVar(test)->isSet()))) {
         /* If we are paused, then we need to wake up so that we properly go through the state machine. */
         paused_until = 0;
+        /* Likewise for a wait, unless the actions of this one set it. */
+        if (rtpstream_wait_msg != call_scenario->messages[search_index]) {
+            rtpstream_wait_check = 0;
+        }
         msg_index = search_index;
         return next();
     } else {
@@ -5955,7 +5131,7 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
         unsigned int candidate;
 
         if (call_scenario->messages[search_index]->next && M_callVariableTable->getVar(test)->isSet()) {
-            WARNING("Last message generates an error and will not be used for next sends (for last_ variables):\n%s\n", msg);
+            WARNING("Last message generates an error and will not be used for next sends (for last_ variables):\n%s", msg);
         }
 
         /* We are just waiting for a message to be received, if any of the
@@ -5965,7 +5141,7 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
             if(call_scenario->messages[search_index] -> M_type != MSG_TYPE_RECV) {
                 break;
             }
-            candidate = call_scenario->messages[search_index] -> timeout;
+            candidate = recvTimeout(call_scenario->messages[search_index]);
             if (candidate == 0) {
                 if (defl_recv_timeout == 0) {
                     continue;
@@ -5982,13 +5158,177 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
     return true;
 }
 
+/* A variable as a number: a string or a regexp match converts, anything
+ * that isn't a number is 0 (with a warning if it has a value). */
+double call::get_var_double(int varId)
+{
+    CCallVariable *var = M_callVariableTable->getVar(varId);
+    double value;
+
+    if (var->toDouble(&value)) {
+        return value;
+    }
+    if (var->isSet()) {
+        WARNING("Invalid double conversion of $%s",
+                call_scenario->allocVars->getName(varId));
+    }
+    return 0.0;
+}
+
 double call::get_rhs(CAction *currentAction)
 {
     if (currentAction->getVarInId()) {
-        return M_callVariableTable->getVar(currentAction->getVarInId())->getDouble();
+        return get_var_double(currentAction->getVarInId());
     } else {
         return currentAction->getDoubleValue();
     }
+}
+
+/* The receive timeout of curmsg in ms: its timeout, with the keywords
+ * expanded now if it has any. */
+unsigned int call::recvTimeout(message *curmsg)
+{
+    if (!curmsg->timeout_scheme) {
+        return curmsg->timeout;
+    }
+
+    double timeout = strtod(createSendingString(curmsg->timeout_scheme).c_str(), nullptr);
+    if (!(timeout >= 1)) { // Also NaN
+        return 0;
+    }
+    if (timeout > INT_MAX) {
+        return INT_MAX;
+    }
+    return (unsigned int)timeout;
+}
+
+/* Check the rtp_stream playback again when it is due to end, or after a
+ * packet time when that is not known or has passed, or at the wait
+ * timeout if that comes first. */
+void call::rtpstreamWaitNextCheck(unsigned long play_end)
+{
+    rtpstream_wait_check = play_end > clock_tick && play_end != ULONG_MAX ? play_end : clock_tick + 20;
+    if (rtpstream_wait_until && rtpstream_wait_until < rtpstream_wait_check) {
+        rtpstream_wait_check = rtpstream_wait_until;
+    }
+}
+
+/* The rtp_stream playback outlasted the wait: jump to the ontimeout
+ * label of the message that waits, or abort the call without one. */
+bool call::rtpstreamWaitTimeout()
+{
+    message *waitmsg = rtpstream_wait_msg;
+
+    rtpstream_wait_check = 0;
+    waitmsg->nb_timeout++;
+    if (waitmsg->on_timeout < 0) {
+        WARNING("Call-Id: %s, rtp_stream wait timeout on message %s:%d without label to jump to (ontimeout attribute): aborting call",
+                id, waitmsg->desc, waitmsg->index);
+    } else {
+        WARNING("Call-Id: %s, rtp_stream wait timeout on message %s:%d, jumping to label %d",
+                id, waitmsg->desc, waitmsg->index, waitmsg->on_timeout);
+        msg_index = waitmsg->on_timeout;
+        if (msg_index < (int)call_scenario->messages.size()) {
+            return true;
+        }
+        // special case - the label points to the end - finish the call
+    }
+    computeStat(CStat::E_CALL_FAILED);
+    if (default_behaviors & DEFAULT_BEHAVIOR_BYE) {
+        return abortCall(true);
+    }
+    delete this;
+    return false;
+}
+
+/* Past its last message, the call waits for its <exec verify> commands
+ * to end, see next(). */
+bool call::pastLastMessage()
+{
+    return msg_index >= (int)(initCall ? call_scenario->initmessages : call_scenario->messages).size();
+}
+
+/* Run an <exec verify> command, which the call waits for before its next
+ * message. The command runs as system() runs it, but without waiting. */
+void call::startVerify(const char *command)
+{
+    TRACE_MSG("Executing '%s'\n", command);
+    pid_t pid = fork();
+    if (pid < 0) {
+        ERROR_NO("Forking error main");
+    }
+    if (pid == 0) {
+        /* _exit(), as the children of an <exec command> */
+        execl("/bin/sh", "sh", "-c", command, (char *) nullptr);
+        _exit(127);
+    }
+    verify_commands[pid] = {this, command};
+    verify_pending++;
+}
+
+/* An <exec verify> command ended: a non-zero exit fails the call. */
+void call::verifyDone(const char *command, int status)
+{
+    if (WIFEXITED(status)) {
+        TRACE_MSG("'%s' returned %d\n", command, WEXITSTATUS(status));
+        if (WEXITSTATUS(status) != 0) {
+            WARNING("Call-Id: %s, '%s' returned %d", id, command, WEXITSTATUS(status));
+            last_action_result = E_AR_VERIFY_FAILED;
+        }
+    } else {
+        TRACE_MSG("'%s' was killed by signal %d\n", command, WTERMSIG(status));
+        WARNING("Call-Id: %s, '%s' was killed by signal %d", id, command, WTERMSIG(status));
+        last_action_result = E_AR_VERIFY_FAILED;
+    }
+
+    if (--verify_pending) {
+        return;
+    }
+    if (pastLastMessage()) {
+        terminate(CStat::E_CALL_SUCCESSFULLY_ENDED);
+    } else {
+        setRunning();
+    }
+}
+
+void call::reap_verify_commands()
+{
+    int status;
+    pid_t pid;
+
+    /* SIPp waits for no other child while one runs: it reaps the first
+     * child of an <exec command> as soon as it forks it. */
+    while (!verify_commands.empty() && (pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        auto it = verify_commands.find(pid);
+        if (it == verify_commands.end()) {
+            continue; /* an orphan, adopted when SIPp is PID 1 */
+        }
+        verify_command done = std::move(it->second);
+        verify_commands.erase(it);
+        if (done.waiting) {
+            done.waiting->verifyDone(done.command.c_str(), status);
+        }
+    }
+}
+
+/* Every step's actions count the same way: a failed check marks the call
+ * as failed when it ends, stop_call and a failed setdest end it now.
+ * Returns false if the call was deleted. */
+bool call::handleActionResult(T_ActionResult actionResult)
+{
+    if (actionResult == E_AR_NO_ERROR) {
+        return true;
+    }
+    // Store last action result if it is an error
+    // and go on with the scenario
+    last_action_result = actionResult;
+    if (actionResult == E_AR_STOP_CALL) {
+        return rejectCall();
+    } else if (actionResult == E_AR_CONNECT_FAILED) {
+        terminate(CStat::E_FAILED_TCP_CONNECT);
+        return false;
+    }
+    return true;
 }
 
 call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
@@ -6010,47 +5350,49 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
         }
 
         if(currentAction->getActionType() == CAction::E_AT_ASSIGN_FROM_REGEXP) {
-            char msgPart[MAX_SUB_MESSAGE_LENGTH];
+            std::string msgPart;
 
             /* Where to look. */
             const char* haystack = nullptr;
+            std::string var_value;
 
             if(currentAction->getLookingPlace() == CAction::E_LP_HDR) {
-                extractSubMessage (msg,
-                                   currentAction->getLookingChar(),
-                                   msgPart,
-                                   currentAction->getCaseIndep(),
-                                   currentAction->getOccurrence(),
-                                   currentAction->getHeadersOnly());
-                if(currentAction->getCheckIt() == true && (strlen(msgPart) == 0)) {
+                msgPart = extractSubMessage(msg, currentAction->getLookingChar(), currentAction->getCaseIndep(),
+                                            currentAction->getOccurrence(), currentAction->getHeadersOnly());
+                if (currentAction->getCheckIt() == true && msgPart.empty()) {
                     // the sub message is not found and the checking action say it
                     // MUST match --> Call will be marked as failed but will go on
-                    WARNING("Failed regexp match: header %s not found in message\n%s\n", currentAction->getLookingChar(), msg);
+                    WARNING("Failed regexp match: header %s not found in message\n%s", currentAction->getLookingChar(), msg);
                     return(call::E_AR_HDR_NOT_FOUND);
                 }
-                haystack = msgPart;
+                haystack = msgPart.c_str();
             } else if(currentAction->getLookingPlace() == CAction::E_LP_BODY) {
                 haystack = strstr(msg, "\r\n\r\n");
-                if (!haystack) {
+                if (haystack) {
+                    haystack += strlen("\r\n\r\n");
+                } else {
                     if (currentAction->getCheckIt() == true) {
-                        WARNING("Failed regexp match: body not found in message\n%s\n", msg);
+                        WARNING("Failed regexp match: body not found in message\n%s", msg);
                         return(call::E_AR_HDR_NOT_FOUND);
                     }
-                    msgPart[0] = '\0';
-                    haystack = msgPart;
+                    haystack = "";
                 }
-                haystack += strlen("\r\n\r\n");
             } else if(currentAction->getLookingPlace() == CAction::E_LP_MSG) {
                 haystack = msg;
             } else if(currentAction->getLookingPlace() == CAction::E_LP_VAR) {
                 /* Get the input variable. */
-                haystack = M_callVariableTable->getVar(currentAction->getVarInId())->getString();
-                if (!haystack) {
+                const char* value = M_callVariableTable->getVar(currentAction->getVarInId())->getString();
+                if (!value) {
                     if (currentAction->getCheckIt() == true) {
                         WARNING("Failed regexp match: variable $%d not set", currentAction->getVarInId());
                         return(call::E_AR_HDR_NOT_FOUND);
                     }
+                    value = "";
                 }
+                /* A copy: a match assigned to the variable it searches
+                 * frees the value searched. */
+                var_value = value;
+                haystack = var_value.c_str();
             } else {
                 ERROR("Invalid looking place: %d", currentAction->getLookingPlace());
             }
@@ -6080,62 +5422,58 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
             M_callVariableTable->getVar(currentAction->getSubVarId(0))->setDouble((double)tv.tv_usec);
         } else if (currentAction->getActionType() == CAction::E_AT_LOOKUP) {
             /* Create strings from the sending messages. */
-            char *file = strdup(createSendingMessage(currentAction->getMessage(0)));
-            char *key = strdup(createSendingMessage(currentAction->getMessage(1)));
+            std::string file = createSendingString(currentAction->getMessage(0));
+            std::string key = createSendingString(currentAction->getMessage(1));
 
-            if (inFiles.find(file) == inFiles.end()) {
-                ERROR("Invalid injection file for insert: %s", file);
+            auto in_file = inFiles.find(file.c_str());
+            if (in_file == inFiles.end()) {
+                ERROR("Invalid injection file for insert: %s", file.c_str());
             }
 
-            double value = inFiles[file]->lookup(key);
+            double value = in_file->second->lookup(key);
 
             M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value);
-            free(file);
-            free(key);
         } else if (currentAction->getActionType() == CAction::E_AT_INSERT) {
             /* Create strings from the sending messages. */
-            char *file = strdup(createSendingMessage(currentAction->getMessage(0)));
-            char *value = strdup(createSendingMessage(currentAction->getMessage(1)));
+            std::string file = createSendingString(currentAction->getMessage(0));
+            std::string value = createSendingString(currentAction->getMessage(1));
 
-            if (inFiles.find(file) == inFiles.end()) {
-                ERROR("Invalid injection file for insert: %s", file);
+            auto in_file = inFiles.find(file.c_str());
+            if (in_file == inFiles.end()) {
+                ERROR("Invalid injection file for insert: %s", file.c_str());
             }
 
-            inFiles[file]->insert(value);
-
-            free(file);
-            free(value);
+            in_file->second->insert(value);
         } else if (currentAction->getActionType() == CAction::E_AT_REPLACE) {
             /* Create strings from the sending messages. */
-            char *file = strdup(createSendingMessage(currentAction->getMessage(0)));
-            char *line = strdup(createSendingMessage(currentAction->getMessage(1)));
-            char *value = strdup(createSendingMessage(currentAction->getMessage(2)));
+            std::string file = createSendingString(currentAction->getMessage(0));
+            std::string line = createSendingString(currentAction->getMessage(1));
+            std::string value = createSendingString(currentAction->getMessage(2));
 
-            if (inFiles.find(file) == inFiles.end()) {
-                ERROR("Invalid injection file for replace: %s", file);
+            auto in_file = inFiles.find(file.c_str());
+            if (in_file == inFiles.end()) {
+                ERROR("Invalid injection file for replace: %s", file.c_str());
             }
 
             char *endptr;
-            int lineNum = (int)strtod(line, &endptr);
+            int lineNum = (int)strtod(line.c_str(), &endptr);
             if (*endptr) {
-                ERROR("Invalid line number for replace: %s", line);
+                ERROR("Invalid line number for replace: %s", line.c_str());
             }
 
-            inFiles[file]->replace(lineNum, value);
-
-            free(file);
-            free(line);
-            free(value);
+            in_file->second->replace(lineNum, value);
         } else if (currentAction->getActionType() == CAction::E_AT_CLOSE_CON) {
             if (call_socket) {
-                call_socket->close();
-                call_socket = nullptr;
+                dissociate_socket()->close();
             }
         } else if (currentAction->getActionType() == CAction::E_AT_SET_DEST) {
             /* Change the destination for this call. */
-            char *str_host = strdup(createSendingMessage(currentAction->getMessage(0)));
-            char *str_port = strdup(createSendingMessage(currentAction->getMessage(1)));
-            char *str_protocol = strdup(createSendingMessage(currentAction->getMessage(2)));
+            const std::string host = createSendingString(currentAction->getMessage(0));
+            const std::string port_text = createSendingString(currentAction->getMessage(1));
+            const std::string protocol_text = createSendingString(currentAction->getMessage(2));
+            const char *str_host = host.c_str();
+            const char *str_port = port_text.c_str();
+            const char *str_protocol = protocol_text.c_str();
 
             char *endptr;
             int port = (int)strtod(str_port, &endptr);
@@ -6152,11 +5490,16 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 protocol = T_TLS;
             } else if (!strcmp(str_protocol, "sctp") || !strcmp(str_protocol, "SCTP")) {
                 protocol = T_SCTP;
+            } else if (!strcmp(str_protocol, "ws") || !strcmp(str_protocol, "WS")) {
+                protocol = T_WS;
+            } else if (!strcmp(str_protocol, "wss") || !strcmp(str_protocol, "WSS")) {
+                protocol = T_WSS;
             } else {
                 ERROR("Unknown transport for setdest: '%s'", str_protocol);
             }
 
             if (!call_socket && ((protocol == T_TCP && transport == T_TCP) ||
+                                 (protocol == T_WS && transport == T_WS) ||
                                  (protocol == T_SCTP && transport == T_SCTP))) {
                 bool existing;
                 if ((associate_socket(SIPpSocket::new_sipp_call_socket(use_ipv6, transport, &existing))) == nullptr) {
@@ -6174,6 +5517,14 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 }
             }
 
+            /* A UDP call socket is bound, not connected: the new
+             * destination below applies to it as well. Only a failed
+             * connection deletes the call, which a UDP socket makes none
+             * of. */
+            if (!call_socket && protocol == T_UDP && transport == T_UDP && !connect_socket_if_needed()) {
+                ERROR("Internal error: a UDP call socket deleted its call");
+            }
+
             if (!call_socket) {
                 ERROR("Unable to get a socket");
             }
@@ -6184,9 +5535,9 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
 
             if (protocol == T_UDP) {
                 /* Nothing to do. */
-            } else if (protocol == T_TLS) {
+            } else if (TRANSPORT_IS_TLS(protocol)) {
                 ERROR("Changing destinations is not supported for TLS.");
-            } else if (protocol == T_TCP || protocol == T_SCTP) {
+            } else if (protocol == T_TCP || protocol == T_SCTP || protocol == T_WS) {
                 if (!multisocket) {
                     ERROR("Changing destinations for TCP or SCTP requires multisocket mode.");
                 }
@@ -6195,19 +5546,14 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 }
             }
 
-            if (gai_getsockaddr(&call_peer, str_host, port,
-                                AI_PASSIVE, AF_UNSPEC) != 0) {
+            if (gai_getsockaddr(&call_peer, str_host, port, AI_PASSIVE, AF_UNSPEC,
+                                call_socket->ss_ipv6 ? AF_INET6 : AF_INET) != 0) {
                 ERROR("Unknown host '%s' for setdest", str_host);
             }
             memcpy(&call_socket->ss_dest, &call_peer, sizeof(call_peer));
 
-            free(str_host);
-            free(str_port);
-            free(str_protocol);
-
-            if (protocol == T_TCP || protocol == T_SCTP) {
-                close(call_socket->ss_fd);
-                call_socket->ss_fd = -1;
+            if (protocol == T_TCP || protocol == T_SCTP || protocol == T_WS) {
+                call_socket->close_fd();
                 call_socket->ss_changed_dest = true;
                 if (call_socket->reconnect()) {
                     if (reconnect_allowed()) {
@@ -6249,18 +5595,13 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
             } else if (lf < end) {
                 result = false;
             } else {
-                char *auth = get_header(msg, "Authorization:", true);
-                auth = strdup(auth); // make a copy to avoid later get_header function call(clear its content)
-                char *method = (char *)malloc(end - msg + 1);
-                strncpy(method, msg, end - msg);
-                method[end - msg] = '\0';
+                const header_value auth = get_header(msg, "Authorization:", true);
+                const std::string method(msg, end - msg);
 
                 /* Generate the username to verify it against. */
-                char *tmp = createSendingMessage(currentAction->getMessage(0));
-                char *username = strdup(tmp);
+                const std::string username = createSendingString(currentAction->getMessage(0));
                 /* Generate the password to verify it against. */
-                tmp= createSendingMessage(currentAction->getMessage(1));
-                char *password = strdup(tmp);
+                const std::string password = createSendingString(currentAction->getMessage(1));
                 /* Need the body for length and auth-int calculation */
                 const char *body;
                 const char *auth_body = nullptr;
@@ -6272,12 +5613,7 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                     auth_body = "";
                 }
 
-                result = verifyAuthHeader(username, password, method, auth, auth_body);
-
-                free(username);
-                free(password);
-                free(method);
-                free(auth);
+                result = verifyAuthHeader(username.c_str(), password.c_str(), method.c_str(), auth.view(), auth_body);
             }
 
             M_callVariableTable->getVar(currentAction->getVarId())->setBool(result);
@@ -6416,22 +5752,24 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
             double operand = get_rhs(currentAction);
             paused_until = (int)operand;
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_ADD) {
-            double value = M_callVariableTable->getVar(currentAction->getVarId())->getDouble();
+            double value = get_var_double(currentAction->getVarId());
             double operand = get_rhs(currentAction);
             M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value + operand);
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_SUBTRACT) {
-            double value = M_callVariableTable->getVar(currentAction->getVarId())->getDouble();
+            double value = get_var_double(currentAction->getVarId());
             double operand = get_rhs(currentAction);
             M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value - operand);
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_MULTIPLY) {
-            double value = M_callVariableTable->getVar(currentAction->getVarId())->getDouble();
+            double value = get_var_double(currentAction->getVarId());
             double operand = get_rhs(currentAction);
             M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value * operand);
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_DIVIDE) {
-            double value = M_callVariableTable->getVar(currentAction->getVarId())->getDouble();
+            double value = get_var_double(currentAction->getVarId());
             double operand = get_rhs(currentAction);
             if (operand == 0) {
-                WARNING("Action failure: Can not divide by zero ($%d/$%d)!\n", currentAction->getVarId(), currentAction->getVarInId());
+                WARNING("Action failure: Can not divide by zero ($%s/$%s)!",
+                        call_scenario->allocVars->getName(currentAction->getVarId()),
+                        call_scenario->allocVars->getName(currentAction->getVarInId()));
             } else {
                 M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value / operand);
             }
@@ -6469,10 +5807,10 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 M_callVariableTable->getVar(currentAction->getVarId())->setBool(value);
             }
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_STRCMP) {
-            char *lhs = M_callVariableTable->getVar(currentAction->getVarInId())->getString();
-            char *rhs = currentAction->getVarIn2Id() ?
-                M_callVariableTable->getVar(currentAction->getVarIn2Id())->getString() :
-                currentAction->getStringValue();
+            const char *lhs = M_callVariableTable->getVar(currentAction->getVarInId())->getString();
+            const char *rhs = currentAction->getVarIn2Id()
+                                  ? M_callVariableTable->getVar(currentAction->getVarIn2Id())->getString()
+                                  : currentAction->getStringValue();
             int value = strcmp(lhs, rhs);
             if ((currentAction->getCheckIt() && value) ||
                 (currentAction->getCheckItInverse() && !value)
@@ -6503,58 +5841,46 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
             }
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_TRIM) {
             CCallVariable *var = M_callVariableTable->getVar(currentAction->getVarId());
-            char *in = var->getString();
-            char *p = in;
+            const char *p = var->getString();
             while (isspace(*p)) {
                 p++;
             }
-            char *q = strdup(p);
-            var->setString(q);
-            int l = strlen(q);
-            for (int i = l - 1; (i >= 0) && isspace(q[i]); i--) {
-                q[i] = '\0';
+            const char *end = p + strlen(p);
+            while (end > p && isspace(end[-1])) {
+                end--;
             }
+            var->setString(std::string(p, end));
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_URLDECODE) {
             CCallVariable *var = M_callVariableTable->getVar(currentAction->getVarId());
-            std::string input = var->getString();
-            std::string output = url_decode(input);
-            char *char_output = strdup(output.c_str());
-            var->setString(char_output);
+            var->setString(url_decode(var->getString()));
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_URLENCODE) {
             CCallVariable *var = M_callVariableTable->getVar(currentAction->getVarId());
-            std::string input = var->getString();
-            std::string output = url_encode(input);
-            char *char_output = strdup(output.c_str());
-            var->setString(char_output);
+            var->setString(url_encode(var->getString()));
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_TO_DOUBLE) {
             double value;
 
             if (M_callVariableTable->getVar(currentAction->getVarInId())->toDouble(&value)) {
                 M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value);
             } else {
-                WARNING("Invalid double conversion from $%d to $%d", currentAction->getVarInId(), currentAction->getVarId());
+                WARNING("Invalid double conversion from $%s to $%s",
+                        call_scenario->allocVars->getName(currentAction->getVarInId()),
+                        call_scenario->allocVars->getName(currentAction->getVarId()));
             }
         } else if (currentAction->getActionType() == CAction::E_AT_ASSIGN_FROM_SAMPLE) {
             double value = currentAction->getDistribution()->sample();
             M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value);
         } else if (currentAction->getActionType() == CAction::E_AT_ASSIGN_FROM_STRING) {
-            char* x = createSendingMessage(currentAction->getMessage());
-            char *str = strdup(x);
-            if (!str) {
-                ERROR("Out of memory duplicating string for assignment!");
-            }
-            M_callVariableTable->getVar(currentAction->getVarId())->setString(str);
+            M_callVariableTable->getVar(currentAction->getVarId())
+                ->setString(createSendingString(currentAction->getMessage()));
         } else if (currentAction->getActionType() == CAction::E_AT_LOG_TO_FILE) {
-            char* x = createSendingMessage(currentAction->getMessage());
-            LOG_MSG("%s\n", x);
+            LOG_MSG("%s\n", createSendingString(currentAction->getMessage()).c_str());
         } else if (currentAction->getActionType() == CAction::E_AT_LOG_WARNING) {
-            char* x = createSendingMessage(currentAction->getMessage());
-            WARNING("%s", x);
+            WARNING("%s", createSendingString(currentAction->getMessage()).c_str());
         } else if (currentAction->getActionType() == CAction::E_AT_LOG_ERROR) {
-            char* x = createSendingMessage(currentAction->getMessage());
-            ERROR("%s", x);
+            ERROR("%s", createSendingString(currentAction->getMessage()).c_str());
         } else if (currentAction->getActionType() == CAction::E_AT_EXECUTE_CMD) {
-            char* x = createSendingMessage(currentAction->getMessage());
+            const std::string command = createSendingString(currentAction->getMessage());
+            const char *x = command.c_str();
             // TRACE_MSG("Trying to execute [%s]", x);
             pid_t l_pid;
             switch(l_pid = fork()) {
@@ -6565,19 +5891,19 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
 
             case 0:
                 // first child process - execute the command
+                // Both children _exit(): exit() would run the atexit
+                // reset_stdin(), clearing O_NONBLOCK on the stdin they
+                // share with SIPp, whose next getch() would then block.
                 if((l_pid = fork()) < 0) {
-                    ERROR_NO("Forking error child");
-                } else {
-                    if( l_pid == 0) {
-                        int ret;
-                        ret = system(x); // second child runs
-                        if(ret == -1) {
-                            WARNING("system call error for %s", x);
-                        }
+                    WARNING_NO("Forking error child");
+                } else if (l_pid == 0) {
+                    int ret;
+                    ret = system(x); // second child runs
+                    if(ret == -1) {
+                        WARNING("system call error for %s", x);
                     }
-                    exit(EXIT_OTHER);
                 }
-                break;
+                _exit(EXIT_OTHER);
             default:
                 // parent process continue
                 // reap first child immediately
@@ -6589,6 +5915,11 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 }
                 break;
             }
+        } else if (currentAction->getActionType() == CAction::E_AT_EXEC_LUA) {
+            lua_script_exec(createSendingString(currentAction->getMessage()), M_callVariableTable,
+                            call_scenario->allocVars);
+        } else if (currentAction->getActionType() == CAction::E_AT_VERIFY_CMD) {
+            startVerify(createSendingString(currentAction->getMessage()).c_str());
         } else if (currentAction->getActionType() == CAction::E_AT_EXEC_INTCMD) {
             switch (currentAction->getIntCmd()) {
             case CAction::E_INTCMD_STOP_ALL:
@@ -6608,46 +5939,56 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
         } else if ((currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_AUDIO) ||
                    (currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_IMAGE) ||
                    (currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_VIDEO) ||
+                   (currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_TEXT) ||
                    (currentAction->getActionType() == CAction::E_AT_PLAY_DTMF)) {
             play_args_t* play_args = 0;
+            rtpstream_pcap_t stream = RTPSTREAM_PCAP_AUDIO;
             if ((currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_AUDIO) ||
                 (currentAction->getActionType() == CAction::E_AT_PLAY_DTMF)) {
-                play_args = &(this->play_args_a);
+                play_args = &playArgs(RTPSTREAM_PCAP_AUDIO);
             } else if (currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_IMAGE) {
-                play_args = &(this->play_args_i);
+                play_args = &playArgs(RTPSTREAM_PCAP_IMAGE);
+                stream = RTPSTREAM_PCAP_IMAGE;
             } else if (currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_VIDEO) {
-                play_args = &(this->play_args_v);
+                play_args = &playArgs(RTPSTREAM_PCAP_VIDEO);
+                stream = RTPSTREAM_PCAP_VIDEO;
+            } else if (currentAction->getActionType() == CAction::E_AT_PLAY_PCAP_TEXT) {
+                play_args = &playArgs(RTPSTREAM_PCAP_TEXT);
+                stream = RTPSTREAM_PCAP_TEXT;
             } else {
                 ERROR("Can't find pcap data to play");
             }
 
-            // existing media thread could be using play_args, so we have to kill it before modifying parameters
-            if (media_thread != 0) {
-                // If a media_thread is already active, kill it before starting a new one
-                pthread_cancel(media_thread);
-                pthread_join(media_thread, nullptr);
-                media_thread = 0;
-            }
-
+            /* the playback thread plays a copy, which owns a dtmf pcap */
             if (currentAction->getActionType() == CAction::E_AT_PLAY_DTMF) {
-                char* digits = createSendingMessage(currentAction->getMessage());
+                const std::string digits = createSendingString(currentAction->getMessage());
                 play_args->pcap = (pcap_pkts *) malloc(sizeof(pcap_pkts));
-                play_args->last_seq_no += parse_dtmf_play_args(digits, play_args->pcap, play_args->last_seq_no);
+                play_args->last_seq_no += parse_dtmf_play_args(digits.c_str(), play_args->pcap, play_args->last_seq_no);
                 play_args->free_pcap_when_done = 1;
             } else {
                 play_args->pcap = currentAction->getPcapPkts();
                 play_args->free_pcap_when_done = 0;
             }
 
-            /* port number is set in [auto_]media_port interpolation */
+            /* port number is set in [auto_]media_port interpolation; without
+             * it, send from the -mp port (+2 for video, +4 for text) rather
+             * than port 0 */
+            int offset = stream == RTPSTREAM_PCAP_VIDEO ? 2 : stream == RTPSTREAM_PCAP_TEXT ? 4 : 0;
+            in_port_t port = htons(media_port + offset);
             if (media_ip_is_ipv6) {
                 struct sockaddr_in6* from = (struct sockaddr_in6*) &(play_args->from);
                 from->sin6_family = AF_INET6;
-                inet_pton(AF_INET6, media_ip, &(from->sin6_addr));
+                from->sin6_addr = _RCAST(struct sockaddr_in6*, &media_sockaddr)->sin6_addr;
+                if (!from->sin6_port) {
+                    from->sin6_port = port;
+                }
             } else {
                 struct sockaddr_in* from = (struct sockaddr_in*) &(play_args->from);
                 from->sin_family = AF_INET;
-                from->sin_addr.s_addr = inet_addr(media_ip);
+                from->sin_addr = _RCAST(struct sockaddr_in*, &media_sockaddr)->sin_addr;
+                if (!from->sin_port) {
+                    from->sin_port = port;
+                }
 #ifdef USE_IPSEC
                 /* VoWiFi: the UE's RTP comes from the address the ePDG
                  * assigned, the one [media_ip] put into the SDP. Sent from
@@ -6658,222 +5999,101 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 }
 #endif
             }
-            /* Create a thread to send RTP or UDPTL packets */
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-#ifndef PTHREAD_STACK_MIN
-#define PTHREAD_STACK_MIN  16384
-#endif
-            int ret = pthread_create(&media_thread, &attr, send_wrapper, play_args);
-            if (ret) {
+            /* Send the RTP or UDPTL packets in the call's RTP playback
+             * thread, at once with its plays on the other streams */
+            if (!rtpstream_play_pcap(&rtpstream_callinfo, stream, play_args)) {
                 ERROR("Can't create thread to send RTP packets");
             }
-            pthread_attr_destroy(&attr);
+            play_args->pcap = nullptr;
 #endif
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_ECHO) {
-            rtp_echo_state = (currentAction->getDoubleValue() != 0);
+            rtp_echo_state.store(currentAction->getDoubleValue() != 0, std::memory_order_relaxed);
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_PAUSE) {
             rtpstream_pause(&rtpstream_callinfo);
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RESUME) {
             rtpstream_resume(&rtpstream_callinfo);
+        } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_WAIT) {
+            /* run() holds the next message while the playback lasts */
+            unsigned long play_end = rtpstream_play_end(&rtpstream_callinfo);
+            if (play_end) {
+                unsigned int timeout = (unsigned int)currentAction->getDoubleValue();
+                rtpstream_wait_until = timeout ? clock_tick + timeout : 0;
+                rtpstream_wait_msg = curmsg;
+                rtpstreamWaitNextCheck(play_end);
+            }
+        } else if (currentAction->getActionType() == CAction::E_AT_RTP_STATS) {
+            rtpstream_received_t received = rtpstream_received(&rtpstream_callinfo, currentAction->getDoubleValue() != 0);
+            M_callVariableTable->getVar(currentAction->getVarId())->setDouble(received.packets);
+            if (currentAction->getNbSubVarId() > 0) {
+                M_callVariableTable->getVar(currentAction->getSubVarId(0))->setDouble(received.first_pt);
+            }
+            if (currentAction->getNbSubVarId() > 1) {
+                /* the payload in hex */
+                static const char digits[] = "0123456789abcdef";
+                const std::string& payload = received.first_payload;
+                std::string hex(2 * payload.size(), '\0');
+                for (size_t i = 0; i < payload.size(); i++) {
+                    hex[2 * i] = digits[(unsigned char) payload[i] >> 4];
+                    hex[2 * i + 1] = digits[payload[i] & 0x0f];
+                }
+                M_callVariableTable->getVar(currentAction->getSubVarId(1))->setString(std::move(hex));
+            }
+        } else if (currentAction->getActionType() == CAction::E_AT_RTP_DTMF) {
+            rtpstream_received_t received = rtpstream_received(&rtpstream_callinfo, false);
+            /* the payload type, from 0 to 127 */
+            int payload_type = (int)currentAction->getDoubleValue();
+            std::string digits;
+            for (const auto &[pt, digit] : received.dtmf) {
+                if (pt == payload_type) {
+                    digits += digit;
+                }
+            }
+            M_callVariableTable->getVar(currentAction->getVarId())->setString(std::move(digits));
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_PLAY) {
-            const char *fileName = createSendingMessage(currentAction->getMessage());
-            currentAction->setRTPStreamActInfo(fileName);
-            rtpstream_play(&rtpstream_callinfo, currentAction->getRTPStreamActInfo());
-            // Obtain ID of parent thread used for the related RTP task
-            call_scenario->addRtpTaskThreadID(rtpstream_callinfo.threadID);
+            currentAction->setRTPStreamActInfo(createSendingString(currentAction->getMessage()).c_str());
+            /* A server plays with the keys of its own answer, as it echoes. */
+            const bool client = sendMode == MODE_CLIENT;
+            startSrtp(false, client, currentAction->getRTPStreamActInfo()->bytes_per_packet);
+            rtpstream_play(&rtpstream_callinfo, currentAction->getRTPStreamActInfo(),
+                           _srtpAudio.tx(client).forPlayback(), _srtpAudio.rx(client).forPlayback());
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_PAUSEAPATTERN) {
             rtpstream_pauseapattern(&rtpstream_callinfo);
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RESUMEAPATTERN) {
             rtpstream_resumeapattern(&rtpstream_callinfo);
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_PLAYAPATTERN) {
-            const char *fileName = createSendingMessage(currentAction->getMessage());
-            currentAction->setRTPStreamActInfo(fileName);
-            //
-            // TX/RX-UAC-AUDIO SRTP context (a)(b) -- SRTP PAYLOAD SIZE + DERIVE SESSION ENCRYPTION/SALTING/AUTHENTICATION KEYS + SELECT ENCRYPTION KEY + RESET CIPHER STATE
-            // WE ASSUME THE SAME CODEC PAYLOAD SIZE WILL BE USED IN BOTH DIRECTIONS
-            //
-            if (sendMode == MODE_CLIENT)
-            {
-                rtpstream_actinfo_t* actinfo = currentAction->getRTPStreamActInfo();
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-AUDIO SRTP context - CLIENT setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _txUACAudio.setSrtpPayloadSize(actinfo->bytes_per_packet);
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-AUDIO SRTP context - CLIENT setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _rxUACAudio.setSrtpPayloadSize(actinfo->bytes_per_packet);
-
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-AUDIO SRTP context - CLIENT deriving session encryption/salting/authentication keys\n");
-                _txUACAudio.deriveSessionEncryptionKey();
-                _txUACAudio.deriveSessionSaltingKey();
-                _txUACAudio.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-AUDIO SRTP context - CLIENT selecting encryption key\n");
-                _txUACAudio.selectEncryptionKey();
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-AUDIO SRTP context - CLIENT resetting cipher state\n");
-                _txUACAudio.resetCipherState();
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-AUDIO SRTP context - CLIENT deriving session encryption/salting/authentication keys\n");
-                _rxUACAudio.deriveSessionEncryptionKey();
-                _rxUACAudio.deriveSessionSaltingKey();
-                _rxUACAudio.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-AUDIO SRTP context - CLIENT selecting decryption key\n");
-                _rxUACAudio.selectDecryptionKey();
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-AUDIO SRTP context - CLIENT resetting cipher state\n");
-                _rxUACAudio.resetCipherState();
-                //logSrtpInfo("call::executeAction():  ******** (a) TX-UAC-AUDIO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _txUACAudio.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction():  ****************************************************\n");
-                //logSrtpInfo("call::executeAction():  ******** (b) RX-UAC-AUDIO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _rxUACAudio.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction():  ****************************************************\n");
-            }
+            currentAction->setRTPStreamActInfo(createSendingString(currentAction->getMessage()).c_str());
+            /* A server plays with the keys of its own answer, as it echoes. */
+            const bool client = sendMode == MODE_CLIENT;
+            startSrtp(false, client, currentAction->getRTPStreamActInfo()->bytes_per_packet);
 
             logSrtpInfo("call::executeAction():  rtpstream_playapattern\n");
-            rtpstream_playapattern(&rtpstream_callinfo,currentAction->getRTPStreamActInfo(), _txUACAudio, _rxUACAudio);
-            // Obtain ID of parent thread used for the related RTP task
-            call_scenario->addRtpTaskThreadID(rtpstream_callinfo.threadID);
+            rtpstream_playapattern(&rtpstream_callinfo, currentAction->getRTPStreamActInfo(),
+                                   _srtpAudio.tx(client).forPlayback(), _srtpAudio.rx(client).forPlayback());
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_PAUSEVPATTERN) {
             rtpstream_pausevpattern(&rtpstream_callinfo);
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RESUMEVPATTERN) {
             rtpstream_resumevpattern(&rtpstream_callinfo);
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_PLAYVPATTERN) {
-            const char *fileName = createSendingMessage(currentAction->getMessage());
-            currentAction->setRTPStreamActInfo(fileName);
-            //
-            // TX/RX-UAC-VIDEO SRTP context (a)(b) -- SRTP PAYLOAD SIZE + DERIVE SESSION ENCRYPTION/SALTING/AUTHENTICATION KEYS + SELECT ENCRYPTION KEY + RESET CIPHER STATE
-            // WE ASSUME THE SAME CODEC PAYLOAD SIZE WILL BE USED IN BOTH DIRECTIONS
-            //
-            if (sendMode == MODE_CLIENT)
-            {
-                rtpstream_actinfo_t* actinfo = currentAction->getRTPStreamActInfo();
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-VIDEO SRTP context - CLIENT setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _txUACVideo.setSrtpPayloadSize(actinfo->bytes_per_packet);
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-VIDEO SRTP context - CLIENT setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _rxUACVideo.setSrtpPayloadSize(actinfo->bytes_per_packet);
-
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-VIDEO SRTP context - CLIENT deriving session encryption/salting/authentication keys\n");
-                _txUACVideo.deriveSessionEncryptionKey();
-                _txUACVideo.deriveSessionSaltingKey();
-                _txUACVideo.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-VIDEO SRTP context - CLIENT selecting encryption key\n");
-                _txUACVideo.selectEncryptionKey();
-                logSrtpInfo("call::executeAction():  (a) TX-UAC-VIDEO SRTP context - CLIENT resetting cipher state\n");
-                _txUACVideo.resetCipherState();
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-VIDEO SRTP context - CLIENT deriving session encryption/salting/authentication keys\n");
-                _rxUACVideo.deriveSessionEncryptionKey();
-                _rxUACVideo.deriveSessionSaltingKey();
-                _rxUACVideo.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-VIDEO SRTP context - CLIENT selecting decryption key\n");
-                _rxUACVideo.selectDecryptionKey();
-                logSrtpInfo("call::executeAction():  (b) RX-UAC-VIDEO SRTP context - CLIENT resetting cipher state\n");
-                _rxUACVideo.resetCipherState();
-                //logSrtpInfo("call::executeAction():  ******** (a) TX-UAC-VIDEO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _txUACVideo.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction():  ****************************************************\n");
-                //logSrtpInfo("call::executeAction():  ******** (b) RX-UAC-VIDEO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _rxUACVideo.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction():  ****************************************************\n");
-            }
+            currentAction->setRTPStreamActInfo(createSendingString(currentAction->getMessage()).c_str());
+            /* A server plays with the keys of its own answer, as it echoes. */
+            const bool client = sendMode == MODE_CLIENT;
+            startSrtp(true, client, currentAction->getRTPStreamActInfo()->bytes_per_packet);
 
             logSrtpInfo("call::executeAction():  rtpstream_playvpattern\n");
-            rtpstream_playvpattern(&rtpstream_callinfo,currentAction->getRTPStreamActInfo(), _txUACVideo, _rxUACVideo);
-            // Obtain ID of parent thread used for the related RTP task
-            call_scenario->addRtpTaskThreadID(rtpstream_callinfo.threadID);
+            rtpstream_playvpattern(&rtpstream_callinfo, currentAction->getRTPStreamActInfo(),
+                                   _srtpVideo.tx(client).forPlayback(), _srtpVideo.rx(client).forPlayback());
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RTPECHO_STARTAUDIO) {
-            if (sendMode == MODE_SERVER)
-            {
-                //
-                // RX-UAS-AUDIO SRTP context (c) -- SSRC/IPADDRESS/PORT
-                //
-                CryptoContextID rxUASA;
-                rxUASA.ssrc = rtpstream_callinfo.taskinfo->audio_ssrc_id;
-                rxUASA.address = media_ip;
-                rxUASA.port = rtpstream_callinfo.local_audioport;
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (c) RX-UAS-AUDIO SRTP context - ssrc:0x%08x address:%s port:%d\n", rxUASA.ssrc, rxUASA.address.c_str(), rxUASA.port);
-                _rxUASAudio.setID(rxUASA);
-
-                //
-                // RX/TX-UAS-AUDIO SRTP context (c)(d) -- SRTP PAYLOAD SIZE + DERIVE SESSION ENCRYPTION/SALTING/AUTHENTICATION KEYS + SELECT ENCRYPTION KEY + RESET CIPHER STATE
-                // WE ASSUME THE SAME CODEC PAYLOAD SIZE WILL BE USED IN BOTH DIRECTIONS
-                //
-                rtpecho_actinfo_t* actinfo = currentAction->getRTPEchoActInfo();
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _rxUASAudio.setSrtpPayloadSize(actinfo->bytes_per_packet);
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _txUASAudio.setSrtpPayloadSize(actinfo->bytes_per_packet);
-
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _rxUASAudio.deriveSessionEncryptionKey();
-                _rxUASAudio.deriveSessionSaltingKey();
-                _rxUASAudio.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER selecting decryption key\n");
-                _rxUASAudio.selectDecryptionKey();
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER resetting cipher state\n");
-                _rxUASAudio.resetCipherState();
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _txUASAudio.deriveSessionEncryptionKey();
-                _txUASAudio.deriveSessionSaltingKey();
-                _txUASAudio.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER selecting encryption key\n");
-                _txUASAudio.selectEncryptionKey();
-                logSrtpInfo("call::executeAction() [STARTAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER resetting cipher state\n");
-                _txUASAudio.resetCipherState();
-                //logSrtpInfo("call::executeAction() [STARTAUDIO]:  ******** (c) RX-UAS-AUDIO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _rxUASAudio.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [STARTAUDIO]:  ****************************************************\n");
-                //logSrtpInfo("call::executeAction() [STARTAUDIO]:  ******** (d) TX-UAS-AUDIO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _txUASAudio.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [STARTAUDIO]:  ****************************************************\n");
-            }
+            startUASSrtp(false, currentAction->getRTPEchoActInfo()->bytes_per_packet);
 
             logSrtpInfo("call::executeAction() [STARTAUDIO]:  rtpstream_rtpecho_startaudio\n");
-            rtpstream_rtpecho_startaudio(&rtpstream_callinfo, _rxUASAudio, _txUASAudio);
+            rtpstream_rtpecho_startaudio(&rtpstream_callinfo, _srtpAudio.rxUAS.forPlayback(),
+                                         _srtpAudio.txUAS.forPlayback());
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RTPECHO_UPDATEAUDIO) {
-            if (sendMode == MODE_SERVER)
-            {
-                //
-                // RX-UAS-AUDIO SRTP context (c) -- SSRC/IPADDRESS/PORT
-                //
-                CryptoContextID rxUASA;
-                rxUASA.ssrc = rtpstream_callinfo.taskinfo->audio_ssrc_id;
-                rxUASA.address = media_ip;
-                rxUASA.port = rtpstream_callinfo.local_audioport;
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (c) RX-UAS-AUDIO SRTP context - ssrc:0x%08x address:%s port:%d\n", rxUASA.ssrc, rxUASA.address.c_str(), rxUASA.port);
-                _rxUASAudio.setID(rxUASA);
-
-                //
-                // RX/TX-UAS-AUDIO SRTP context (c)(d) -- SRTP PAYLOAD SIZE + DERIVE SESSION ENCRYPTION/SALTING/AUTHENTICATION KEYS + SELECT ENCRYPTION KEY + RESET CIPHER STATE
-                // WE ASSUME THE SAME CODEC PAYLOAD SIZE WILL BE USED IN BOTH DIRECTIONS
-                //
-                rtpecho_actinfo_t* actinfo = currentAction->getRTPEchoActInfo();
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _rxUASAudio.setSrtpPayloadSize(actinfo->bytes_per_packet);
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _txUASAudio.setSrtpPayloadSize(actinfo->bytes_per_packet);
-
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _rxUASAudio.deriveSessionEncryptionKey();
-                _rxUASAudio.deriveSessionSaltingKey();
-                _rxUASAudio.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER selecting decryption key\n");
-                _rxUASAudio.selectDecryptionKey();
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (c) RX-UAS-AUDIO SRTP context - SERVER resetting cipher state\n");
-                _rxUASAudio.resetCipherState();
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _txUASAudio.deriveSessionEncryptionKey();
-                _txUASAudio.deriveSessionSaltingKey();
-                _txUASAudio.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER selecting encryption key\n");
-                _txUASAudio.selectEncryptionKey();
-                logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  (d) TX-UAS-AUDIO SRTP context - SERVER resetting cipher state\n");
-                _txUASAudio.resetCipherState();
-                //logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  ******** (c) RX-UAS-AUDIO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _rxUASAudio.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  ****************************************************\n");
-                //logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  ******** (d) TX-UAS-AUDIO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _txUASAudio.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  ****************************************************\n");
-            }
+            startUASSrtp(false, currentAction->getRTPEchoActInfo()->bytes_per_packet);
 
             logSrtpInfo("call::executeAction() [UPDATEAUDIO]:  rtpstream_rtpecho_updateaudio\n");
-            rtpstream_rtpecho_updateaudio(&rtpstream_callinfo, _rxUASAudio, _txUASAudio);
+            rtpstream_rtpecho_updateaudio(&rtpstream_callinfo, _srtpAudio.rxUAS.forPlayback(),
+                                          _srtpAudio.txUAS.forPlayback());
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RTPECHO_STOPAUDIO) {
             logSrtpInfo("call::executeAction() [STOPAUDIO]:  rtpstream_rtpecho_stopaudio\n");
             rc = rtpstream_rtpecho_stopaudio(&rtpstream_callinfo);
@@ -6883,103 +6103,17 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 return call::E_AR_RTPECHO_ERROR;
             }
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RTPECHO_STARTVIDEO) {
-            if (sendMode == MODE_SERVER)
-            {
-                //
-                // RX-UAS-VIDEO SRTP context (c) -- SSRC/IPADDRESS/PORT
-                //
-                CryptoContextID rxUASV;
-                rxUASV.ssrc = rtpstream_callinfo.taskinfo->video_ssrc_id;
-                rxUASV.address = media_ip;
-                rxUASV.port = rtpstream_callinfo.local_videoport;
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (c) RX-UAS-VIDEO SRTP context - ssrc:0x%08x address:%s port:%d\n", rxUASV.ssrc, rxUASV.address.c_str(), rxUASV.port);
-                _rxUASVideo.setID(rxUASV);
-
-                //
-                // RX/TX-UAS-VIDEO SRTP context (c)(d) -- SRTP PAYLOAD SIZE + DERIVE SESSION ENCRYPTION/SALTING/AUTHENTICATION KEYS + SELECT ENCRYPTION KEY + RESET CIPHER STATE
-                // WE ASSUME THE SAME CODEC PAYLOAD SIZE WILL BE USED IN BOTH DIRECTIONS
-                //
-                rtpecho_actinfo_t* actinfo = currentAction->getRTPEchoActInfo();
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _rxUASVideo.setSrtpPayloadSize(actinfo->bytes_per_packet);
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _txUASVideo.setSrtpPayloadSize(actinfo->bytes_per_packet);
-
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _rxUASVideo.deriveSessionEncryptionKey();
-                _rxUASVideo.deriveSessionSaltingKey();
-                _rxUASVideo.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER selecting decryption key\n");
-                _rxUASVideo.selectDecryptionKey();
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER resetting cipher state\n");
-                _rxUASVideo.resetCipherState();
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _txUASVideo.deriveSessionEncryptionKey();
-                _txUASVideo.deriveSessionSaltingKey();
-                _txUASVideo.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER selecting encryption key\n");
-                _txUASVideo.selectEncryptionKey();
-                logSrtpInfo("call::executeAction() [STARTVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER resetting cipher state\n");
-                _txUASVideo.resetCipherState();
-                //logSrtpInfo("call::executeAction() [STARTVIDEO]:  ******** (c) RX-UAS-VIDEO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _rxUASVideo.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [STARTVIDEO]:  ****************************************************\n");
-                //logSrtpInfo("call::executeAction() [STARTVIDEO]:  ******** (d) TX-UAS-VIDEO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _txUASVideo.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [STARTVIDEO]:  ****************************************************\n");
-            }
+            startUASSrtp(true, currentAction->getRTPEchoActInfo()->bytes_per_packet);
 
             logSrtpInfo("call::executeAction() [STARTVIDEO]:  rtpstream_rtpecho_startvideo\n");
-            rtpstream_rtpecho_startvideo(&rtpstream_callinfo, _rxUASVideo, _txUASVideo);
+            rtpstream_rtpecho_startvideo(&rtpstream_callinfo, _srtpVideo.rxUAS.forPlayback(),
+                                         _srtpVideo.txUAS.forPlayback());
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RTPECHO_UPDATEVIDEO) {
-            if (sendMode == MODE_SERVER)
-            {
-                //
-                // RX-UAS-VIDEO SRTP context (c) -- SSRC/IPADDRESS/PORT
-                //
-                CryptoContextID rxUASV;
-                rxUASV.ssrc = rtpstream_callinfo.taskinfo->video_ssrc_id;
-                rxUASV.address = media_ip;
-                rxUASV.port = rtpstream_callinfo.local_videoport;
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (c) RX-UAS-VIDEO SRTP context - ssrc:0x%08x address:%s port:%d\n", rxUASV.ssrc, rxUASV.address.c_str(), rxUASV.port);
-                _rxUASVideo.setID(rxUASV);
-
-                //
-                // RX/TX-UAS-VIDEO SRTP context (c)(d) -- SRTP PAYLOAD SIZE + DERIVE SESSION ENCRYPTION/SALTING/AUTHENTICATION KEYS + SELECT ENCRYPTION KEY + RESET CIPHER STATE
-                // WE ASSUME THE SAME CODEC PAYLOAD SIZE WILL BE USED IN BOTH DIRECTIONS
-                //
-                rtpecho_actinfo_t* actinfo = currentAction->getRTPEchoActInfo();
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _rxUASVideo.setSrtpPayloadSize(actinfo->bytes_per_packet);
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER setting SRTP payload size to %d\n", actinfo->bytes_per_packet);
-                _txUASVideo.setSrtpPayloadSize(actinfo->bytes_per_packet);
-
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _rxUASVideo.deriveSessionEncryptionKey();
-                _rxUASVideo.deriveSessionSaltingKey();
-                _rxUASVideo.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER selecting decryption key\n");
-                _rxUASVideo.selectDecryptionKey();
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (c) RX-UAS-VIDEO SRTP context - SERVER resetting cipher state\n");
-                _rxUASVideo.resetCipherState();
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER deriving session encryption/salting/authentication keys\n");
-                _txUASVideo.deriveSessionEncryptionKey();
-                _txUASVideo.deriveSessionSaltingKey();
-                _txUASVideo.deriveSessionAuthenticationKey();
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER selecting encryption key\n");
-                _txUASVideo.selectEncryptionKey();
-                logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  (d) TX-UAS-VIDEO SRTP context - SERVER resetting cipher state\n");
-                _txUASVideo.resetCipherState();
-                //logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  ******** (c) RX-UAS-VIDEO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _rxUASVideo.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  ****************************************************\n");
-                //logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  ******** (d) TX-UAS-VIDEO SRTP context dump ********\n");
-                //logSrtpInfo("%s", _txUASVideo.dumpCryptoContext().c_str());
-                //logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  ****************************************************\n");
-            }
+            startUASSrtp(true, currentAction->getRTPEchoActInfo()->bytes_per_packet);
 
             logSrtpInfo("call::executeAction() [UPDATEVIDEO]:  rtpstream_rtpecho_updatevideo\n");
-            rtpstream_rtpecho_updatevideo(&rtpstream_callinfo, _rxUASVideo, _txUASVideo);
+            rtpstream_rtpecho_updatevideo(&rtpstream_callinfo, _srtpVideo.rxUAS.forPlayback(),
+                                          _srtpVideo.txUAS.forPlayback());
         } else if (currentAction->getActionType() == CAction::E_AT_RTP_STREAM_RTPECHO_STOPVIDEO) {
             logSrtpInfo("call::executeAction() [STOPVIDEO]:  rtpstream_rtpecho_stopvideo\n");
             rc = rtpstream_rtpecho_stopvideo(&rtpstream_callinfo);
@@ -6995,25 +6129,35 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
     return(call::E_AR_NO_ERROR);
 }
 
-void call::extractSubMessage(const char* msg, char* matchingString, char* result, bool case_indep, int occurrence, bool headers)
+/* What follows matchingString on its line, "" if it is not found */
+std::string call::extractSubMessage(const char *msg, const char *matchingString, bool case_indep, int occurrence,
+                                    bool headers)
 {
 
     const char *ptr, *ptr1;
-    int sizeOf;
-    int i = 0;
     int len = strlen(matchingString);
     char mat1 = tolower(*matchingString);
     char mat2 = toupper(*matchingString);
+    /* A header name (an RFC 3261 token, with or without its colon)
+     * starts a line and ends at the colon: "To" is neither "Topic:" nor
+     * "X-Forward-To:". Any other text ("tag=") is looked for anywhere,
+     * or at the start of a line with start_line. */
+    int toklen = 0;
+    while (matchingString[toklen] &&
+           (isalnum((unsigned char)matchingString[toklen]) || strchr("-.!%*_+`'~", matchingString[toklen]))) {
+        toklen++;
+    }
+    bool name = toklen > 0 && (!matchingString[toklen] || !strcmp(matchingString + toklen, ":"));
+    bool need_colon = name && !matchingString[toklen];
+    if (name) {
+        headers = true;
+    }
 
     ptr = msg;
     while (*ptr) {
         if (!case_indep) {
             ptr = strstr(ptr, matchingString);
             if (ptr == nullptr) break;
-            if (headers == true && ptr != msg && *(ptr-1) != '\n') {
-                ++ptr;
-                continue;
-            }
         } else {
             if (headers) {
                 if (ptr != msg) {
@@ -7037,50 +6181,61 @@ void call::extractSubMessage(const char* msg, char* matchingString, char* result
                 continue;
             }
         }
+        if (headers && ptr != msg && *(ptr - 1) != '\n') {
+            ++ptr;
+            continue;
+        }
+        if (need_colon) {
+            ptr1 = ptr + len;
+            while (*ptr1 == ' ' || *ptr1 == '\t') {
+                ptr1++;
+            }
+            if (*ptr1 != ':') {
+                ++ptr;
+                continue;
+            }
+        }
         // here with ptr pointing to a matching string
         if (occurrence <= 1) break;
         --occurrence;
         ++ptr;
     }
 
-    if(ptr != nullptr && *ptr != 0) {
-        strncpy(result, ptr+len, MAX_SUB_MESSAGE_LENGTH);
-        sizeOf = strlen(result);
-        if(sizeOf >= MAX_SUB_MESSAGE_LENGTH)
-            sizeOf = MAX_SUB_MESSAGE_LENGTH-1;
-        while((i<sizeOf) && (result[i] != '\n') && (result[i] != '\r'))
-            i++;
-        result[i] = '\0';
-    } else {
-        result[0] = '\0';
+    if (ptr != nullptr && *ptr != 0) {
+        const char *rest = ptr + len;
+        return std::string(rest, strcspn(rest, "\r\n"));
     }
+    return "";
 }
 
-void call::getFieldFromInputFile(const char *fileName, int field, SendingMessage *lineMsg, char*& dest)
+std::string call::getFieldFromInputFile(const std::string &fileName, int field, SendingMessage *lineMsg)
 {
     if (m_lineNumber == nullptr) {
         ERROR("Automatic calls (created by -aa, -oocsn or -oocsf) cannot use input files!");
     }
-    if (inFiles.find(fileName) == inFiles.end()) {
-        ERROR("Invalid injection file: %s", fileName);
+    const file_map::iterator in_file = inFiles.find(fileName);
+    if (in_file == inFiles.end()) {
+        ERROR("Invalid injection file: %s", fileName.c_str());
     }
     int line = (*m_lineNumber)[fileName];
     if (lineMsg) {
-        char lineBuffer[20];
+        char lineBuffer[64];
         char *endptr;
         createSendingMessage(lineMsg, SM_UNUSED, lineBuffer, sizeof(lineBuffer));
         line = (int) strtod(lineBuffer, &endptr);
-        if (*endptr != 0) {
+        /* Empty, not a number, or too long for the buffer. */
+        if (endptr == lineBuffer || *endptr != 0 ||
+                strlen(lineBuffer) == sizeof(lineBuffer) - 1) {
             ERROR("Invalid line number generated: '%s'", lineBuffer);
         }
-        if (line > inFiles[fileName]->numLines()) {
+        if (line > in_file->second->numLines()) {
             line = -1;
         }
     }
     if (line < 0) {
-        return;
+        return "";
     }
-    dest += inFiles[fileName]->getField(line, field, dest, SIPP_MAX_MSG_SIZE);
+    return in_file->second->getField(line, field);
 }
 
 call::T_AutoMode call::checkAutomaticResponseMode(char* P_recv)
@@ -7104,39 +6259,19 @@ call::T_AutoMode call::checkAutomaticResponseMode(char* P_recv)
 
 void call::setLastMsg(const char *msg)
 {
-    realloc_ptr = (char *) realloc(last_recv_msg, strlen(msg) + 1);
-    if (realloc_ptr) {
-        last_recv_msg = realloc_ptr;
-    } else {
-        free(last_recv_msg);
-        ERROR("Out of memory!");
-        return;
-    }
-
-    strcpy(last_recv_msg, msg);
+    assign_exact(last_recv_msg, msg);
 }
 
 bool call::automaticResponseMode(T_AutoMode P_case, const char* P_recv)
 {
 
     int res ;
-    char * old_last_recv_msg = nullptr;
-    bool last_recv_msg_saved = false;
+    std::string old_last_recv_msg;
 
     switch (P_case) {
     case E_AM_UNEXP_BYE: // response for an unexpected BYE
         // usage of last_ keywords
-        realloc_ptr = (char *) realloc(last_recv_msg, strlen(P_recv) + 1);
-        if (realloc_ptr) {
-            last_recv_msg = realloc_ptr;
-        } else {
-            free(last_recv_msg);
-            ERROR("Out of memory!");
-            return false;
-        }
-
-
-        strcpy(last_recv_msg, P_recv);
+        assign_exact(last_recv_msg, P_recv);
 
         // The BYE is unexpected, count it
         call_scenario->messages[msg_index] -> nb_unexp++;
@@ -7164,17 +6299,7 @@ bool call::automaticResponseMode(T_AutoMode P_case, const char* P_recv)
 
     case E_AM_UNEXP_CANCEL: // response for an unexpected cancel
         // usage of last_ keywords
-        realloc_ptr = (char *) realloc(last_recv_msg, strlen(P_recv) + 1);
-        if (realloc_ptr) {
-            last_recv_msg = realloc_ptr;
-        } else {
-            free(last_recv_msg);
-            ERROR("Out of memory!");
-            return false;
-        }
-
-
-        strcpy(last_recv_msg, P_recv);
+        assign_exact(last_recv_msg, P_recv);
 
         // The CANCEL is unexpected, count it
         call_scenario->messages[msg_index] -> nb_unexp++;
@@ -7197,23 +6322,13 @@ bool call::automaticResponseMode(T_AutoMode P_case, const char* P_recv)
             computeStat(CStat::E_FAILED_UNEXPECTED_MSG);
             delete this;
         } else {
-            WARNING("Continuing call on unexpected CANCEL for call: %s", (id==nullptr)?"none":id);
+            WARNING("Continuing call on an unexpected CANCEL for call: %s", (id==nullptr)?"none":id);
         }
         break ;
 
     case E_AM_PING: // response for a random ping
         // usage of last_ keywords
-        realloc_ptr = (char *) realloc(last_recv_msg, strlen(P_recv) + 1);
-        if (realloc_ptr) {
-            last_recv_msg = realloc_ptr;
-        } else {
-            free(last_recv_msg);
-            ERROR("Out of memory!");
-            return false;
-        }
-
-
-        strcpy(last_recv_msg, P_recv);
+        assign_exact(last_recv_msg, P_recv);
 
         if (default_behaviors & DEFAULT_BEHAVIOR_PINGREPLY) {
             WARNING("Automatic response mode for an unexpected PING for call: %s", (id==nullptr)?"none":id);
@@ -7230,6 +6345,7 @@ bool call::automaticResponseMode(T_AutoMode P_case, const char* P_recv)
             }
 
             CStat::globalStat(CStat::E_AUTO_ANSWERED);
+            computeStat(CStat::E_CALL_ENDED_UNCOUNTED);
             delete this;
         } else {
             WARNING("Do not answer on an unexpected PING for call: %s", (id==nullptr)?"none":id);
@@ -7240,47 +6356,17 @@ bool call::automaticResponseMode(T_AutoMode P_case, const char* P_recv)
         // store previous last msg if msg is INFO, NOTIFY, OPTIONS or UPDATE
         // restore last_recv_msg to previous one
         // after sending ok
-        old_last_recv_msg = nullptr;
-        if (last_recv_msg != nullptr) {
-            last_recv_msg_saved = true;
-            old_last_recv_msg = (char *) malloc(strlen(last_recv_msg)+1);
-            strcpy(old_last_recv_msg, last_recv_msg);
-        }
+        old_last_recv_msg = std::move(last_recv_msg);
         // usage of last_ keywords
-        realloc_ptr = (char *) realloc(last_recv_msg, strlen(P_recv) + 1);
-        if (realloc_ptr) {
-            last_recv_msg = realloc_ptr;
-        } else {
-            free(last_recv_msg);
-            free(old_last_recv_msg);
-            ERROR("Out of memory!");
-            return false;
-        }
-
-
-        strcpy(last_recv_msg, P_recv);
+        assign_exact(last_recv_msg, P_recv);
 
         TRACE_CALLDEBUG("Automatic response mode for an unexpected INFO, NOTIFY, OPTIONS or UPDATE for call: %s",
                         (id == nullptr) ? "none" : id);
         sendBuffer(createSendingMessage(get_default_message("200")));
 
         // restore previous last msg
-        if (last_recv_msg_saved == true) {
-            realloc_ptr = (char *) realloc(last_recv_msg, strlen(old_last_recv_msg) + 1);
-            if (realloc_ptr) {
-                last_recv_msg = realloc_ptr;
-            } else {
-                free(last_recv_msg);
-                ERROR("Out of memory!");
-                return false;
-            }
-
-
-            strcpy(last_recv_msg, old_last_recv_msg);
-            if (old_last_recv_msg != nullptr) {
-                free(old_last_recv_msg);
-                old_last_recv_msg = nullptr;
-            }
+        if (!old_last_recv_msg.empty()) {
+            last_recv_msg = std::move(old_last_recv_msg);
         }
         CStat::globalStat(CStat::E_AUTO_ANSWERED);
         return true;
@@ -7308,6 +6394,234 @@ int call::logSrtpInfo(const char *fmt, ...)
     return 0;
 }
 
+/* The message to send again for a retransmission of the request it
+ * answered stays when last_send_msg is about to change: it takes it. */
+void call::keepRecvRetransMsg()
+{
+    if (recv_retrans_last) {
+        recv_retrans_msg = std::move(last_send_msg);
+        recv_retrans_last = false;
+    }
+}
+
+/* The context of the call's role that sends, or receives, a media's SRTP,
+ * made on use; none in any other mode */
+SrtpChannel *call::srtpTx(bool video)
+{
+    return sendMode == MODE_CLIENT   ? &srtpMedia(video).txUAC.get()
+           : sendMode == MODE_SERVER ? &srtpMedia(video).txUAS.get()
+                                     : nullptr;
+}
+
+SrtpChannel *call::srtpRx(bool video)
+{
+    return sendMode == MODE_CLIENT   ? &srtpMedia(video).rxUAC.get()
+           : sendMode == MODE_SERVER ? &srtpMedia(video).rxUAS.get()
+                                     : nullptr;
+}
+
+/* The a=crypto lines of an SDP we send, and the address we receive on: the
+ * lines, and only those, are the ones an answer can take. */
+void call::passLocalSrtp(bool video, SrtpInfoParams &p)
+{
+    if (SrtpChannel *tx = srtpTx(video)) {
+        tx->setCryptoTag(p.primary_cryptotag, PRIMARY_CRYPTO);
+        tx->setCryptoTag(p.secondary_cryptotag, SECONDARY_CRYPTO);
+        tx->setOfferedCryptoSuite(p.primary_cryptosuite, PRIMARY_CRYPTO);
+        tx->setOfferedCryptoSuite(p.secondary_cryptosuite, SECONDARY_CRYPTO);
+    }
+    if (p.primary_cryptotag == 0) {
+        return;
+    }
+
+    if (video) {
+        rtpstream_set_srtp_video_local(&rtpstream_callinfo, p);
+    } else {
+        rtpstream_set_srtp_audio_local(&rtpstream_callinfo, p);
+    }
+    if (sendMode == MODE_CLIENT) {
+        CryptoContextID id;
+        id.ssrc = video ? rtpstream_callinfo.video_ssrc_id : rtpstream_callinfo.audio_ssrc_id;
+        id.address = media_ip;
+        id.port = video ? rtpstream_callinfo.local_videoport : rtpstream_callinfo.local_audioport;
+        logSrtpInfo("call::createSendingMessage():  RX-UAC-%s SRTP context - ssrc:0x%08x address:%s port:%d\n",
+                    video ? "VIDEO" : "AUDIO", id.ssrc, id.address.c_str(), id.port);
+        srtpMedia(video).rxUAC->setID(std::move(id));
+    }
+}
+
+/* An SRTP keyword of a message we send: it sets what the context that sends
+ * takes from the keyword, and writes it. */
+void call::appendSrtpKeyword(const SrtpKeyword &keyword, const MessageComponent &comp, std::string &out,
+                             SrtpInfoParams &p)
+{
+    const bool primary = keyword.crypto == PRIMARY_CRYPTO;
+    SrtpChannel *tx = srtpTx(keyword.video);
+
+    p.found = true;
+    switch (keyword.what) {
+    case SrtpKeyword::TAG: {
+        int &tag = primary ? p.primary_cryptotag : p.secondary_cryptotag;
+        tag = primary ? 1 : 2;
+        logSrtpInfo("call::createSendingMessage():  %s crypto tag: %d\n", primary ? "PRIMARY" : "SECONDARY", tag);
+        if (tx) {
+            tx->setCryptoTag(tag, keyword.crypto);
+        }
+        append_number(out, tag);
+        break;
+    }
+    case SrtpKeyword::SUITE:
+    case SrtpKeyword::UNENCRYPTED: {
+        const bool unencrypted = keyword.what == SrtpKeyword::UNENCRYPTED;
+        const SrtpSuite &suite = *keyword.suite;
+        logSrtpInfo("call::createSendingMessage():  %s %s cryptosuite %s\n", keyword.video ? "VIDEO" : "AUDIO",
+                    primary ? "PRIMARY" : "SECONDARY", suite.name);
+        if (tx) {
+            if (tx->selectCipherAlgorithm(unencrypted ? NULL_CIPHER : suite.cipher, keyword.crypto) < 0) {
+                ERROR("SRTP crypto suite %s is not supported by the TLS library SIPp is built with", suite.name);
+            }
+            tx->selectHashAlgorithm(suite.hash, keyword.crypto);
+        }
+        if (unencrypted) {
+            (primary ? p.primary_unencrypted_srtp : p.secondary_unencrypted_srtp) = true;
+        } else if (primary) {
+            SrtpChannel *rx = srtpRx(keyword.video);
+            if ((getSessionStateCurrent() == eNoSession) || (getSessionStateCurrent() == eCompleted)) {
+                logSrtpInfo("call::createSendingMessage():  Marking preferred OFFER cryptosuite...\n");
+            } else if ((getSessionStateCurrent() == eOfferReceived) && rx && answer_swaps_crypto(*rx, suite.name)) {
+                logSrtpInfo("call::createSendingMessage():  Preferred ANSWER cryptosuite mismatch -- SWAPPING...\n");
+                rx->swapCrypto();
+            }
+        }
+        snprintf(primary ? p.primary_cryptosuite : p.secondary_cryptosuite, sizeof(p.primary_cryptosuite), "%s",
+                 suite.name);
+        out += unencrypted ? "UNENCRYPTED_SRTP" : suite.name;
+        break;
+    }
+    case SrtpKeyword::KEYPARAMS: {
+        char *keyparams = primary ? p.primary_cryptokeyparams : p.secondary_cryptokeyparams;
+        std::string mks;
+        if (tx) {
+            if (comp.offset >= 0) {
+                tx->generateMasterKey(keyword.crypto);
+                tx->generateMasterSalt(keyword.crypto);
+            }
+            tx->encodeMasterKeySalt(mks, keyword.crypto);
+            logSrtpInfo("call::createSendingMessage():  %s %s master key/salt: %s\n", primary ? "PRIMARY" : "SECONDARY",
+                        comp.offset >= 0 ? "generating new" : "reusing old", mks.c_str());
+        }
+        snprintf(keyparams, sizeof(p.primary_cryptokeyparams), "%s", mks.c_str());
+        out += keyparams;
+        break;
+    }
+    }
+}
+
+/* The a=crypto lines of a received SDP's media in the contexts of the role:
+ * the one that sends takes the peer's address, and the one that receives
+ * the keys the peer sends with. */
+void call::takeRemoteSrtp(bool video, const SrtpInfoParams &p, const std::string &host, int port, bool answer)
+{
+    if (sendMode != MODE_CLIENT && sendMode != MODE_SERVER) {
+        return;
+    }
+    const bool client = sendMode == MODE_CLIENT;
+    SrtpMedia &media = srtpMedia(video);
+    LazySrtpChannel &tx = media.tx(client);
+    LazySrtpChannel &rx = media.rx(client);
+    const char *name = video ? (client ? "UAC-VIDEO" : "UAS-VIDEO") : (client ? "UAC-AUDIO" : "UAS-AUDIO");
+
+    CryptoContextID id;
+    id.ssrc = video ? rtpstream_callinfo.video_ssrc_id : rtpstream_callinfo.audio_ssrc_id;
+    id.address = host;
+    id.port = port;
+    logSrtpInfo("call::process_incoming():  TX-%s SRTP context - ssrc:0x%08x address:%s port:%d\n", name, id.ssrc,
+                id.address.c_str(), id.port);
+    tx->setID(std::move(id));
+
+    if (answer) {
+        logSrtpInfo("call::process_incoming():  TX-%s SRTP context -- CIPHERSUITE CHOICE...\n", name);
+        take_answered_crypto(tx, p, video ? "video" : "audio");
+    }
+
+    const struct {
+        ActiveCrypto crypto;
+        int tag;
+        const char *suite, *keyparams;
+        bool unencrypted;
+    } lines[] = {
+        {PRIMARY_CRYPTO, p.primary_cryptotag, p.primary_cryptosuite, p.primary_cryptokeyparams,
+         p.primary_unencrypted_srtp},
+        {SECONDARY_CRYPTO, p.secondary_cryptotag, p.secondary_cryptosuite, p.secondary_cryptokeyparams,
+         p.secondary_unencrypted_srtp},
+    };
+    for (const auto &line : lines) {
+        std::string mks = line.keyparams;
+        if (!mks.empty() && decode_srtp_key(rx, mks, line.suite, line.crypto)) {
+            logSrtpInfo("call::process_incoming():  RX-%s SRTP context -- %s master key/salt: %s, crypto tag: %d, "
+                        "cryptosuite: [%s]%s\n",
+                        name, line.crypto == PRIMARY_CRYPTO ? "primary" : "secondary", mks.c_str(), line.tag,
+                        line.suite, line.unencrypted ? " UNENCRYPTED_SRTP" : "");
+            rx->setCryptoTag(line.tag, line.crypto);
+            rx->setOfferedCryptoSuite(line.suite, line.crypto);
+            select_srtp_suite(rx, line.suite, line.unencrypted, line.crypto);
+        } else {
+            // No line, or an ignored one: nothing to receive with in the slot
+            rx->setCryptoTag(0, line.crypto);
+            rx->setOfferedCryptoSuite("", line.crypto);
+        }
+    }
+}
+
+/* Derives the keys of a media's contexts of the role, now its payload size
+ * is known. A call without SRTP has none to derive. The payload size of
+ * the codec is assumed the same in both directions. */
+void call::startSrtp(bool video, bool client, int payloadSize)
+{
+    SrtpMedia &media = srtpMedia(video);
+    LazySrtpChannel &tx = media.tx(client);
+    LazySrtpChannel &rx = media.rx(client);
+    if (!tx.made() && !rx.made()) {
+        return;
+    }
+
+    const char *name = video ? (client ? "UAC-VIDEO" : "UAS-VIDEO") : (client ? "UAC-AUDIO" : "UAS-AUDIO");
+    logSrtpInfo("call::executeAction():  TX/RX-%s SRTP contexts - setting SRTP payload size to %d, deriving session "
+                "encryption/salting/authentication keys\n",
+                name, payloadSize);
+    for (LazySrtpChannel *context : {&tx, &rx}) {
+        (*context)->setSrtpPayloadSize(payloadSize);
+        (*context)->deriveSessionEncryptionKey();
+        (*context)->deriveSessionSaltingKey();
+        (*context)->deriveSessionAuthenticationKey();
+        (*context)->resetCipherState();
+    }
+    tx->selectEncryptionKey();
+    rx->selectDecryptionKey();
+    /* Only the playback thread's copies of the contexts, which make
+     * their own, use AES once the keys are derived */
+    tx->freeCiphers();
+    rx->freeCiphers();
+}
+
+/* A server echoing or updating its RTP echo: its receiving context's ID, then its keys */
+void call::startUASSrtp(bool video, int payloadSize)
+{
+    SrtpMedia &media = srtpMedia(video);
+    if (sendMode != MODE_SERVER || (!media.rxUAS.made() && !media.txUAS.made())) {
+        return;
+    }
+
+    CryptoContextID id;
+    id.ssrc = video ? rtpstream_callinfo.video_ssrc_id : rtpstream_callinfo.audio_ssrc_id;
+    id.address = media_ip;
+    id.port = video ? rtpstream_callinfo.local_videoport : rtpstream_callinfo.local_audioport;
+    logSrtpInfo("call::executeAction():  RX-UAS-%s SRTP context - ssrc:0x%08x address:%s port:%d\n",
+                video ? "VIDEO" : "AUDIO", id.ssrc, id.address.c_str(), id.port);
+    media.rxUAS->setID(std::move(id));
+    startSrtp(video, false, payloadSize);
+}
+
 void call::setSessionState(SessionState state)
 {
     _sessionStateOld = _sessionStateCurrent;
@@ -7325,20 +6639,10 @@ SessionState call::getSessionStateOld()
 }
 
 #ifdef PCAPPLAY
-void *send_wrapper(void *arg)
+void rtp_pcap_count(unsigned long bytes)
 {
-    play_args_t *s = (play_args_t *) arg;
-    //struct sched_param param;
-    //int ret;
-    //param.sched_priority = 10;
-    //ret = pthread_setschedparam(pthread_self(), SCHED_RR, &param);
-    //if(ret)
-    //  ERROR("Can't set RTP play thread realtime parameters");
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, nullptr);
-    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, nullptr);
-    send_packets(s);
-    pthread_exit(nullptr);
-    return nullptr;
+    rtp_pckts_pcap.fetch_add(1, std::memory_order_relaxed);
+    rtp_bytes_pcap.fetch_add(bytes, std::memory_order_relaxed);
 }
 #endif
 
@@ -7349,18 +6653,42 @@ void *send_wrapper(void *arg)
 class mockcall : public call {
 public:
     mockcall(bool is_ipv6) : listener("//testing", true), call(main_scenario, "///testing", is_ipv6, 0, nullptr) {}
+    mockcall(bool is_ipv6, struct sockaddr_storage *dest) : listener("//testing", true), call(main_scenario, "///testing", is_ipv6, 0, dest) {}
 
     /* Helpers to poke at protected internals */
+    using call::createSendingMessage;
+    using call::createSendingString;
+    using call::extract_rtp_remote_addr;
+    void set_last_recv_msg(const char *msg)
+    {
+        assign_exact(last_recv_msg, msg);
+    }
     void parse_media_addr(std::string const& msg) { get_remote_media_addr(msg); }
-
+    int parse_srtp(const char *msg, SrtpInfoParams &pA, SrtpInfoParams &pV)
+    {
+        return extract_srtp_remote_info(msg, pA, pV);
+    }
+    void set_retransmission_state(const char *msg, int index, int len, unsigned int retrans_at)
+    {
+        msg_index = index;
+        last_send_index = index;
+        keepRecvRetransMsg();
+        next_retrans = retrans_at;
+        last_send_msg.assign(msg, len);
+    }
 #ifdef PCAPPLAY
     bool has_media() { return hasMediaInformation; }
 
     template<typename T>
-    T get_audio_addr() {
+    T get_addr(rtpstream_pcap_t stream) {
         T sa;
-        std::memcpy(&sa, &play_args_a.to, sizeof(T));
+        std::memcpy(&sa, &playArgs(stream).to, sizeof(T));
         return sa;
+    }
+
+    template<typename T>
+    T get_audio_addr() {
+        return get_addr<T>(RTPSTREAM_PCAP_AUDIO);
     }
 #endif
 };
@@ -7393,11 +6721,181 @@ const std::string test_sdp_v6 = "v=0\r\n"
                                 "m=audio 12345 RTP/AVP 0\r\n"
                                 "a=rtpmap:0 PCMU/8000\r\n";
 
+static std::string call_id_body(const char *call_id)
+{
+    const char *separator = strchr(call_id, '@');
+    if (!separator) {
+        return call_id;
+    }
+    return std::string(call_id, separator - call_id);
+}
+
+static bool is_lower_hex_string(const std::string &value)
+{
+    return std::all_of(value.begin(), value.end(), [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+class call_id_test_state_guard {
+public:
+    call_id_test_state_guard()
+        : saved_call_id_string(call_id_string), saved_call_id_mode(call_id_mode), saved_pid(pid),
+          saved_local_ip(local_ip)
+    {
+    }
+
+    ~call_id_test_state_guard()
+    {
+        call_id_string = saved_call_id_string;
+        call_id_mode = saved_call_id_mode;
+        pid = saved_pid;
+        local_ip = saved_local_ip;
+    }
+
+private:
+    const char *saved_call_id_string;
+    int saved_call_id_mode;
+    unsigned int saved_pid;
+    std::string saved_local_ip;
+};
+
+TEST(hash, sdbm_hash_four_characters_at_a_time)
+{
+    const char text[] = "INVITE sip:a@b SIP/2.0\r\n\xe9\x80\xff tail";
+    for (size_t len = 0; len < sizeof(text); len++) {
+        unsigned long expected = 0;
+        for (size_t i = 0; i < len; i++) {
+            int c = text[i];
+            expected = c + (expected << 6) + (expected << 16) - expected;
+        }
+        EXPECT_EQ(expected, sdbm_hash(text, len));
+    }
+}
+
+TEST(call_id, default_mode_uses_cid_str_template) {
+    char call_id[MAX_HEADER_LEN];
+    call_id_test_state_guard guard;
+
+    call_id_mode = CID_MODE_FORMAT;
+    call_id_string = "%u-%p@%s";
+    pid = 4321;
+    local_ip = "192.0.2.10";
+
+    build_call_id(call_id, 77);
+    EXPECT_STREQ("77-4321@192.0.2.10", call_id);
+}
+
+TEST(call_id, default_mode_treats_trailing_percent_as_literal) {
+    char call_id[MAX_HEADER_LEN];
+    call_id_test_state_guard guard;
+
+    call_id_mode = CID_MODE_FORMAT;
+    call_id_string = "call-%";
+
+    build_call_id(call_id, 77);
+    EXPECT_STREQ("call-%", call_id);
+}
+
+TEST(call_id, default_mode_keeps_unknown_conversion) {
+    char call_id[MAX_HEADER_LEN];
+    call_id_test_state_guard guard;
+
+    call_id_mode = CID_MODE_FORMAT;
+    call_id_string = "a%xb%%c%u";
+
+    build_call_id(call_id, 77);
+    EXPECT_STREQ("a%xb%c77", call_id);
+}
+
+TEST(call_id, uuid_mode_generates_rfc4122_value) {
+    char call_id[MAX_HEADER_LEN];
+    call_id_test_state_guard guard;
+
+    call_id_mode = CID_MODE_UUID;
+    pid = 9001;
+    local_ip = "198.51.100.25";
+
+    build_call_id(call_id, 15);
+
+    std::string body = call_id_body(call_id);
+    ASSERT_EQ(body.size(), 36U);
+    EXPECT_EQ(body[8], '-');
+    EXPECT_EQ(body[13], '-');
+    EXPECT_EQ(body[18], '-');
+    EXPECT_EQ(body[23], '-');
+    EXPECT_EQ(body[14], '4');
+    EXPECT_TRUE(body[19] == '8' || body[19] == '9' || body[19] == 'a' || body[19] == 'b');
+    EXPECT_TRUE(is_lower_hex_string(body.substr(0, 8)));
+    EXPECT_TRUE(is_lower_hex_string(body.substr(9, 4)));
+    EXPECT_TRUE(is_lower_hex_string(body.substr(14, 4)));
+    EXPECT_TRUE(is_lower_hex_string(body.substr(19, 4)));
+    EXPECT_TRUE(is_lower_hex_string(body.substr(24, 12)));
+    EXPECT_NE(std::string(call_id).find("@198.51.100.25"), std::string::npos);
+}
+
+TEST(call_id, uuid_compact_mode_generates_hex_value) {
+    char call_id[MAX_HEADER_LEN];
+    call_id_test_state_guard guard;
+
+    call_id_mode = CID_MODE_UUID_COMPACT;
+    pid = 1337;
+    local_ip = "203.0.113.8";
+
+    build_call_id(call_id, 22);
+
+    std::string body = call_id_body(call_id);
+    ASSERT_EQ(body.size(), 32U);
+    EXPECT_TRUE(is_lower_hex_string(body));
+    EXPECT_EQ(body[12], '4');
+    EXPECT_TRUE(body[16] == '8' || body[16] == '9' || body[16] == 'a' || body[16] == 'b');
+    EXPECT_NE(std::string(call_id).find("@203.0.113.8"), std::string::npos);
+}
+
+TEST(call_id, random_mode_generates_unique_token_with_call_number) {
+    char call_id[MAX_HEADER_LEN];
+    call_id_test_state_guard guard;
+
+    call_id_mode = CID_MODE_RANDOM;
+    pid = 5150;
+    local_ip = "203.0.113.44";
+
+    build_call_id(call_id, 31);
+
+    std::string body = call_id_body(call_id);
+    ASSERT_EQ(body.rfind("31-", 0), 0U);
+    ASSERT_EQ(body.size(), 35U);
+    EXPECT_TRUE(is_lower_hex_string(body.substr(3)));
+    EXPECT_NE(std::string(call_id).find("@203.0.113.44"), std::string::npos);
+}
+
+TEST(call_id, timestamp_mode_embeds_call_number_and_pid) {
+    char call_id[MAX_HEADER_LEN];
+    call_id_test_state_guard guard;
+
+    call_id_mode = CID_MODE_TIMESTAMP;
+    pid = 2718;
+    local_ip = "192.0.2.44";
+
+    build_call_id(call_id, 52);
+
+    std::string full_call_id(call_id);
+    EXPECT_NE(full_call_id.find("-52-2718@192.0.2.44"), std::string::npos);
+}
+
 TEST(sdp, parse_valid_sdp_msg) {
     ASSERT_EQ(find_in_sdp("c=IN IP4 ", test_sdp_v4), "127.0.0.1");
     ASSERT_EQ(find_in_sdp("c=IN IP6 ", test_sdp_v6), "::1");
     ASSERT_EQ(find_in_sdp("m=audio ", test_sdp_v4), "12345");
     ASSERT_EQ(find_in_sdp("m=audio ", test_sdp_v6), "12345");
+}
+
+TEST(sdp, parse_port_count_and_ttl) {
+    const std::string sdp = "v=0\r\n"
+                            "c=IN IP4 224.2.1.1/127\r\n"
+                            "m=audio 30000/2 RTP/AVP 0 101\r\n";
+    ASSERT_EQ(find_in_sdp("c=IN IP4 ", sdp), "224.2.1.1");
+    ASSERT_EQ(find_in_sdp("m=audio ", sdp), "30000");
 }
 
 TEST(sdp, parse_invalid_sdp_msg) {
@@ -7407,9 +6905,399 @@ TEST(sdp, parse_invalid_sdp_msg) {
     ASSERT_EQ(find_in_sdp("m=video ", test_sdp_v4), "");
 }
 
+TEST(sdp, extract_rtp_remote_addr_skips_zero_port) {
+    const std::string msg = "INVITE sip:a@b SIP/2.0\r\n"
+                            "Content-Type: application/sdp\r\n\r\n"
+                            "v=0\r\n"
+                            "c=IN IP6 ::1\r\n"
+                            "m=audio 0 RTP/AVP 0\r\n"
+                            "m=video 7000/2 RTP/AVP 31\r\n"
+                            "m=audio 6000 RTP/AVP 0\r\n";
+    mockcall test_call(false);
+    std::string audio_host, video_host;
+    int audio_port = 0, video_port = 0;
+
+    test_call.extract_rtp_remote_addr(msg.c_str(), audio_host, audio_port, video_host, video_port);
+    EXPECT_EQ("::1", audio_host);
+    EXPECT_EQ(6000, audio_port);
+    EXPECT_EQ("::1", video_host);
+    EXPECT_EQ(7000, video_port);
+}
+
+/* The connection address of the media section at the first prefix */
+static std::string media_connection(std::string_view sdp, std::string_view prefix, bool &ipv6)
+{
+    return sdp_media_connection(sdp, sdp_media_section(sdp, sdp.find(prefix)), ipv6);
+}
+
+TEST(sdp, media_connection_session_level_only) {
+    bool ipv6 = true;
+    EXPECT_EQ("127.0.0.1", media_connection(test_sdp_v4, "\nm=audio", ipv6));
+    EXPECT_FALSE(ipv6);
+    EXPECT_EQ("::1", media_connection(test_sdp_v6, "\nm=audio", ipv6));
+    EXPECT_TRUE(ipv6);
+}
+
+TEST(sdp, media_connection_media_level_only) {
+    const std::string sdp = "v=0\r\n"
+                            "o=- 1 1 IN IP4 192.0.2.9\r\n"
+                            "t=0 0\r\n"
+                            "m=audio 6000 RTP/AVP 0\r\n"
+                            "c=IN IP4 192.0.2.1\r\n"
+                            "m=video 7000 RTP/AVP 31\r\n"
+                            "c=IN IP4 192.0.2.2\r\n";
+    bool ipv6;
+    EXPECT_EQ("192.0.2.1", media_connection(sdp, "\nm=audio", ipv6));
+    EXPECT_EQ("192.0.2.2", media_connection(sdp, "\nm=video", ipv6));
+    EXPECT_EQ("m=video 7000 RTP/AVP 31\r\nc=IN IP4 192.0.2.2\r\n",
+              sdp_media_section(sdp, sdp.find("\nm=video")).substr(1));
+}
+
+TEST(sdp, media_connection_overrides_session_level) {
+    const std::string sdp = "v=0\r\n"
+                            "c=IN IP4 192.0.2.1\r\n"
+                            "t=0 0\r\n"
+                            "m=audio 6000 RTP/AVP 0\r\n"
+                            "m=video 7000 RTP/AVP 31\r\n"
+                            "c=IN IP6 2001:db8::2\r\n"
+                            "m=image 8000 udptl t38\r\n";
+    bool ipv6;
+    EXPECT_EQ("192.0.2.1", media_connection(sdp, "\nm=audio", ipv6));
+    EXPECT_FALSE(ipv6);
+    EXPECT_EQ("2001:db8::2", media_connection(sdp, "\nm=video", ipv6));
+    EXPECT_TRUE(ipv6);
+    EXPECT_EQ("192.0.2.1", media_connection(sdp, "\nm=image", ipv6));
+    EXPECT_FALSE(ipv6);
+}
+
+TEST(sdp, extract_rtp_remote_addr_of_each_media_section) {
+    const std::string msg = "SIP/2.0 200 OK\r\n"
+                            "Content-Type: application/sdp\r\n\r\n"
+                            "v=0\r\n"
+                            "c=IN IP4 192.0.2.1\r\n"
+                            "m=audio 0 RTP/AVP 0\r\n"
+                            "c=IN IP4 192.0.2.3\r\n"
+                            "m=video 7000 RTP/AVP 31\r\n"
+                            "c=IN IP4 192.0.2.2\r\n"
+                            "m=audio 6000 RTP/AVP 0\r\n";
+    mockcall test_call(false);
+    std::string audio_host, video_host;
+    int audio_port = 0, video_port = 0;
+
+    test_call.extract_rtp_remote_addr(msg.c_str(), audio_host, audio_port, video_host, video_port);
+    EXPECT_EQ("192.0.2.1", audio_host);
+    EXPECT_EQ(6000, audio_port);
+    EXPECT_EQ("192.0.2.2", video_host);
+    EXPECT_EQ(7000, video_port);
+}
+
+TEST(create_sending_message, default_ack_with_oversized_peer_headers_is_bounded) {
+    /* A peer answers the INVITE with an error response whose Via, From and
+     * To headers are ~20 KB each. The built-in ACK echoes all three and
+     * repeats the To URI in its request line, so the rendered message is
+     * larger than the send buffer. It must be truncated, never written (or
+     * later sent) past the end of that buffer. */
+    ASSERT_STREQ("ack", default_message_names[1]);
+
+    const std::string big(20000, 'a');
+    const std::string received =
+        "SIP/2.0 486 Busy Here\r\n"
+        "Via: SIP/2.0/UDP " + big + ";branch=z9hG4bK-1\r\n"
+        "From: <sip:" + big + "@example.com>;tag=1\r\n"
+        "To: <sip:" + big + "@example.com>;tag=2\r\n"
+        "Call-ID: 1-1@127.0.0.1\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Content-Length: 0\r\n\r\n";
+    ASSERT_LT(received.size(), (size_t)SIPP_MAX_MSG_SIZE);
+
+    mockcall test_call(false);
+    test_call.set_last_recv_msg(received.c_str());
+
+    SendingMessage ack(main_scenario, default_message_strings[1].c_str(), true);
+    int len = -1;
+    char *out = test_call.createSendingMessage(&ack, -1, &len);
+
+    ASSERT_NE(nullptr, out);
+    /* The buffer holds SIPP_MAX_MSG_SIZE + 2 bytes: the message, its NUL,
+     * and one byte kept free for the 3PCC delimiter. */
+    EXPECT_EQ(SIPP_MAX_MSG_SIZE, len);
+    EXPECT_EQ((size_t)len, strlen(out));
+    EXPECT_EQ(0, strncmp(out, "ACK sip:aaaa", 12));
+}
+
+TEST(create_sending_message, truncates_to_caller_buffer) {
+    mockcall test_call(false);
+    SendingMessage msg(main_scenario, "OPTIONS sip:someone@example.com SIP/2.0\n", true);
+    char buf[16];
+    int len = -1;
+
+    EXPECT_EQ(buf, test_call.createSendingMessage(&msg, -1, buf, sizeof(buf), &len));
+    EXPECT_EQ(15, len);
+    EXPECT_STREQ("OPTIONS sip:som", buf);
+}
+
+TEST(create_sending_message, content_length_counts_the_body) {
+    mockcall test_call(false);
+    SendingMessage msg(main_scenario, "INVITE sip:a@b SIP/2.0\nContent-Length: [len]\n\nabc\n", true);
+    int len = -1;
+    const char *out = test_call.createSendingMessage(&msg, -1, &len);
+
+    EXPECT_NE(nullptr, strstr(out, "\r\nContent-Length:     5\r\n\r\nabc\r\n"));
+    EXPECT_EQ((size_t)len, strlen(out));
+}
+
+TEST(create_sending_message, zero_content_length_keeps_later_headers) {
+    mockcall test_call(false);
+    SendingMessage msg(main_scenario, "BYE sip:a@b SIP/2.0\nContent-Length: [len]\nX-Foo: bar\n\n", true);
+    int len = -1;
+    const char *out = test_call.createSendingMessage(&msg, -1, &len);
+
+    EXPECT_STREQ("BYE sip:a@b SIP/2.0\r\nContent-Length:     0\r\nX-Foo: bar\r\n\r\n", out);
+    EXPECT_EQ((size_t)len, strlen(out));
+}
+
+TEST(create_sending_message, string_leaves_the_message_buffer)
+{
+    mockcall test_call(false);
+    SendingMessage msg(main_scenario, "BYE sip:a@b SIP/2.0\nContent-Length: [len]\n\n", true);
+    SendingMessage text(main_scenario, "abc", true);
+    const char *out = test_call.createSendingMessage(&msg, -1);
+
+    EXPECT_EQ("abc", test_call.createSendingString(&text));
+    EXPECT_STREQ("BYE sip:a@b SIP/2.0\r\nContent-Length:     0\r\n\r\n", out);
+}
+
+TEST(call_run, stops_after_fatal_retransmission_send_error) {
+    /* Run with a one-message scenario; put the real messages back after. */
+    msgvec saved_messages;
+    saved_messages.swap(main_scenario->messages);
+    auto *msg = new message(0, "retransmission");
+    main_scenario->messages.push_back(msg);
+
+    struct sockaddr_storage peer = {};
+    auto *peer4 = reinterpret_cast<struct sockaddr_in *>(&peer);
+    peer4->sin_family = AF_INET;
+    peer4->sin_port = htons(5060);
+    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &peer4->sin_addr));
+    mockcall *test_call = new mockcall(false, &peer);
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    test_call->associate_socket(new SIPpSocket(false, T_UDP, fd, 0));
+    ASSERT_EQ(0, close(fd));
+
+    /* run() refreshes clock_tick from the monotonic ms clock, and the
+     * retransmission only fires when next_retrans < clock_tick. Anchor the
+     * deadline to the current tick (never 0, which would disable it) and wait
+     * for the clock to move past it, so the test works no matter how early in
+     * the process it runs. */
+    unsigned long retrans_at = getmilliseconds() + 1;
+    while (getmilliseconds() <= retrans_at) {
+        usleep(500);
+    }
+    test_call->set_retransmission_state("REGISTER sip:test SIP/2.0\r\n\r\n", 0, 29, retrans_at);
+
+    EXPECT_FALSE(test_call->run());
+    EXPECT_EQ(0UL, msg->nb_sent_retrans);
+
+    main_scenario->messages.swap(saved_messages);
+    delete msg;
+}
+
+static const char srtp_sdp_head[] = "INVITE sip:t SIP/2.0\r\n\r\n"
+                                    "v=0\r\n"
+                                    "c=IN IP4 127.0.0.1\r\n"
+                                    "t=0 0\r\n";
+
+TEST(srtp_sdp, cryptos_stay_in_their_media_section) {
+    std::string msg = std::string(srtp_sdp_head) +
+                      "m=audio 12346 RTP/SAVP 0\r\n"
+                      "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\r\n"
+                      "a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC UNENCRYPTED_SRTP\r\n"
+                      "m=video 12348 RTP/SAVP 99\r\n"
+                      "a=crypto:3 AES_CM_128_HMAC_SHA1_80 inline:Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0ND UNENCRYPTED_SRTP\r\n";
+    SrtpInfoParams pA, pV;
+    mockcall call(false);
+    ASSERT_EQ(0, call.parse_srtp(msg.c_str(), pA, pV));
+    EXPECT_TRUE(pA.found);
+    EXPECT_STREQ("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", pA.primary_cryptokeyparams);
+    EXPECT_FALSE(pA.primary_unencrypted_srtp);
+    EXPECT_TRUE(pA.secondary_unencrypted_srtp);
+    EXPECT_TRUE(pV.primary_unencrypted_srtp);
+    EXPECT_EQ(1, pA.primary_cryptotag);
+    EXPECT_STREQ("AES_CM_128_HMAC_SHA1_80", pA.primary_cryptosuite);
+    EXPECT_EQ(2, pA.secondary_cryptotag);
+    EXPECT_STREQ("AES_CM_128_HMAC_SHA1_32", pA.secondary_cryptosuite);
+    EXPECT_TRUE(pV.found);
+    EXPECT_EQ(3, pV.primary_cryptotag);
+    EXPECT_EQ(0, pV.secondary_cryptotag);
+}
+
+// find_srtp_keyword() indexes the table by the enum
+TEST(srtp_sdp, keyword_table_follows_the_enum)
+{
+    const int rows = sizeof(srtp_keywords) / sizeof(srtp_keywords[0]);
+
+    EXPECT_EQ(E_Message_CryptoSuiteAesCm256Sha1322Video - E_Message_CryptoTag1Audio + 1, rows);
+    for (int i = 0; i < rows; i++) {
+        EXPECT_EQ(E_Message_CryptoTag1Audio + i, srtp_keywords[i].type) << i;
+    }
+    EXPECT_EQ(nullptr, find_srtp_keyword(E_Message_RTPStream_Video_Port));
+    EXPECT_EQ(&srtp_keywords[rows - 1], find_srtp_keyword(E_Message_CryptoSuiteAesCm256Sha1322Video));
+}
+
+TEST(srtp_sdp, rfc6188_keys_are_read_whole) {
+    std::string msg = std::string(srtp_sdp_head) +
+                      "m=audio 12346 RTP/SAVP 0\r\n"
+                      "a=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==\r\n"
+                      "a=crypto:2 AES_192_CM_HMAC_SHA1_32 inline:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI= UNENCRYPTED_SRTP\r\n"
+                      "m=video 12348 RTP/SAVP 99\r\n"
+                      "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0ND|2^20|1:32\r\n";
+    SrtpInfoParams pA, pV;
+    mockcall call(false);
+    ASSERT_EQ(0, call.parse_srtp(msg.c_str(), pA, pV));
+    EXPECT_STREQ("AES_256_CM_HMAC_SHA1_80", pA.primary_cryptosuite);
+    EXPECT_STREQ("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==", pA.primary_cryptokeyparams);
+    EXPECT_FALSE(pA.primary_unencrypted_srtp);
+    EXPECT_STREQ("AES_192_CM_HMAC_SHA1_32", pA.secondary_cryptosuite);
+    EXPECT_STREQ("QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=", pA.secondary_cryptokeyparams);
+    EXPECT_TRUE(pA.secondary_unencrypted_srtp);
+    // The key without its lifetime and MKI
+    EXPECT_STREQ("Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0ND", pV.primary_cryptokeyparams);
+}
+
+TEST(srtp_sdp, unencrypted_srtp_after_a_lifetime_and_mki) {
+    std::string msg = std::string(srtp_sdp_head) +
+                      "m=audio 12346 RTP/SAVP 0\r\n"
+                      "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB|2^20|1:32 UNENCRYPTED_SRTP\r\n"
+                      "a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC KDR=1 UNENCRYPTED_SRTP\r\n"
+                      "m=video 12348 RTP/SAVP 99\r\n"
+                      "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0ND UNENCRYPTED_SRTP\r\n"
+                      "a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:RERERERERERERERERERERERERERERERERERE|1:4\r\n";
+    SrtpInfoParams pA, pV;
+    mockcall call(false);
+    ASSERT_EQ(0, call.parse_srtp(msg.c_str(), pA, pV));
+    EXPECT_STREQ("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", pA.primary_cryptokeyparams);
+    EXPECT_TRUE(pA.primary_unencrypted_srtp);
+    EXPECT_TRUE(pA.secondary_unencrypted_srtp);
+    EXPECT_TRUE(pV.primary_unencrypted_srtp);
+    // The primary's UNENCRYPTED_SRTP is not the secondary's
+    EXPECT_EQ(2, pV.secondary_cryptotag);
+    EXPECT_STREQ("RERERERERERERERERERERERERERERERERERE", pV.secondary_cryptokeyparams);
+    EXPECT_FALSE(pV.secondary_unencrypted_srtp);
+}
+
+// A received key of the length its suite takes, whether it encrypts or not
+TEST(srtp_sdp, received_key_of_its_suite_length) {
+    JLSRTP rx(0x12345678, "127.0.0.1", 0);
+    std::string aes128 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0e";
+    std::string aes192 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSY=";
+    std::string aes256 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLg==";
+    std::string odd = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywt";
+
+    EXPECT_TRUE(decode_srtp_key(rx, aes128, "AES_CM_128_HMAC_SHA1_80", PRIMARY_CRYPTO));
+    EXPECT_TRUE(decode_srtp_key(rx, aes128, "NULL_HMAC_SHA1_32", SECONDARY_CRYPTO));
+    EXPECT_TRUE(decode_srtp_key(rx, aes192, "AES_192_CM_HMAC_SHA1_32", PRIMARY_CRYPTO));
+    EXPECT_TRUE(decode_srtp_key(rx, aes256, "AES_256_CM_HMAC_SHA1_80", SECONDARY_CRYPTO));
+    EXPECT_EQ(32U, rx.getMasterKey(SECONDARY_CRYPTO).size());
+
+    EXPECT_FALSE(decode_srtp_key(rx, aes256, "AES_CM_128_HMAC_SHA1_80", SECONDARY_CRYPTO));
+    EXPECT_FALSE(decode_srtp_key(rx, aes128, "AES_256_CM_HMAC_SHA1_32", SECONDARY_CRYPTO));
+    EXPECT_FALSE(decode_srtp_key(rx, aes256, "AES_192_CM_HMAC_SHA1_80", SECONDARY_CRYPTO));
+    EXPECT_FALSE(decode_srtp_key(rx, odd, "AES_CM_128_HMAC_SHA1_80", SECONDARY_CRYPTO));
+    EXPECT_EQ(32U, rx.getMasterKey(SECONDARY_CRYPTO).size());
+}
+
+TEST(srtp_sdp, answer_takes_a_line_of_its_suite) {
+    JLSRTP ctx(0x12345678, "127.0.0.1", 0);
+
+    // Neither line taken: none is of any suite, the default one included
+    EXPECT_EQ(INVALID_CRYPTO, find_crypto_line(ctx, 1, "AES_CM_128_HMAC_SHA1_80"));
+    EXPECT_EQ(INVALID_CRYPTO, find_crypto_line(ctx, 0, "AES_CM_128_HMAC_SHA1_80"));
+
+    // The first line ignored, the second one taken
+    ctx.setCryptoTag(2, SECONDARY_CRYPTO);
+    ctx.setOfferedCryptoSuite("AES_CM_128_HMAC_SHA1_80", SECONDARY_CRYPTO);
+    EXPECT_EQ(SECONDARY_CRYPTO, find_crypto_line(ctx, 1, "AES_CM_128_HMAC_SHA1_80"));
+    EXPECT_EQ(INVALID_CRYPTO, find_crypto_line(ctx, 2, "AES_CM_128_HMAC_SHA1_32"));
+
+    // Both taken: the line of the tag if it is of the suite, else by suite
+    ctx.setCryptoTag(1, PRIMARY_CRYPTO);
+    ctx.setOfferedCryptoSuite("AES_CM_128_HMAC_SHA1_32", PRIMARY_CRYPTO);
+    EXPECT_EQ(PRIMARY_CRYPTO, find_crypto_line(ctx, 1, "AES_CM_128_HMAC_SHA1_32"));
+    EXPECT_EQ(PRIMARY_CRYPTO, find_crypto_line(ctx, 2, "AES_CM_128_HMAC_SHA1_32"));
+    EXPECT_EQ(SECONDARY_CRYPTO, find_crypto_line(ctx, 1, "AES_CM_128_HMAC_SHA1_80"));
+    EXPECT_EQ(INVALID_CRYPTO, find_crypto_line(ctx, 1, "NULL_HMAC_SHA1_80"));
+    // A whole name, not a prefix
+    EXPECT_EQ(INVALID_CRYPTO, find_crypto_line(ctx, 1, "AES_CM_128"));
+    EXPECT_EQ(INVALID_CRYPTO, find_crypto_line(ctx, 1, ""));
+    ctx.setOfferedCryptoSuite("AES_CM_128_HMAC_SHA1_32", SECONDARY_CRYPTO);
+    EXPECT_EQ(SECONDARY_CRYPTO, find_crypto_line(ctx, 2, "AES_CM_128_HMAC_SHA1_32"));
+    EXPECT_EQ(PRIMARY_CRYPTO, find_crypto_line(ctx, 3, "AES_CM_128_HMAC_SHA1_32"));
+
+    // Only the first line taken
+    ctx.setCryptoTag(0, SECONDARY_CRYPTO);
+    EXPECT_EQ(INVALID_CRYPTO, find_crypto_line(ctx, 2, "AES_CM_128_HMAC_SHA1_80"));
+    EXPECT_FALSE(answer_swaps_crypto(ctx, "AES_CM_128_HMAC_SHA1_32"));
+}
+
+TEST(srtp_sdp, offerer_sends_with_the_answered_line) {
+    SrtpInfoParams p = {};
+    p.primary_cryptotag = 1;
+    strcpy(p.primary_cryptosuite, "AES_CM_128_HMAC_SHA1_32");
+    JLSRTP tx(0x12345678, "127.0.0.1", 0);
+    tx.setCryptoTag(1, PRIMARY_CRYPTO);
+    tx.setOfferedCryptoSuite("AES_CM_128_HMAC_SHA1_80", PRIMARY_CRYPTO);
+
+    // One line offered, another suite answered: no SRTP
+    take_answered_crypto(tx, p, "audio");
+    EXPECT_EQ(0U, tx.getCryptoTag(PRIMARY_CRYPTO));
+
+    // Two lines offered, the second one's suite answered with tag 1
+    tx.setCryptoTag(1, PRIMARY_CRYPTO);
+    tx.setCryptoTag(2, SECONDARY_CRYPTO);
+    tx.selectHashAlgorithm(HMAC_SHA1_32, SECONDARY_CRYPTO);
+    tx.setOfferedCryptoSuite("AES_CM_128_HMAC_SHA1_32", SECONDARY_CRYPTO);
+    take_answered_crypto(tx, p, "audio");
+    EXPECT_EQ(2U, tx.getCryptoTag(PRIMARY_CRYPTO));
+    EXPECT_EQ("AES_CM_128_HMAC_SHA1_32", tx.getCryptoSuite(PRIMARY_CRYPTO));
+    EXPECT_EQ(HMAC_SHA1_32, tx.getHashAlgorithm(PRIMARY_CRYPTO));
+    EXPECT_EQ("AES_CM_128_HMAC_SHA1_80", tx.getCryptoSuite(SECONDARY_CRYPTO));
+}
+
+TEST(srtp_sdp, plain_audio_does_not_take_the_video_crypto) {
+    std::string msg = std::string(srtp_sdp_head) +
+                      "m=audio 12346 RTP/AVP 0\r\n"
+                      "a=rtpmap:0 PCMU/8000\r\n"
+                      "m=video 12348 RTP/SAVP 99\r\n"
+                      "a=crypto:3 AES_CM_128_HMAC_SHA1_80 inline:Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0ND\r\n";
+    SrtpInfoParams pA, pV;
+    mockcall call(false);
+    ASSERT_EQ(0, call.parse_srtp(msg.c_str(), pA, pV));
+    EXPECT_EQ(0, pA.primary_cryptotag);
+    EXPECT_STREQ("", pA.primary_cryptosuite);
+    EXPECT_EQ(3, pV.primary_cryptotag);
+}
+
+TEST(srtp_sdp, plain_video_first_does_not_take_the_audio_crypto) {
+    std::string msg = std::string(srtp_sdp_head) +
+                      "m=video 12348 RTP/AVP 99\r\n"
+                      "m=audio 12346 RTP/SAVP 0\r\n"
+                      "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB\r\n"
+                      "a=crypto:2 AES_CM_128_HMAC_SHA1_32 inline:QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC\r\n";
+    SrtpInfoParams pA, pV;
+    mockcall call(false);
+    ASSERT_EQ(0, call.parse_srtp(msg.c_str(), pA, pV));
+    EXPECT_EQ(1, pA.primary_cryptotag);
+    EXPECT_EQ(2, pA.secondary_cryptotag);
+    EXPECT_EQ(0, pV.primary_cryptotag);
+    EXPECT_EQ(0, pV.secondary_cryptotag);
+}
+
 #ifdef PCAPPLAY
 TEST(sdp, good_remote_media_addr_v4) {
     media_ip_is_ipv6 = false;
+    pcap_plays = true;
 
     struct sockaddr_in reference;
     reference.sin_family = AF_INET;
@@ -7424,6 +7312,7 @@ TEST(sdp, good_remote_media_addr_v4) {
 
 TEST(sdp, good_remote_media_addr_v6) {
     media_ip_is_ipv6 = true;
+    pcap_plays = true;
 
     struct sockaddr_in6 reference;
     reference.sin6_family = AF_INET6;
@@ -7434,6 +7323,311 @@ TEST(sdp, good_remote_media_addr_v6) {
     call.parse_media_addr(test_sdp_v6);
     ASSERT_EQ(call.has_media(), true);
     ASSERT_EQ(reference, call.get_audio_addr<struct sockaddr_in6>());
+}
+
+TEST(sdp, remote_media_addr_of_each_media_section) {
+    media_ip_is_ipv6 = false;
+    pcap_plays = true;
+
+    struct sockaddr_in audio, video;
+    audio.sin_family = video.sin_family = AF_INET;
+    audio.sin_port = htons(6000);
+    video.sin_port = htons(7000);
+    inet_pton(AF_INET, "192.0.2.1", &audio.sin_addr);
+    inet_pton(AF_INET, "192.0.2.2", &video.sin_addr);
+
+    mockcall call(false);
+    call.parse_media_addr("v=0\r\n"
+                          "c=IN IP4 192.0.2.1\r\n"
+                          "m=audio 6000 RTP/AVP 0\r\n"
+                          "m=video 7000 RTP/AVP 31\r\n"
+                          "c=IN IP4 192.0.2.2\r\n");
+    ASSERT_EQ(call.has_media(), true);
+    ASSERT_EQ(audio, call.get_addr<struct sockaddr_in>(RTPSTREAM_PCAP_AUDIO));
+    ASSERT_EQ(video, call.get_addr<struct sockaddr_in>(RTPSTREAM_PCAP_VIDEO));
+}
+
+TEST(sdp, remote_media_addr_of_text)
+{
+    media_ip_is_ipv6 = false;
+    pcap_plays = true;
+
+    struct sockaddr_in text;
+    text.sin_family = AF_INET;
+    text.sin_port = htons(8000);
+    inet_pton(AF_INET, "192.0.2.1", &text.sin_addr);
+
+    mockcall call(false);
+    call.parse_media_addr("v=0\r\n"
+                          "c=IN IP4 192.0.2.1\r\n"
+                          "m=audio 6000 RTP/AVP 0\r\n"
+                          "m=video 0 RTP/AVP 31\r\n"
+                          "m=text 8000 RTP/AVP 98 100\r\n"
+                          "a=rtpmap:98 t140/1000\r\n"
+                          "a=rtpmap:100 red/1000\r\n");
+    ASSERT_EQ(call.has_media(), true);
+    ASSERT_EQ(text, call.get_addr<struct sockaddr_in>(RTPSTREAM_PCAP_TEXT));
+}
+
+TEST(sdp, remote_media_addr_skips_zero_port) {
+    media_ip_is_ipv6 = false;
+    pcap_plays = true;
+
+    struct sockaddr_in audio;
+    audio.sin_family = AF_INET;
+    audio.sin_port = htons(6000);
+    inet_pton(AF_INET, "192.0.2.3", &audio.sin_addr);
+
+    mockcall call(false);
+    call.parse_media_addr("v=0\r\n"
+                          "c=IN IP4 192.0.2.1\r\n"
+                          "m=audio 0 RTP/AVP 0\r\n"
+                          "m=video 7000 RTP/AVP 31\r\n"
+                          "m=audio 6000 RTP/AVP 8\r\n"
+                          "c=IN IP4 192.0.2.3\r\n");
+    ASSERT_EQ(audio, call.get_addr<struct sockaddr_in>(RTPSTREAM_PCAP_AUDIO));
+}
+
+/* The RTP payload type of packet n of a play_dtmf; the first 20 are
+ * no-ops. */
+static int dtmf_payload_type(const char* args, int n)
+{
+    pcap_pkts* pkts = (pcap_pkts*) malloc(sizeof(pcap_pkts));
+    parse_dtmf_play_args(args, pkts, 0);
+    int pt = pkts->pkts[n].data[sizeof(struct udphdr) + 1] & 0x7f;
+    free_pcaps(pkts);
+    return pt;
+}
+
+TEST(extract_cseq_method, method) {
+    char method[16];
+    call::extract_cseq_method(method, sizeof(method), "SIP/2.0 200 OK\r\nCSeq: 2 BYE\r\n\r\n");
+    EXPECT_STREQ("BYE", method);
+    call::extract_cseq_method(method, sizeof(method), "SIP/2.0 200 OK\r\n\r\n");
+    EXPECT_STREQ("", method);
+}
+
+TEST(extract_cseq_method, only_the_cseq_header)
+{
+    char method[16];
+    call::extract_cseq_method(method, sizeof(method), "SIP/2.0 200 OK\r\ncseq: 2 BYE\r\n\r\n");
+    EXPECT_STREQ("BYE", method);
+    call::extract_cseq_method(method, sizeof(method),
+                              "SIP/2.0 200 OK\r\nX-Orig-CSeq: 1 OPTIONS\r\nCSeq: 2 BYE\r\n\r\n");
+    EXPECT_STREQ("BYE", method);
+    call::extract_cseq_method(method, sizeof(method), "SIP/2.0 200 OK\r\nCSEQ: 2 BYE\r\n\r\nCSeq: 1 INFO\r\n");
+    EXPECT_STREQ("BYE", method);
+    call::extract_cseq_method(method, sizeof(method), "SIP/2.0 200 OK\r\n\r\nCSeq: 1 INFO\r\n");
+    EXPECT_STREQ("", method);
+}
+
+TEST(extract_cseq_method, long_method_is_truncated) {
+    std::string msg = "SIP/2.0 200 OK\r\nCSeq: 1 " + std::string(3000, 'X') + "\r\n\r\n";
+    char method[16];
+    call::extract_cseq_method(method, sizeof(method), msg.c_str());
+    EXPECT_STREQ(std::string(sizeof(method) - 1, 'X').c_str(), method);
+}
+
+TEST(play_dtmf, payload_type) {
+    EXPECT_EQ(96, dtmf_payload_type("1", 20));
+    EXPECT_EQ(96, dtmf_payload_type("1,100", 20));
+    EXPECT_EQ(101, dtmf_payload_type("1,100,101", 20));
+    EXPECT_EQ(97, dtmf_payload_type("1,100,101", 0));
+    EXPECT_EQ(96, dtmf_payload_type("1,100,97", 0));
+    EXPECT_EQ(96, dtmf_payload_type("1,100,", 20));
+    /* an invalid one falls back to the default */
+    EXPECT_EQ(96, dtmf_payload_type("1,100,foo", 20));
+    EXPECT_EQ(96, dtmf_payload_type("1,100,128", 20));
+}
+
+/* What parse_dtmf says of args, NULL if it is valid, with the values
+ * it parsed. */
+static const char *dtmf_error(std::string args, unsigned long *tone_len = nullptr, uint8_t *payload_type = nullptr)
+{
+    unsigned long len;
+    uint8_t pt;
+    const char *error = parse_dtmf(args.data(), &len, &pt);
+    if (tone_len) {
+        *tone_len = len;
+    }
+    if (payload_type) {
+        *payload_type = pt;
+    }
+    return error;
+}
+
+TEST(play_dtmf, parse) {
+    unsigned long len;
+    uint8_t pt;
+
+    EXPECT_EQ(nullptr, dtmf_error("1", &len, &pt));
+    EXPECT_EQ(200u, len);
+    EXPECT_EQ(96, pt);
+    EXPECT_EQ(nullptr, dtmf_error("x1,,", &len, &pt));
+    EXPECT_EQ(200u, len);
+    EXPECT_EQ(96, pt);
+    EXPECT_EQ(nullptr, dtmf_error("*#ABCD,50,0", &len, &pt));
+    EXPECT_EQ(50u, len);
+    EXPECT_EQ(0, pt);
+    EXPECT_EQ(nullptr, dtmf_error("1,2000,127", &len, &pt));
+    EXPECT_EQ(2000u, len);
+    EXPECT_EQ(127, pt);
+
+    EXPECT_NE(nullptr, dtmf_error(""));
+    EXPECT_NE(nullptr, dtmf_error("abc,100"));
+    EXPECT_NE(nullptr, dtmf_error(",100"));
+
+    EXPECT_NE(nullptr, dtmf_error("1,49", &len, &pt));
+    EXPECT_EQ(200u, len);
+    EXPECT_NE(nullptr, dtmf_error("1,2001"));
+    EXPECT_NE(nullptr, dtmf_error("1,foo"));
+    EXPECT_NE(nullptr, dtmf_error("1,100x"));
+
+    EXPECT_NE(nullptr, dtmf_error("1,100,foo", &len, &pt));
+    EXPECT_EQ(100u, len);
+    EXPECT_EQ(96, pt);
+    EXPECT_NE(nullptr, dtmf_error("1,100,101x"));
+    EXPECT_NE(nullptr, dtmf_error("1,100,128"));
+    EXPECT_NE(nullptr, dtmf_error("1,100,-1"));
+    EXPECT_NE(nullptr, dtmf_error("1,100,101,1"));
+
+    /* the first problem is the one told */
+    EXPECT_NE(nullptr, strstr(dtmf_error("1,10,128"), "tone length"));
+}
+
+/* The packets that arrive on a UDP socket, until none does for 50 ms */
+static int count_packets(int sock)
+{
+    char buffer[PCAP_MAXPACKET];
+    struct pollfd pfd = {sock, POLLIN, 0};
+    int n = 0;
+    while (poll(&pfd, 1, 50) > 0 && recv(sock, buffer, sizeof(buffer), 0) > 0) {
+        n++;
+    }
+    return n;
+}
+
+TEST(send_packets_due, capture_pacing) {
+    /* a capture that starts at 0, and whose 4th packet appears before
+     * the 3rd one: played from 1 ms, it starts at 20 ms, where the 1st
+     * two leave, the 3rd and 4th 20 ms later, and the 5th 30.5 ms after
+     * the 4th, in that millisecond */
+    const long ts_us[] = {0, 0, 20000, 10000, 40500};
+    pcap_pkt pkts_list[5];
+    u_char data[5][sizeof(struct udphdr) + 4] = {};
+    for (int i = 0; i < 5; i++) {
+        pkts_list[i].data = data[i];
+        pkts_list[i].pktlen = sizeof(data[i]);
+        pkts_list[i].ts.tv_sec = ts_us[i] / 1000000;
+        pkts_list[i].ts.tv_usec = ts_us[i] % 1000000;
+        pkts_list[i].partial_check = 0;
+    }
+    pcap_pkts pkts = {};
+    pkts.pkts = pkts_list;
+    pkts.max = pkts_list + 5;
+
+    /* sent on a UDP socket to another, the UDP header in the payload */
+    int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    int sender = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(receiver, 0);
+    ASSERT_GE(sender, 0);
+    play_args_t play = {};
+    struct sockaddr_in* to = (struct sockaddr_in*) &play.to;
+    to->sin_family = AF_INET;
+    to->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(0, bind(receiver, (struct sockaddr*) to, sizeof(*to)));
+    socklen_t len = sizeof(*to);
+    ASSERT_EQ(0, getsockname(receiver, (struct sockaddr*) to, &len));
+    play.from.ss_family = AF_INET;
+    play.pcap = &pkts;
+    const bool was_ipv6 = media_ip_is_ipv6;
+    media_ip_is_ipv6 = false;
+
+    unsigned long long due = 0;
+    EXPECT_EQ(1, send_packets_due(sender, &play, 1000, &due));
+    EXPECT_EQ(20000u, due);
+    EXPECT_EQ(0, count_packets(receiver));
+    EXPECT_EQ(1, send_packets_due(sender, &play, 20000, &due));
+    EXPECT_EQ(40000u, due);
+    EXPECT_EQ(2, count_packets(receiver));
+    EXPECT_EQ(1, send_packets_due(sender, &play, 39999, &due));
+    EXPECT_EQ(40000u, due);
+    EXPECT_EQ(0, count_packets(receiver));
+    EXPECT_EQ(1, send_packets_due(sender, &play, 40000, &due));
+    EXPECT_EQ(70000u, due);
+    EXPECT_EQ(2, count_packets(receiver));
+    EXPECT_EQ(0, send_packets_due(sender, &play, 70000, &due));
+    EXPECT_EQ(1, count_packets(receiver));
+
+    media_ip_is_ipv6 = was_ipv6;
+    close(sender);
+    close(receiver);
+}
+
+TEST(send_packets_due, full_send_buffer) {
+    /* two packets at once */
+    pcap_pkt pkts_list[2];
+    u_char data[2][sizeof(struct udphdr) + 4] = {};
+    for (int i = 0; i < 2; i++) {
+        pkts_list[i].data = data[i];
+        pkts_list[i].pktlen = sizeof(data[i]);
+        pkts_list[i].ts.tv_sec = 0;
+        pkts_list[i].ts.tv_usec = 0;
+        pkts_list[i].partial_check = 0;
+    }
+    pcap_pkts pkts = {};
+    pkts.pkts = pkts_list;
+    pkts.max = pkts_list + 2;
+
+    /* sent on a TCP connection, which ignores the address, and whose
+     * send buffer fills up as the other end reads none */
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    int sender = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(listener, 0);
+    ASSERT_GE(sender, 0);
+    int small = 4096;
+    setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    setsockopt(sender, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+    play_args_t play = {};
+    struct sockaddr_in* to = (struct sockaddr_in*) &play.to;
+    to->sin_family = AF_INET;
+    to->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(0, bind(listener, (struct sockaddr*) to, sizeof(*to)));
+    socklen_t len = sizeof(*to);
+    ASSERT_EQ(0, getsockname(listener, (struct sockaddr*) to, &len));
+    ASSERT_EQ(0, listen(listener, 1));
+    ASSERT_EQ(0, connect(sender, (struct sockaddr*) to, sizeof(*to)));
+    int receiver = accept(listener, nullptr, nullptr);
+    ASSERT_GE(receiver, 0);
+    char buffer[4096] = {};
+    while (send(sender, buffer, sizeof(buffer), MSG_DONTWAIT) > 0) {
+    }
+    play.from.ss_family = AF_INET;
+    play.pcap = &pkts;
+    const bool was_ipv6 = media_ip_is_ipv6;
+    media_ip_is_ipv6 = false;
+
+    /* the play, started on a multiple of 20 ms, waits for the socket,
+     * 1 ms at a time */
+    unsigned long long due = 0;
+    EXPECT_EQ(1, send_packets_due(sender, &play, 20000, &due));
+    EXPECT_EQ(21000u, due);
+    EXPECT_EQ(pkts_list, play.next);
+    EXPECT_EQ(1, send_packets_due(sender, &play, 21000, &due));
+    EXPECT_EQ(22000u, due);
+    EXPECT_EQ(pkts_list, play.next);
+
+    /* and sends both packets once the other end has read */
+    struct pollfd pfd = {receiver, POLLIN, 0};
+    while (poll(&pfd, 1, 50) > 0 && recv(receiver, buffer, sizeof(buffer), 0) > 0) {
+    }
+    EXPECT_EQ(0, send_packets_due(sender, &play, 22000, &due));
+    EXPECT_EQ(pkts.max, play.next);
+
+    media_ip_is_ipv6 = was_ipv6;
+    close(sender);
+    close(receiver);
+    close(listener);
 }
 #endif /* PCAP_PLAY */
 #endif
@@ -7680,14 +7874,12 @@ int call::ipsec_setup_sas(const char *msg)
     } else if (peripsocket) {
         /* -t ui: the SAs and the protected sockets belong to this call's
          * address from the injection file, not to the process-wide one. */
-        char peripaddr[256];
-        char *tmp = peripaddr;
-        getFieldFromInputFile(ip_file, peripfield, nullptr, tmp);
-        snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", peripaddr);
+        const std::string peripaddr = getFieldFromInputFile(ip_file, peripfield, nullptr);
+        snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", peripaddr.c_str());
     } else {
-        snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", local_ip);
+        snprintf(ipsec_params.local_ip, sizeof(ipsec_params.local_ip), "%s", local_ip.c_str());
     }
-    snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", remote_ip);
+    snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", remote_ip.c_str());
     if (tunnel_pcscf()) {
         snprintf(ipsec_params.remote_ip, sizeof(ipsec_params.remote_ip), "%s", tunnel_pcscf());
     }

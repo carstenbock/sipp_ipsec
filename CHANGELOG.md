@@ -36,14 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docker/Dockerfile`: `USE_IPSEC=1` build argument enables `-DUSE_IPSEC=1` CMake flag; `iproute2` added to runtime image for XFRM SA management
 
 ### Fixed
+- An AKA key given as `-key aka_K 0x...` whose bytes include `[` (0x5B), such as K of 3GPP TS 35.208 test set 1, no longer stops SIPp with "Syntax error or invalid [keyword] in scenario": the key is decoded in the authentication code, not before the scenario is parsed (from upstream)
 - SWu with several SIPp processes on one host: the tunnel SAs took their kernel reqid from a per-process counter, so UEs of different processes that used the same ePDG shared a reqid and half of them sent their packets through another UE's SA (REGISTERs retransmitted for tens of seconds, re-REGISTERs unanswered). The reqid is now the SPI the ePDG assigned
 
 ### Changed
+- Merged upstream SIPp master (3.7.8, 3.7.9 and the unreleased changes up to `da204b9` of 2026-10-10): several dialogs per call, server transactions, Lua scripting, SIP over WebSocket, DNS NAPTR/SRV, `-round_robin`, SHA-256/SHA-512-256 digest variants, RFC 6188 SRTP suites, and many crash, memory and transport fixes. See `CHANGES.md` for the full list
+- AKA keys (`aka_K`, `aka_OP`, `aka_OPc`) reach the authentication code as text and are decoded there: with a leading `0x`, or as exactly 32 hex digits without it. `aka_AMF` is ignored, the AMF of the challenge's AUTN is used (3GPP TS 33.102 section 6.3.3), which is now upstream behaviour too
+- `docker/Dockerfile`: runtime image is Alpine 3.24 (from upstream)
 - The ESP tunnel SAs of an SWu attach accept inner packets of both address families (`XFRM_STATE_AF_UNSPEC`); a PGW's answer "accepted with another PDN type" (GTP causes 17 to 19) brings an S8 session up like cause 16
 - VoLTE scenarios now use Service-Route from REGISTER 200 OK as `Route` header instead of hardcoded `Route: <sip:[remote_ip]:[remote_port];lr>`
 - `volte_reregister_cycle.xml` re-extracts Service-Route on every refresh 200 OK to handle registrar route updates
 - Security-Client header now offers all 4 algorithm combinations ({hmac-md5-96, hmac-sha-1-96} x {aes-cbc, null}) per 3GPP TS 33.203, matching real UE behavior
 - IPSec protected ports (port-c, port-s) now use random ephemeral ports (32768-65535) instead of hardcoded 5060/5061
+
+### Breaking
+- From upstream, see `CHANGES.md`: numbers in options and scenarios are decimal or `0x` hex, a leading `0` no longer means octal, and empty, malformed or out-of-range values are errors instead of 0; `<ereg search_in="hdr">` matches a header name only at the start of a line; the `-trace_stat` file has periodic (P) and cumulative (C) columns for each repartition range and `-periodic_rtd` is ignored; a fatal error before the scenario loads exits with 255, not 1; the built-in scenarios use `[media_ip]` instead of `[local_ip]` in SDP; building requires a C++17 compiler and OpenSSL 1.1.1 or later, or wolfSSL (the bundled MD5, AKA and base64 code is gone)
 
 ### Fixed
 - A request with a new Call-ID that arrives on a UE's protected server port (an INVITE to a registered UE) is handed to the call that owns the port instead of being discarded as "can't be mapped to a known SIPp call", so the callee scenarios (`vowifi_uas.xml`, `s8hr_uas.xml`) receive their call

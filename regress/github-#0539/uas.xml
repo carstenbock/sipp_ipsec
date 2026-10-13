@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Challenges with the algorithm and qop of the next line of the CSV,
+     and accepts only alice's response. -->
+<scenario name="digest algorithms uas">
+  <recv request="MESSAGE"/>
+  <send>
+    <![CDATA[
+      SIP/2.0 401 Unauthorized
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=srv
+      [last_Call-ID:]
+      [last_CSeq:]
+      WWW-Authenticate: Digest realm="r", nonce="n[call_number]", qop="[field1]", algorithm=[field0], opaque="o"
+      Content-Length: 0
+    ]]>
+  </send>
+  <recv request="MESSAGE">
+    <action>
+      <verifyauth assign_to="authvalid" username="alice" password="secret"/>
+    </action>
+  </recv>
+  <nop test="authvalid" next="good"/>
+  <send next="end">
+    <![CDATA[
+      SIP/2.0 403 Forbidden
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=srv
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+    ]]>
+  </send>
+  <label id="good"/>
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=srv
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+    ]]>
+  </send>
+  <label id="end"/>
+</scenario>

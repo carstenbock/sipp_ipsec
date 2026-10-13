@@ -1,24 +1,33 @@
 SIP authentication
 ``````````````````
 
-SIPp supports SIP authentication. Two authentication algorithm are
-supported: Digest/MD5 ("algorithm="MD5""),
-Digest/SHA-256 ("algorithm="SHA-256"") and Digest/AKA
-("algorithm="AKAv1-MD5"", as specified by 3GPP for IMS).
+SIPp supports SIP authentication. These authentication algorithms are
+supported: Digest/MD5 ("algorithm="MD5""), Digest/SHA-256
+("algorithm="SHA-256"") and Digest/SHA-512-256
+("algorithm="SHA-512-256""), each also as a session variant
+("MD5-sess", "SHA-256-sess" and "SHA-512-256-sess", RFC 7616 and RFC
+8760), and Digest/AKA ("algorithm="AKAv1-MD5"", as specified by 3GPP
+for IMS). A session variant needs a qop in the challenge, as its
+response is of the cnonce. SHA-512-256 needs an SSL library with
+SHA-512/256: OpenSSL has it, and wolfSSL unless built without it.
+The algorithm is echoed as the challenge has it.
 
 Enabling authentication is simple. When receiving a 401 (Unauthorized)
 or a 407 (Proxy Authentication Required), you must add auth="true" in
 the <recv> command to take the challenge into account. Then, the
 authorization header can be re-injected in the next message by using
-[authentication] keyword.
+[authentication] keyword. Of several challenges, the first Digest one
+with a supported algorithm is answered (a session variant only with a
+qop).
 
 Computing the authorization header is done through the usage of the
-"[authentication]" keyword. Depending on the algorithm ("MD5", "AKAv1-MD5" or
-"SHA-256"), different parameters must be passed next to the
+"[authentication]" keyword. Depending on the algorithm (AKAv1-MD5 or
+another), different parameters must be passed next to the
 authentication keyword:
 
 
-+ Digest/MD5 and Digest/SHA-256 (example: [authentication username=joe password=schmo])
++ Digest/MD5, Digest/SHA-256 and Digest/SHA-512-256, and their session
+  variants (example: [authentication username=joe password=schmo])
 
     + username : username: if no username is specified, the username is
       taken from the '-au' (authentication username) or '-s' (service)
@@ -28,7 +37,7 @@ authentication keyword:
 
 + Digest/AKA: (example: [authentication username=HappyFeet
   aka_OP=0xCDC202D5123E20F62B6D676AC72CB318
-  aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC aka_AMF=0xB9B9])
+  aka_K=0x465B5CE8B199B49FAA5F0A2EE238A6BC])
 
   Or with a pre-computed OPc instead of OP: (example: [authentication
   username=HappyFeet
@@ -45,9 +54,11 @@ authentication keyword:
     + aka_OPc : Derived operator key (OPc = AES_K(OP) XOR OP). Use
       this instead of aka_OP when OPc is pre-computed or provisioned
       directly. Exactly one of aka_OP or aka_OPc must be provided.
-    + aka_AMF : Authentication Management Field (indicates the algorithm
-      and key in use)
+    + aka_AMF : ignored: the Authentication Management Field is the one
+      in the challenge's AUTN, as a USIM uses it
 
+A value can also be a keyword, such as
+[authentication username=[field0] password=[field1]].
 
 AKA with IPSec (VoLTE)
 +++++++++++++++++++++++
@@ -140,7 +151,7 @@ Example::
         Content-Length: [len]
 
         v=0
-        o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+        o=user1 53655765 2353687637 IN IP[media_ip_type] [media_ip]
         s=-
         t=0 0
         c=IN IP[media_ip_type] [media_ip]

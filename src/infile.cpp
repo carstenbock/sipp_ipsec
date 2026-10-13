@@ -23,8 +23,35 @@
 #include "screen.hpp"
 #include "stat.hpp"
 #include "infile.hpp"
+#include <algorithm>
 #include <iostream>
 #include <assert.h>
+
+/* Reads the number of a "key=number" entry of an input file's first line.
+ * Only the whole key matches: PRINTF is not the start of PRINTFOFFSET. */
+static bool get_printf_param(const char *line, const char *key,
+                             const char *fileName, unsigned long *value)
+{
+    size_t len = strlen(key);
+    const char *p = line;
+    while ((p = strstr(p, key)) && isalnum((unsigned char)p[len])) {
+        p += len;
+    }
+    if (!p) {
+        return false;
+    }
+    p += len;
+    if (*p != '=') {
+        ERROR("Invalid %s specification (requires =) for %s:%s", key, fileName, line);
+    }
+    char *endptr;
+    *value = strtoul(p + 1, &endptr, 0);
+    if (*endptr && *endptr != ',') {
+        ERROR("Invalid %s specification (invalid end character '%c') for %s:%s",
+              key, *endptr, fileName, line);
+    }
+    return true;
+}
 
 /* Read MAX_CHAR_BUFFER_SIZE size lines from the "fileName" and populate it in
  * the fileContents vector. Each line should be terminated with a '\n'
@@ -64,50 +91,21 @@ FileContents::FileContents(const char *fileName)
         ERROR("Unknown file type (valid values are RANDOM, SEQUENTIAL, and USER) for %s:%s", fileName, line);
     }
 
-    const char *useprintf;
-    if ((useprintf = strstr(line, "PRINTF"))) {
+    unsigned long value;
+    if (get_printf_param(line, "PRINTF", fileName, &value)) {
         /* We are going to operate in printf mode, which uses the line as a format
          * string for printf with the line number. */
-        useprintf += strlen("PRINTF");
-        if (*useprintf != '=') {
-            ERROR("Invalid file printf specification (requires =) for %s:%s", fileName, line);
-        }
-        useprintf++;
-        char *endptr;
-        virtualLines = strtoul(useprintf, &endptr, 0);
-        if (*endptr && *endptr != '\r' && *endptr != '\n' && *endptr != ',') {
-            ERROR("Invalid file printf specification for (invalid end character '%c') %s:%s", *endptr, fileName, line);
-        }
+        virtualLines = value;
         if (virtualLines == 0) {
             ERROR("A printf file must have at least one virtual line %s:%s", fileName, line);
         }
         printfFile = true;
     }
-
-    if ((useprintf = strstr(line, "PRINTFOFFSET"))) {
-        useprintf += strlen("PRINTFOFFSET");
-        if (*useprintf != '=') {
-            ERROR("Invalid file PRINTFOFFSET specification (requires =) for %s:%s", fileName, line);
-        }
-        useprintf++;
-        char *endptr;
-        printfOffset = strtoul(useprintf, &endptr, 0);
-        if (*endptr && *endptr != '\n' && *endptr != ',') {
-            ERROR("Invalid PRINTFOFFSET specification for (invalid end character '%c') %s:%s", *endptr, fileName, line);
-        }
+    if (get_printf_param(line, "PRINTFOFFSET", fileName, &value)) {
+        printfOffset = value;
     }
-
-    if ((useprintf = strstr(line, "PRINTFMULTIPLE"))) {
-        useprintf += strlen("PRINTFMULTIPLE");
-        if (*useprintf != '=') {
-            ERROR("Invalid PRINTFMULTIPLE specification (requires =) for %s:%s", fileName, line);
-        }
-        useprintf++;
-        char *endptr;
-        printfMultiple = strtoul(useprintf, &endptr, 0);
-        if (*endptr && *endptr != '\n' && *endptr != ',') {
-            ERROR("Invalid PRINTFOFFSET specification for (invalid end character '%c') %s:%s", *endptr, fileName, line);
-        }
+    if (get_printf_param(line, "PRINTFMULTIPLE", fileName, &value)) {
+        printfMultiple = value;
     }
 
     while (!inFile.eof()) {
@@ -136,26 +134,101 @@ FileContents::FileContents(const char *fileName)
         numLinesInFile = realLinesInFile;
     }
 
-    indexMap = nullptr;
     indexField = -1;
 }
 
-int FileContents::getLine(int line, char *dest, int len)
+const std::string &FileContents::getLine(int line)
 {
     if (printfFile) {
         line %= realLinesInFile;
     }
-    return snprintf(dest, len, "%s", fileLines[line].c_str());
+    return fileLines[line];
 }
 
-int FileContents::getField(int lineNum, int field, char *dest, int len)
+/* Expands a PRINTF injection field: each "%[-][0][width][.precision]d" is
+ * replaced by value, and "%%" by "%". The conversion is parsed here and
+ * printed with a constant format string, so text from the file is never
+ * used as a format. Width and precision are capped, as the output cannot
+ * be longer than a message anyway. */
+static std::string expand_printf_field(const std::string &field, long long value)
+{
+    const char *s = field.c_str();
+    size_t l = field.length();
+    std::string out;
+    size_t i = 0;
+
+    while (i < l) {
+        if (s[i] != '%') {
+            out += s[i++];
+            continue;
+        }
+        if (s[i + 1] == '%') {
+            out += '%';
+            i += 2;
+            continue;
+        }
+
+        bool left_align = false, zero_pad = false;
+        int width = 0, precision = -1;
+        i++;
+        while (s[i] == '-' || s[i] == '0') {
+            if (s[i] == '-') {
+                left_align = true;
+            } else {
+                zero_pad = true;
+            }
+            i++;
+        }
+        while (isdigit((unsigned char)s[i])) {
+            width = std::min(width * 10 + (s[i] - '0'), SIPP_MAX_MSG_SIZE);
+            i++;
+        }
+        if (s[i] == '.') {
+            precision = 0;
+            i++;
+            while (isdigit((unsigned char)s[i])) {
+                precision = std::min(precision * 10 + (s[i] - '0'), SIPP_MAX_MSG_SIZE);
+                i++;
+            }
+        }
+        if (i == l) {
+            ERROR("Invalid printf injection field (ran off end of line): %s", s);
+        }
+        if (s[i] != 'd') {
+            ERROR("Invalid printf injection field (only decimal values allowed '%c'): %s", s[i], s);
+        }
+        i++;
+
+        /* Room for the padding plus the widest long long. */
+        std::string piece(std::max(width, precision) + 32, '\0');
+        int n;
+        if (left_align) {
+            if (precision < 0) {
+                n = snprintf(&piece[0], piece.size(), "%-*lld", width, value);
+            } else {
+                n = snprintf(&piece[0], piece.size(), "%-*.*lld", width, precision, value);
+            }
+        } else if (precision >= 0) {
+            n = snprintf(&piece[0], piece.size(), "%*.*lld", width, precision, value);
+        } else if (zero_pad) {
+            n = snprintf(&piece[0], piece.size(), "%0*lld", width, value);
+        } else {
+            n = snprintf(&piece[0], piece.size(), "%*lld", width, value);
+        }
+        if (n > 0) {
+            out.append(piece, 0, std::min<size_t>(n, piece.size() - 1));
+        }
+    }
+    return out;
+}
+
+std::string FileContents::getField(int lineNum, int field)
 {
     int curfield = field;
     int curline = lineNum;
 
-    dest[0] = '\0';
-    if (lineNum >= numLinesInFile) {
-        return 0;
+    if (lineNum < 0 || lineNum >= numLinesInFile) {
+        return "";
     }
 
     if (printfFile) {
@@ -186,12 +259,12 @@ int FileContents::getField(int lineNum, int field, char *dest, int len)
 
     if (curfield) {
         WARNING("Field %d not found in the file %s", field, fileName);
-        return 0;
+        return "";
     }
 
 
     if (std::string::npos == oldpos) {
-        return 0;
+        return "";
     }
 
     if (std::string::npos != pos) {
@@ -200,49 +273,11 @@ int FileContents::getField(int lineNum, int field, char *dest, int len)
     }
 
     std::string x = line.substr(oldpos, pos);
-    if (x.length()) {
-        if (printfFile) {
-            const char *s = x.c_str();
-            int l = strlen(s);
-            int copied = 0;
-            for (int i = 0; i < l; i++) {
-                if (s[i] == '%') {
-                    if (s[i + 1] == '%') {
-                        dest[copied++] = s[i];
-                    } else {
-                        const char *format = s + i;
-                        i++;
-                        while (s[i] != 'd') {
-                            if (i == l) {
-                                ERROR("Invalid printf injection field (ran off end of line): %s", s);
-                            }
-                            if (!(isdigit(s[i]) || s[i] == '.' || s[i] == '-')) {
-                                ERROR("Invalid printf injection field (only decimal values allowed '%c'): %s", s[i], s);
-                            }
-                            i++;
-                        }
-                        assert(s[i] == 'd');
-                        char *tmp = (char *)malloc(s + i + 2 - format);
-                        if (!tmp) {
-                            ERROR("Out of memory!");
-                        }
-                        memcpy(tmp, format, s + i + 1 - format);
-                        tmp[s + i + 1 - format] = '\0';
-                        copied += sprintf(dest + copied, tmp, printfOffset + (lineNum * printfMultiple));
-                        free(tmp);
-                    }
-                } else {
-                    dest[copied++] = s[i];
-                }
-            }
-            dest[copied] = '\0';
-            return copied;
-        } else {
-            return snprintf(dest, len, "%s", x.c_str());
-        }
-    } else {
-        return 0;
+    if (printfFile) {
+        long long value = (long long)printfOffset + (long long)lineNum * printfMultiple;
+        return expand_printf_field(x, value);
     }
+    return x;
 }
 
 int FileContents::numLines()
@@ -250,14 +285,16 @@ int FileContents::numLines()
     return numLinesInFile;
 }
 
-int FileContents::nextLine(int userId)
+int FileContents::nextLine(int userId, bool advance)
 {
     switch(usage) {
     case InputFileRandomOrder:
         return rand() % numLinesInFile;
     case InputFileSequentialOrder: {
         int ret = lineCounter;
-        lineCounter = (lineCounter + 1) % numLinesInFile;
+        if (advance) {
+            lineCounter = (lineCounter + 1) % numLinesInFile;
+        }
         return ret;
     }
     case InputFileUser:
@@ -291,30 +328,27 @@ void FileContents::index(int field)
 {
     this->indexField = field;
 
-    indexMap = new str_int_map;
+    indexMap.clear();
     for (int line = 0; line < numLines(); line++) {
         reIndex(line);
     }
 }
 
-int FileContents::lookup(char *key)
+int FileContents::lookup(const std::string &key)
 {
     if (indexField == -1) {
         ERROR("Invalid Index File: %s", fileName);
     }
-    if (!indexMap) {
-        ERROR("Invalid Index File: %s", fileName);
-    }
 
-    str_int_map::iterator index_it = indexMap->find(key);
-    if (index_it == indexMap->end()) {
+    str_int_map::iterator index_it = indexMap.find(key);
+    if (index_it == indexMap.end()) {
         return -1;
     }
     return index_it->second;
 }
 
 
-void FileContents::insert(char *value)
+void FileContents::insert(const std::string &value)
 {
     if (printfFile) {
         ERROR("Can not insert or replace into a printf file: %s", fileName);
@@ -325,13 +359,9 @@ void FileContents::insert(char *value)
     if (indexField != -1) {
         reIndex(realLinesInFile - 1);
     }
-    char line[1024];
-    getLine(realLinesInFile - 1, line, sizeof(line));
-    char tmp[1024];
-    getField(realLinesInFile - 1, 0, tmp, sizeof(tmp));
 }
 
-void FileContents::replace(int line, char *value)
+void FileContents::replace(int line, const std::string &value)
 {
     if (printfFile) {
         ERROR("Can not insert or replace into a printf file: %s", fileName);
@@ -352,13 +382,8 @@ void FileContents::reIndex(int line)
     assert(line >= 0);
     assert(line < realLinesInFile);
 
-    char tmp[SIPP_MAX_MSG_SIZE];
-    getField(line, indexField, tmp, SIPP_MAX_MSG_SIZE);
-    str_int_map::iterator index_it = indexMap->find(str_int_map::key_type(tmp));
-    if (index_it != indexMap->end()) {
-        indexMap->erase(index_it);
-    }
-    indexMap->insert(std::pair<str_int_map::key_type,int>(str_int_map::key_type(tmp), line));
+    /* The line now has the key, whichever had it before */
+    indexMap[getField(line, indexField)] = line;
 }
 
 void FileContents::deIndex(int line)
@@ -369,12 +394,131 @@ void FileContents::deIndex(int line)
     assert(line >= 0);
     assert(line < realLinesInFile);
 
-    char tmp[SIPP_MAX_MSG_SIZE];
-    getField(line, indexField, tmp, SIPP_MAX_MSG_SIZE);
-    str_int_map::iterator index_it = indexMap->find(str_int_map::key_type(tmp));
-    if (index_it != indexMap->end()) {
+    str_int_map::iterator index_it = indexMap.find(getField(line, indexField));
+    if (index_it != indexMap.end()) {
         if (index_it->second == line) {
-            indexMap->erase(index_it);
+            indexMap.erase(index_it);
         }
     }
 }
+
+#ifdef GTEST
+#include "gtest/gtest.h"
+#include <fstream>
+
+TEST(infile, get_field_is_whole)
+{
+    std::string path = testing::TempDir() + "sipp_infile_get_field.csv";
+    {
+        std::ofstream out(path);
+        out << "SEQUENTIAL\n"
+            << "short;" << std::string(100000, 'x') << ";last\n";
+    }
+    FileContents contents(path.c_str());
+
+    EXPECT_EQ("short", contents.getField(0, 0));
+    EXPECT_EQ(std::string(100000, 'x'), contents.getField(0, 1));
+    EXPECT_EQ("last", contents.getField(0, 2));
+    EXPECT_EQ("", contents.getField(1, 0));
+
+    remove(path.c_str());
+}
+
+TEST(infile, printf_get_field_is_whole)
+{
+    std::string path = testing::TempDir() + "sipp_infile_printf_get_field.csv";
+    {
+        std::ofstream out(path);
+        out << "SEQUENTIAL,PRINTF=10\n"
+            << "user%010d" << std::string(100, 'y') << ";\n";
+    }
+    FileContents contents(path.c_str());
+
+    EXPECT_EQ("user0000000003" + std::string(100, 'y'), contents.getField(3, 0));
+
+    remove(path.c_str());
+}
+
+TEST(infile, index)
+{
+    std::string path = testing::TempDir() + "sipp_infile_index.csv";
+    {
+        std::ofstream out(path);
+        out << "SEQUENTIAL\n"
+            << "alice;1;\n"
+            << "bob;2;\n";
+    }
+    FileContents contents(path.c_str());
+
+    EXPECT_DEATH(contents.lookup("bob"), "Invalid Index File: ");
+    contents.index(0);
+    EXPECT_EQ(1, contents.lookup("bob"));
+    EXPECT_EQ(-1, contents.lookup("carol"));
+    contents.insert("carol;3;");
+    EXPECT_EQ(2, contents.lookup("carol"));
+    EXPECT_EQ("carol;3;", contents.getLine(2));
+    contents.replace(0, "dave;4;");
+    EXPECT_EQ(-1, contents.lookup("alice"));
+    EXPECT_EQ(0, contents.lookup("dave"));
+    /* Indexing again starts over */
+    contents.index(1);
+    EXPECT_EQ(-1, contents.lookup("dave"));
+    EXPECT_EQ(1, contents.lookup("2"));
+
+    remove(path.c_str());
+}
+
+TEST(infile, printf_get_field_matches_printf) {
+    /* Each field uses one of the accepted conversion forms; the result
+     * must be what printf() itself produces for the line number. */
+    static const char *const specs[] = {
+        "%d", "%5d", "%-5d", "%05d", "%.3d", "%8.3d", "%-8.3d", "%-05d",
+        "50%%", "%%%d",
+    };
+    std::string path = testing::TempDir() + "sipp_infile_printf_matches.csv";
+    {
+        std::ofstream out(path);
+        out << "SEQUENTIAL,PRINTF=100,PRINTFOFFSET=1000\n";
+        for (const char *spec : specs) {
+            out << "<" << spec << ">;";
+        }
+        out << "\n";
+    }
+    FileContents contents(path.c_str());
+
+    for (int field = 0; field < (int)(sizeof(specs) / sizeof(specs[0])); field++) {
+        char expected[64];
+        std::string fmt = std::string("<") + specs[field] + ">";
+        snprintf(expected, sizeof(expected), fmt.c_str(), 1042);
+
+        EXPECT_EQ(expected, contents.getField(42, field)) << "spec " << specs[field];
+    }
+
+    remove(path.c_str());
+}
+
+TEST(infile, printf_keys_match_whole) {
+    /* PRINTF is not the start of PRINTFOFFSET or PRINTFMULTIPLE, in any
+     * order. */
+    std::string path = testing::TempDir() + "sipp_infile_printf_keys.csv";
+    {
+        std::ofstream out(path);
+        out << "SEQUENTIAL,PRINTFMULTIPLE=2,PRINTFOFFSET=100,PRINTF=10\n"
+            << "user%d;\n";
+    }
+    FileContents contents(path.c_str());
+
+    EXPECT_EQ(10, contents.numLines());
+    EXPECT_EQ("user106", contents.getField(3, 0));
+
+    {
+        std::ofstream out(path);
+        out << "SEQUENTIAL,PRINTF=10,PRINTFMULTIPLE=2x\n"
+            << "user%d;\n";
+    }
+    EXPECT_DEATH(FileContents bad(path.c_str()),
+                 "Invalid PRINTFMULTIPLE specification \\(invalid end character 'x'\\) for ");
+
+    remove(path.c_str());
+}
+#endif

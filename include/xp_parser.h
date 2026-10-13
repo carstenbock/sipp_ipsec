@@ -22,13 +22,13 @@
 #ifndef __XP_PARSER_H__
 #define __XP_PARSER_H__
 
-int xp_unescape(const char *source, char *dest);
 int xp_set_xml_buffer_from_string(const char *str);
 int xp_set_xml_buffer_from_file(const char *filename);
 char* xp_open_element(int index);
 void xp_close_element(void);
 int xp_is_invalid(void);
 int xp_get_invalid_line(void);
+const char* xp_get_error(void);
 const char* xp_get_value(const char *name);
 char* xp_get_cdata(void);
 

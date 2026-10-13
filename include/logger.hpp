@@ -3,6 +3,7 @@
 
 /************************** Trace Files ***********************/
 
+#include <signal.h>
 #include <time.h>
 #include "sipp.hpp"
 
@@ -28,14 +29,17 @@ MAYBE_EXTERN bool   useLogf             DEFVAL(0);
 MAYBE_EXTERN bool   dumpInFile          DEFVAL(0);
 MAYBE_EXTERN bool   dumpInRtt           DEFVAL(0);
 MAYBE_EXTERN bool   useCountf           DEFVAL(0);
-MAYBE_EXTERN char * slave_cfg_file;
+MAYBE_EXTERN const char *slave_cfg_file;
 
 MAYBE_EXTERN unsigned long long max_log_size DEFVAL(0);
 MAYBE_EXTERN unsigned long long ringbuffer_size DEFVAL(0);
 MAYBE_EXTERN int    ringbuffer_files    DEFVAL(0);
 
 MAYBE_EXTERN char   screen_last_error[32768];
-MAYBE_EXTERN char   screen_logfile[MAX_PATH] DEFVAL("");
+MAYBE_EXTERN std::string screen_logfile;
+
+/* Set by the SIGXFSZ handler: a trace went over the file size limit. */
+MAYBE_EXTERN volatile sig_atomic_t file_size_exceeded DEFVAL(0);
 
 /* Log Rotation Functions. */
 struct logfile_id {
@@ -48,8 +52,8 @@ struct logfile_info {
     bool check;
     FILE *fptr;
     int nfiles;
-    struct logfile_id *ftimes;
-    char file_name[MAX_PATH];
+    std::vector<logfile_id> ftimes;
+    std::string file_name;
     bool overwrite;
     bool fixedname;
     time_t starttime;
@@ -63,10 +67,12 @@ void print_tdm_map();
 void print_screens(void);
 
 void log_off(struct logfile_info *lfi);
+/* Once a trace went over the file size limit, say so in a file of its
+ * own and stop the traces, as the signal handler cannot. */
+void stop_oversized_traces();
 
 #ifdef GLOBALS_FULL_DEFINITION
-#define LOGFILE(name, s, check) \
-    struct logfile_info name = { s, check, nullptr, 0, nullptr, "", true, false, 0, 0 }
+#define LOGFILE(name, s, check) struct logfile_info name = {s, check, nullptr, 0, {}, "", true, false, 0, 0}
 #else
 #define LOGFILE(name, s, check) \
     extern struct logfile_info name

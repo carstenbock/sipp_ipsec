@@ -7,7 +7,7 @@ an action. Several actions are available:
 
 + `Regular expressions`_ (ereg)
 + Log something in a log file (log)
-+ Execute an external (system), internal (int_cmd) or
++ Execute an external (system), internal (int_cmd), Lua (lua) or
   pcap_play_audio/pcap_play_video command (exec)
 + Manipulate double precision variables using arithmetic
 + Assign string values to a variable
@@ -55,7 +55,13 @@ search_in         msg     can have four values: "msg" (try to match against the 
                           SIPp string variable).
 header            None    Header to try to match against.
                           Only used when the search_in tag is set to hdr. MANDATORY IF search_in
-                          is equal to hdr.
+                          is equal to hdr. The regexp is matched against the rest of the line
+                          after the text: header="To:" gives " <sip:...>", header="To"
+                          gives ": <sip:...>". A header name, with or without its
+                          colon, is looked for at the start of a line, and without the colon
+                          only matches that header ("To" matches neither "Topic:" nor
+                          "X-Forward-To:"). Any other text (header="tag=") is looked for
+                          anywhere in the message.
 variable          None    Variable to try to match against. Only
                           used when the search_in tag is set to var. MANDATORY IF search_in is
                           equal to var.
@@ -64,7 +70,8 @@ case_indep        false   To look for a header ignoring case .
 occurrence         1      To find the nth occurrence of a header. Only used when the search_in tag is set
                           to hdr.
 start_line        false   To look only at start of line. Only used when
-                          the search_in tag is set to hdr.
+                          the search_in tag is set to hdr. Kept for older scenarios: a header
+                          name is always looked for at the start of a line.
 check_it          false   if set to true, the
                           call is marked as failed if the regexp doesn't match. Can not be
                           combined with check_it_inverse.
@@ -161,7 +168,19 @@ Execute a command
 +++++++++++++++++
 
 The "exec" action allows you to execute "internal", "external",
-"play_pcap_audio" or "play_pcap_video" commands.
+"play_pcap_audio", "play_pcap_video", "play_pcap_image",
+"play_pcap_text" or "lua" commands.
+
+
+Lua functions
++++++++++++++
+
+The lua attribute calls a function of the Lua file given with
+``-lua_file``, which can read and write the variables of the call::
+
+    <exec lua="translate [$called]"/>
+
+See :doc:`lua` for what the functions can do, and examples.
 
 
 Internal commands
@@ -192,9 +211,38 @@ Example that execute a system echo for every INVITE received::
 
     <recv request="INVITE">
       <action>
-        <exec command="echo [last_From] is the from header received >> from_list.log"/>
+        <exec command="echo INVITE received for call [call_number] >> invite_list.log"/>
       </action>
     </recv>
+
+SIPp does not wait for a command. With the verify attribute instead,
+the call waits for the command to end before it goes on to its next
+message (or ends), and fails if the command exits with a non-zero
+code or is killed by a signal: the call is counted as failed when it
+ends, and the error log says what the command returned. SIPp itself
+does not wait: the other calls go on meanwhile, and so do messages the
+call receives, as during a pause. Example that checks the call's
+record as its last step::
+
+    <nop>
+      <action>
+        <exec verify="./check_record.sh [call_number]"/>
+      </action>
+    </nop>
+
+.. warning::
+
+   The command is expanded like a message and then passed to the shell
+   as is. Keywords whose value comes from the remote peer, such as
+   ``[last_*]`` headers, ``[last_message]`` or variables captured with
+   ``<ereg>``, are not quoted: a peer that controls such a value can run
+   arbitrary commands on the host running SIPp. Only put values into a
+   command that you trust, or write them to a file with ``log`` instead.
+   The same applies to the file name given to ``rtp_stream`` and to the
+   ``[file name=...]`` keyword, which a peer-controlled value could point
+   at any file SIPp can read. The file names given to the
+   ``play_pcap_*`` actions are read when the scenario is loaded and are
+   not expanded.
 
 
 
@@ -203,7 +251,11 @@ Media/RTP commands
 
 RTP streaming allows you to stream audio from a PCMA, PCMU, G722,
 iLBC or G729-encoded audio file (e.g. a .wav file). The "rtp_stream"
-action controls this.
+action controls this. Of a .wav file, the audio of its data chunk
+plays as the payload, as it is: SIPp does not convert or resample it,
+but mixes its channels down to one, as their mean for 8- or 16-bit
+PCM, and as the first channel for other formats, such as A-law and
+mu-law.
 
 
 + <exec rtp_stream="file.wav" /> will stream the audio contained in
@@ -219,16 +271,102 @@ action controls this.
   playback.
 + <exec rtp_stream="resume" /> will resume any currently paused
   playback.
++ <exec rtp_stream="wait" [timeout="10000"] /> holds the next message
+  of the scenario until the playback of the file or pattern is over.
+  A paused playback still plays, and one that repeats forever never
+  ends. After timeout milliseconds (by default, never), the call jumps
+  to the ontimeout label of the message, or is aborted without one. As
+  with a pause, a message that the scenario expects meanwhile ends the
+  wait.
+
+Example that plays a file, and runs the next message once it has
+played, or jumps to the label too_long after 30 seconds::
+
+    <nop ontimeout="too_long">
+      <action>
+        <exec rtp_stream="announcement.wav,1,8,PCMA/8000" />
+        <exec rtp_stream="wait" timeout="30000" />
+      </action>
+    </nop>
+
+``rtp_stream`` sends from a port of its own for each call, which the SDP
+should advertise with ``[rtpstream_audio_port]`` (or
+``[rtpstream_video_port]``), not ``[media_port]``. The PCAP play
+commands below send from ``[media_port]`` instead. See the keyword list.
+
+The rtp_stats action assigns what the call's audio port (or its video
+port, with ``media="video"``) received: the number of RTP packets to
+the first variable of assign_to, and, if given, the payload type and
+the payload of the first packet, in hex, to the second and the third.
+When a scenario has rtp_stats or rtp_dtmf, its calls count the RTP that comes on
+their ``rtp_stream`` ports from the first packet on, even when they
+play and echo nothing, as with a ringback before the call is answered. With no packet, they are 0, -1 and
+an empty string. The payload is the packet's as it came, so with SRTP
+it is still encrypted. The packets are those read so far: those of
+the last few milliseconds (or packet time, while the call plays) may
+not be counted yet.
+
+Example that fails the call unless a PCMA ringback of 0xd5 bytes came
+before the 200 OK::
+
+    <send>
+      ... INVITE with m=audio [rtpstream_audio_port] ...
+    </send>
+
+    <recv response="180" />
+
+    <recv response="200">
+      <action>
+        <rtp_stats assign_to="packets,pt,payload" />
+        <test assign_to="ok" variable="packets" compare="greater_than" value="0" check_it="true" />
+        <test assign_to="ok" variable="pt" compare="equal" value="8" check_it="true" />
+        <ereg regexp="^(d5)+$" search_in="var" variable="payload" assign_to="ok" check_it="true" />
+      </action>
+    </recv>
+
+The rtp_dtmf action assigns the DTMF digits the call's audio port
+received as :RFC:`4733` (:RFC:`2833`) telephone-events to the string
+variable of assign_to, in the order they came: each event is one digit,
+from 0-9, \*, #, and A-D, however many packets it has. payload_type is
+the payload type of the events, as in the SDP (0 to 127, the default is
+96, as for play_dtmf); packets of other payload types are not events. As
+for rtp_stats, the call reads the RTP on its ``rtp_stream`` port, and
+not with SRTP; the digits are those that came so far, and with none the
+variable is empty. In-band DTMF tones are not decoded.
+
+Example that fails the call unless the far end sent the digits 1234::
+
+    <nop>
+      <action>
+        <rtp_dtmf assign_to="digits" payload_type="101" />
+        <strcmp assign_to="cmp" variable="digits" value="1234" />
+        <test assign_to="ok" variable="cmp" compare="equal" value="0" check_it="true" />
+      </action>
+    </nop>
 
 
-PCAP play commands (specified using play_pcap_audio / play_pcap_video
-attributes) allow you to send a pre-recorded RTP stream using the
-`pcap library`_.
+PCAP play commands (specified using play_pcap_audio / play_pcap_video /
+play_pcap_image / play_pcap_text attributes) allow you to send a
+pre-recorded RTP stream using the `pcap library`_.
 Choose play_pcap_audio to send the pre-recorded RTP stream using the
 "m=audio" SIP/SDP line port as a base for the replay.
 
 Choose play_pcap_video to send the pre-recorded RTP stream using the
 "m=video" SIP/SDP line port as a base.
+
+Choose play_pcap_image to send pre-recorded UDPTL (T.38 fax) packets
+using the "m=image" SIP/SDP line port as a base.
+
+Choose play_pcap_text to send a pre-recorded real-time text stream
+(T.140 over RTP, RFC 4103, with or without the RFC 2198 redundancy)
+using the "m=text" SIP/SDP line port as a base.
+
+The packets play as they were captured, with their destination ports
+moved by the same offset: the lowest destination port of the file goes
+to the port of the SDP line, so an RTCP port above it goes to the port
+above that. Keep only the stream to play in the file, e.g. with
+``tshark -r call.pcap -w text.pcap udp.srcport==11078 or
+udp.srcport==11079``: its SIP packets would play too.
 
 The play_pcap_audio/video command has the following format:
 play_pcap_audio="[file_to_play]" with:
@@ -253,19 +391,51 @@ iLBC  98         50 bytes    30 ms       -f ilbc -ar 8k -ac 1 -b:a 13.33k
   FFmpeg adds a header to iLBC files denoting the mode that is used, either 20
   or 30 ms per packet. This header needs to be stripped from the file.
 .. note::
-  The action is non-blocking. SIPp will start a light-weight thread to
-  play the file and the scenario with continue immediately. If needed,
-  you will need to add a pause to wait for the end of the pcap play.
-.. warning::
-  A known bug means that starting a pcap_play_audio command will end any
-  pcap_play_video command, and vice versa; you cannot play both audio
-  and video streams at once.
+  The action is non-blocking. The RTP playback threads (see
+  ``-rtp_threadtasks``) play the file and the scenario continues
+  immediately. If needed, you will need to add a pause to wait for the
+  end of the pcap play.
+.. note::
+  A video or text play goes on while an audio or image one plays, but a
+  new play ends the one still playing on its stream. Audio and image share
+  one, as a switch to T.38 often keeps the remote port: a
+  play_pcap_image ends a play_pcap_audio, and the other way round.
 
 Example that plays a pre-recorded RTP stream::
 
     <nop>
       <action>
         <exec play_pcap_audio="pcap/g711a.pcap"/>
+      </action>
+    </nop>
+
+The play_dtmf command sends DTMF digits as :RFC:`2833` telephone-events,
+generated on the fly and sent like a play_pcap_audio stream. It plays
+on the audio stream: it ends a play_pcap_audio still playing, and a
+play_pcap_audio ends it. It has the following format:
+play_dtmf="[digits],[tone_length],[payload_type]" with:
+
+
++ digits: the digits to send, from 0-9, \*, #, and A-D. Other
+  characters are skipped, but there must be at least one digit.
++ tone_length: optional, how long each digit lasts, in milliseconds,
+  followed by as long a pause (50 to 2000, the default is 200).
++ payload_type: optional, the RTP payload type of the events, which
+  should match the telephone-event payload in the SDP (0 to 127, the
+  default is 96).
+
+Keywords such as ``[field0]`` are expanded when the action runs. A
+value without keywords is checked when the scenario loads, and an
+invalid one is a fatal error. Built from keywords, it is checked when
+it is played, with a warning (see ``-trace_err``) rather than an
+error: an invalid tone_length or payload_type is replaced by its
+default, and without a digit nothing is sent.
+
+Example that sends the digits 1, 2 and 3 with the payload type 101::
+
+    <nop>
+      <action>
+        <exec play_dtmf="123,200,101"/>
       </action>
     </nop>
 
@@ -405,7 +575,7 @@ to find the corresponding line in users.csv.
 
     <recv request="REGISTER">
       <action>
-        <ereg regexp="Digest .*username=\"([^\"]*)\"" search_in="hdr" header="Authorization:" assign_to="junk,username" />
+        <ereg regexp='Digest .*username="([^"]*)"' search_in="hdr" header="Authorization:" assign_to="junk,username" />
         <lookup assign_to="line" file="users.csv" key="[$username]" />
       </action>
     </recv>
@@ -514,8 +684,11 @@ setdest
 The setdest action allows you to change the remote end point for a
 call. The parameters are the transport, host, and port to connect the
 call to. There are certain limitations based on SIPp's design: you can
-not change the transport for a call; and if you are using TCP then
-multi-socket support must be selected (i.e. -t tn must be specified).
+not change the transport for a call; and if you are using TCP or WS then
+multi-socket support must be selected (i.e. -t tn or -t wn must be
+specified); TLS and WSS do not support it. The responses to requests
+that come from elsewhere than the destination still go where those came
+from (see "Where responses go" in the transport modes).
 Also, be aware that frequently using setdest may reduce SIPp's
 capacity as name resolution is a blocking operation (thus potentially
 causing SIPp to stall while looking up host names). This example
@@ -546,9 +719,10 @@ verifyauth
 The verifyauth action checks the Authorization header in an incoming
 message against a provided username and password. The result of the
 check is stored in a boolean variable. This allows you to simulate a
-server which requires authorization. Currently MD5 and SHA-256 digest
-authentications are supported. Before using the verifyauth action, you
-must send a challenge. For example::
+server which requires authorization. Currently MD5, SHA-256 and
+SHA-512-256 digest authentications are supported, and their session
+variants MD5-sess, SHA-256-sess and SHA-512-256-sess. Before using the
+verifyauth action, you must send a challenge. For example::
 
     <recv request="REGISTER" />
     <send>
@@ -575,9 +749,9 @@ on the result::
 
     <recv request="REGISTER">
       <action>
-        <ereg regexp="Digest .*username=\"([^\"]*)\"" search_in="hdr" header="Authorization:" assign_to="junk,username" />
+        <ereg regexp='Digest .*username="([^"]*)"' search_in="hdr" header="Authorization:" assign_to="junk,username" />
         <lookup assign_to="line" file="users.conf" key="[$username]" />
-        <verifyauth assign_to="authvalid" username="[field0 line=\"[$line]\"]" password="[field3 line=\"[$line]\"]" />
+        <verifyauth assign_to="authvalid" username='[field0 line="[$line]"]' password='[field3 line="[$line]"]' />
       </action>
     </recv>
 

@@ -9,13 +9,21 @@ on:
       - '.github/workflows/coverity.yml'
       - 'include/**'
       - 'src/**'
+  # to submit master again, as when Coverity refused a build while
+  # another waited in its queue
+  workflow_dispatch:
+
+# A newer push or merge supersedes the runs before it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   coverity:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     if: github.repository == 'SIPp/sipp'
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - run: sudo apt update
     - run: sudo apt-get install --yes build-essential cmake libpcap-dev openssl libssl-dev libgsl-dev libsctp-dev libncurses-dev libncurses6 libgtest-dev libpugixml-dev
     - run:  cmake . -DUSE_GSL=1 -DUSE_PCAP=1 -DUSE_SCTP=1 -DUSE_SYSTEM_GTEST=ON -DUSE_SYSTEM_PUGIXML=ON

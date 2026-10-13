@@ -20,7 +20,15 @@
 #ifndef __SIPP_SOCKET_H__
 #define __SIPP_SOCKET_H__
 
+#include <string>
+#include <string_view>
+
 #include "sslsocket.hpp"
+
+class WebSocket;
+
+/* At most so much waits for a WebSocket handshake to be done. */
+#define WS_HELD_MAX (16 * SIPP_MAX_MSG_SIZE)
 
 #ifdef USE_SCTP
 #define SCTP_DOWN 0
@@ -54,10 +62,22 @@ inline socklen_t socklen_from_addr(const struct sockaddr_storage* ss) {
     }
 }
 
+/* prefer: of the addresses of host, take the first one of that family
+ * if there is one. */
 int gai_getsockaddr(struct sockaddr_storage* ss, const char* host,
-                    unsigned short port, int flags, int family);
+                    unsigned short port, int flags, int family,
+                    int prefer = AF_UNSPEC);
 int gai_getsockaddr(struct sockaddr_storage* ss, const char* host,
-                    const char *service, int flags, int family);
+                    const char *service, int flags, int family,
+                    int prefer = AF_UNSPEC);
+/* -t ui: the socket of the address ss that the -ip_field text peripaddr
+ * resolves to, if another name of it has one (peripaddr then maps to it
+ * too); and a new socket for both. */
+SIPpSocket *find_perip_socket(const std::string &peripaddr, const struct sockaddr_storage *ss);
+void add_perip_socket(const std::string &peripaddr, const struct sockaddr_storage *ss, SIPpSocket *sock);
+
+/* The family of the first address of host, AF_UNSPEC if it has none. */
+int gai_family(const char *host);
 void sockaddr_update_port(struct sockaddr_storage* ss, short port);
 
 
@@ -66,10 +86,15 @@ void sockaddr_update_port(struct sockaddr_storage* ss, short port);
 class SIPpSocket {
 public:
     SIPpSocket(bool use_ipv6, int transport, int fd, int accepting);
+    ~SIPpSocket();
+    static void check_ws_handshakes();
     static SIPpSocket* new_sipp_call_socket(bool use_ipv6, int transport, bool *existing);
     void set_bind_port(int bind_port);
 
     int connect(struct sockaddr_storage* dest = nullptr);
+    /* Close the descriptor, keeping the socket in its place for
+     * reconnect(), as a setdest does. */
+    void close_fd();
     int reconnect();
 
     // Reset a failed connection
@@ -92,6 +117,10 @@ public:
     // Have we read a message from this socket?
     bool message_ready() { return ss_msglen > 0; };
 
+    /* Did the connection take all that was written to it: nothing waits
+     * to be written, and it is up? */
+    bool all_written();
+
 #ifdef SO_BINDTODEVICE
     // Bind to specific network device.
     int bind_to_device(const char* device_name);
@@ -110,8 +139,9 @@ public:
      * here: set on a UE's protected server port (3GPP TS 33.203), where the
      * P-CSCF sends the requests for that UE and for nobody else. */
     class listener *ss_owner = nullptr;
+    bool ss_own_ref = true;     /* Does ss_count include the socket's own reference? */
     bool ss_ipv6 = false;
-    int ss_transport = 0;       /* T_TCP, T_UDP, or T_TLS. */
+    int ss_transport = 0;       /* T_TCP, T_UDP, T_TLS, T_SCTP, T_WS or T_WSS. */
     bool ss_control = false;    /* Is this a control socket? */
     int ss_fd = -1;             /* The underlying file descriptor for this socket. */
     int ss_port = 0;            /* The port used by this socket */
@@ -128,31 +158,57 @@ private:
     void sipp_sctp_peer_params();
     void invalidate();
     void buffer_read(struct socketbuf *newbuf);
-    void buffer_write(const char *buffer, size_t len, struct sockaddr_storage *dest);
+    void buffer_write(const char *buffer, size_t len, struct sockaddr_storage *dest,
+                      bool untraced);
+    void buffer_whole(const char *buffer, size_t len, const char *out, size_t out_len,
+                      struct sockaddr_storage *dest);
+    void drop_out();
+    bool keep(const char *buffer, size_t len, int flags, struct sockaddr_storage *dest);
+    void trace_sent(const char *buffer, size_t len);
     ssize_t read_message(char *buf, size_t len, struct sockaddr_storage *src);
     struct socketbuf *ss_in = nullptr;    /* Buffered input. */
     struct socketbuf *ss_out = nullptr;   /* Buffered output. */
     struct socketbuf *ss_out_tail = nullptr; /* Tail of buffered output */
     size_t ss_msglen = 0;           /* Is there a complete SIP message waiting, and if so how big? */
 
-    void close_calls();
+    int close_calls();
+    void resume_calls(const std::string &held);
+    void peer_closed(bool reset);
     int flush();
     int write_error(int ret);
-    void abort();
+    void drop_connection();
     int check_for_message();
     int enter_congestion(int again);
+    void poll_add();
+    void poll_remove();
+    void poll_out();
+    void ws_connect();
+    void ws_waiting();
+    void ws_handshake_expired();
+    int ws_empty(const char *data, int ret, struct sockaddr_storage *from);
+    bool to_empty(bool readable);
+    void ws_reply(const std::string &reply);
     ssize_t write_primitive(const char* buffer, size_t len,
                             struct sockaddr_storage* dest);
 
 
     bool ss_call_socket = false; /* Is this a call socket? */
+    bool ss_accepted = false;    /* Was this socket accepted from a peer? */
 
 #if defined(USE_OPENSSL) || defined(USE_WOLFSSL)
     SSL *ss_ssl = nullptr; /* The underlying SSL descriptor for this socket. */
-    BIO *ss_bio = nullptr; /* The underlying BIO descriptor for this socket. */
 #endif
 
-    int ss_pollidx = -1; /* The index of this socket in our poll structures. */
+    int ss_pollidx = -1; /* The index of this socket in sockets[]. */
+    bool ss_poll_writable = false; /* Does the poll loop wait for it to be
+                                      writable (see poll_out())? */
+
+    WebSocket *ss_ws = nullptr; /* The WebSocket of a WS or WSS connection. */
+    std::string ss_ws_close;    /* Its close frame, or a server's handshake
+                                   error, to send once it ends. */
+    unsigned long ss_ws_since = 0; /* When its handshake started, in ms. */
+    std::string ss_ws_pong;     /* The pong to the last ping that came while
+                                   output waited. */
 
 #ifdef USE_SCTP
     int sctpstate = SCTP_DOWN;
@@ -168,6 +224,9 @@ int handle_ctrl_socket();
 void handle_stdin_socket();
 
 void process_message(SIPpSocket* socket, char *msg, ssize_t msg_size, struct sockaddr_storage *src);
+/* The Call-ID of msg without its "///" prefix (unless -callid_slash_ign):
+ * the key of the call it is for. full, if given, gets the whole value. */
+std::string_view get_trimmed_call_id(const char *msg, std::string_view *full = nullptr);
 bool reconnect_allowed();
 
 /********************** Network Interfaces ********************/
@@ -187,6 +246,7 @@ struct socketbuf {
     size_t len;
     size_t offset;
     struct sockaddr_storage addr;
+    bool untraced;      /* A whole message, to trace as sent once written. */
     struct socketbuf *next;
 };
 
@@ -194,6 +254,7 @@ struct socketbuf {
 
 #define WS_EAGAIN 1 /* Return EAGAIN if there is no room for writing the message. */
 #define WS_BUFFER 2 /* Buffer the message if there is no room for writing the message. */
+#define WS_KEEP 4   /* Keep the message for the new connection of one that failed (see keep()). */
 
 
 #if defined (__hpux) || (defined (__alpha) && !defined (__FreeBSD__) && !defined (__linux__))

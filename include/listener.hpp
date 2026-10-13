@@ -20,37 +20,49 @@
 #ifndef __LISTENER__
 #define __LISTENER__
 
-#include <map>
 #include <iterator>
 #include <list>
+#include <string_view>
 #include <sys/types.h>
 #include <string.h>
 #include <assert.h>
 
 #include "sipp.hpp"
 
+class SIPpSocket;
+
 class listener
 {
 public:
-    listener(const char *id, bool listening);
+    listener(std::string_view id, bool listening);
     virtual ~listener();
     char *getId();
-    virtual bool process_incoming(const char* msg, const struct sockaddr_storage* src) = 0;
+    /* socket: the one msg came on. */
+    virtual bool process_incoming(const char* msg, const struct sockaddr_storage* src,
+                                  SIPpSocket *socket) = 0;
     virtual bool process_twinSippCom(char* msg) = 0;
     /* Also receive the messages of another Call-ID (a dialog the peer
      * starts toward a call that exists, e.g. an INVITE to a registered UE) */
     void addAlias(const char *other_id);
 
 protected:
+    /* Not listening, the id in storage of the derived class if it fits */
+    listener(const char *id, char *storage, size_t size);
+
     void startListening();
     void stopListening();
+    /* Takes the messages of this Call-ID too, until unlisten(): key
+     * must stay until then */
+    void listen(const char *key);
+    void unlisten(const char *key);
 
     char *id;
     bool listening;
     std::list<std::string> aliases;
+    bool own_id; /* id is ours to free */
 };
 
-typedef std::map<std::string, listener *> listener_map;
-listener * get_listener(const char *);
+/* The listener of the id, or of a key it listens to */
+listener *get_listener(std::string_view id);
 
 #endif

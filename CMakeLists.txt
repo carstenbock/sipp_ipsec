@@ -29,6 +29,9 @@ function(optional_library LIB_NAME DESCRIPTION)
   string(TOLOWER "${LIB_NAME}" LIB_LOWER)
   if(USE_${LIB_NAME} STREQUAL "ON" OR USE_${LIB_NAME} STREQUAL "1")
     find_library(${LIB_NAME}_LIBRARY ${LIB_LOWER})
+    if(NOT ${LIB_NAME}_LIBRARY)
+      message(FATAL_ERROR "USE_${LIB_NAME} is ON, but lib${LIB_LOWER} is missing: install its development package")
+    endif()
     set(USE_${LIB_NAME} 1)
   elseif(USE_${LIB_NAME} STREQUAL "OFF" OR USE_${LIB_NAME} STREQUAL "0")
     set(USE_${LIB_NAME} 0)
@@ -41,6 +44,24 @@ function(optional_library LIB_NAME DESCRIPTION)
       message(STATUS "${LIB_NAME} is disabled")
       set(USE_${LIB_NAME} 0 PARENT_SCOPE)
     endif()
+  endif()
+endfunction()
+
+# A three-way cache option: AUTO, ON or OFF. ON and OFF may be given in any
+# spelling CMake takes for a boolean (1, TRUE, YES, 0, FALSE, NO, ...), as
+# packagers often pass -DOPTION=1. Sets <VAR>_MODE to AUTO, ON or OFF.
+function(tristate_option VAR DESCRIPTION)
+  set(${VAR} "AUTO" CACHE STRING "${DESCRIPTION}")
+  set_property(CACHE ${VAR} PROPERTY STRINGS AUTO ON OFF)
+  string(TOUPPER "${${VAR}}" value)
+  if(value STREQUAL "AUTO")
+    set(${VAR}_MODE AUTO PARENT_SCOPE)
+  elseif(value MATCHES "^(ON|1|TRUE|YES|Y)$")
+    set(${VAR}_MODE ON PARENT_SCOPE)
+  elseif(value MATCHES "^(OFF|0|FALSE|NO|N)$")
+    set(${VAR}_MODE OFF PARENT_SCOPE)
+  else()
+    message(FATAL_ERROR "${VAR} must be AUTO, ON or OFF, not '${${VAR}}'")
   endif()
 endfunction()
 
@@ -91,8 +112,16 @@ function(apply_common_sipp_dependencies TARGET_NAME)
     target_link_libraries(${TARGET_NAME} ${RT_LIBRARY})
   endif()
 
+  if(RESOLV_LIBRARY)
+    target_link_libraries(${TARGET_NAME} ${RESOLV_LIBRARY})
+  endif()
+
   if(USE_GSL AND GSL_LIBRARY AND GSLCBLAS_LIBRARY)
     target_link_libraries(${TARGET_NAME} ${GSL_LIBRARY} ${GSLCBLAS_LIBRARY})
+  endif()
+
+  if(BUILD_STATIC AND SSL_STATIC_LIBRARIES)
+    set(SSL_LIBRARIES ${SSL_STATIC_LIBRARIES})
   endif()
 
   target_link_libraries(${TARGET_NAME} ${SSL_LIBRARIES})
@@ -118,6 +147,18 @@ function(apply_common_sipp_dependencies TARGET_NAME)
     target_link_libraries(${TARGET_NAME} ${MNL_LIBRARY})
   endif()
 
+  if(LUA_FOUND)
+    if(BUILD_STATIC AND LUA_STATIC_LIBRARIES)
+      target_link_libraries(${TARGET_NAME} ${LUA_STATIC_LIBRARIES})
+    else()
+      target_link_libraries(${TARGET_NAME} ${LUA_LIBRARIES})
+    endif()
+    target_include_directories(${TARGET_NAME} SYSTEM PUBLIC ${LUA_INCLUDE_DIRS})
+    if(LUA_LIBRARY_DIRS)
+      target_link_directories(${TARGET_NAME} PRIVATE ${LUA_LIBRARY_DIRS})
+    endif()
+  endif()
+
   if(BUILD_STATIC AND MSYS)
     target_link_libraries(${TARGET_NAME} crypt32)
   endif()
@@ -132,15 +173,44 @@ option(TLS_KEY_LOGGING "Enable TLS session key logging (OpenSSL only)" OFF)
 
 find_package(PkgConfig QUIET)  # import pkg_check_modules() and friends
 
-option(USE_SYSTEM_PUGIXML "Use system-installed pugixml instead of bundled version" OFF)
-if(USE_SYSTEM_PUGIXML)
-    pkg_check_modules(PUGIXML REQUIRED pugixml)
-    include_directories(SYSTEM ${PUGIXML_INCLUDE_DIRS})
-else()
+# AUTO builds with Lua if pkg-config finds it.
+tristate_option(USE_LUA "Build with Lua scripting: AUTO, ON, or OFF")
+if(NOT USE_LUA_MODE STREQUAL "OFF")
+  if(PKG_CONFIG_FOUND)
+    pkg_search_module(LUA lua5.4 lua-5.4 lua5.3 lua-5.3 lua)
+  endif()
+  if(LUA_FOUND)
+    message(STATUS "Lua is enabled")
+    add_definitions("-DUSE_LUA")
+  elseif(USE_LUA_MODE STREQUAL "ON")
+    message(FATAL_ERROR "USE_LUA is ON, but pkg-config cannot find Lua: install its development package")
+  else()
+    message(STATUS "Lua is disabled")
+  endif()
+endif()
+
+# AUTO takes the bundled copy if its submodule is there, else the system one.
+tristate_option(USE_SYSTEM_PUGIXML "Use system pugixml: AUTO, ON, or OFF")
+set(BUNDLED_PUGIXML ${PROJECT_SOURCE_DIR}/third_party/pugixml)
+if(USE_SYSTEM_PUGIXML_MODE STREQUAL "OFF" OR
+        (USE_SYSTEM_PUGIXML_MODE STREQUAL "AUTO" AND EXISTS ${BUNDLED_PUGIXML}/CMakeLists.txt))
+    if(NOT EXISTS ${BUNDLED_PUGIXML}/CMakeLists.txt)
+        message(FATAL_ERROR "USE_SYSTEM_PUGIXML is OFF, but the bundled pugixml is missing: run 'git submodule update --init'")
+    endif()
     message(STATUS "Using bundled pugixml")
-    set(PUGIXML_SOURCES ${PROJECT_SOURCE_DIR}/third_party/pugixml/src/pugixml.cpp)
-    include_directories(${PROJECT_SOURCE_DIR}/third_party/pugixml/src)
+    set(PUGIXML_SOURCES ${BUNDLED_PUGIXML}/src/pugixml.cpp)
+    include_directories(${BUNDLED_PUGIXML}/src)
     set(PUGIXML_LIBRARIES "")
+else()
+    pkg_check_modules(PUGIXML pugixml)
+    if(PUGIXML_FOUND)
+        message(STATUS "Using system pugixml")
+        include_directories(SYSTEM ${PUGIXML_INCLUDE_DIRS})
+    elseif(USE_SYSTEM_PUGIXML_MODE STREQUAL "ON")
+        message(FATAL_ERROR "USE_SYSTEM_PUGIXML is ON, but pkg-config cannot find pugixml: install its development package")
+    else()
+        message(FATAL_ERROR "pugixml is required. Either install the library or run 'git submodule update --init'")
+    endif()
 endif()
 
 if(USE_WOLFSSL)
@@ -189,10 +259,26 @@ CHECK_INCLUDE_FILE("endian.h" HAVE_ENDIAN_H)
 CHECK_INCLUDE_FILE("sys/endian.h" HAVE_SYS_ENDIAN_H)
 CHECK_INCLUDE_FILE("libkern/OSByteOrder.h" HAVE_OSBYTEORDER_H)
 CHECK_INCLUDE_FILE("sys/epoll.h" HAVE_EPOLL)
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+CHECK_SYMBOL_EXISTS(recvmmsg "sys/socket.h" HAVE_RECVMMSG)
+unset(CMAKE_REQUIRED_DEFINITIONS)
 CHECK_STRUCT_HAS_MEMBER("struct udphdr" uh_sport "sys/types.h;netinet/udp.h"  HAVE_UDP_UH_PREFIX)
 
 configure_file("${PROJECT_SOURCE_DIR}/include/config.h.in"
                "${PROJECT_BINARY_DIR}/config.h" )
+
+# The built-in scenarios (-sn, -sd) are docs/*.xml, each made into a raw
+# string literal for src/scenario.cpp to include.
+file(GLOB builtin_scenarios "${PROJECT_SOURCE_DIR}/docs/*.xml")
+foreach(xml ${builtin_scenarios})
+  get_filename_component(name "${xml}" NAME)
+  file(READ "${xml}" content)
+  file(WRITE "${PROJECT_BINARY_DIR}/docs/${name}.inc.tmp" "R\"SIPP(${content})SIPP\",\n")
+  # Rewritten only when it changed, so scenario.cpp isn't rebuilt each time.
+  configure_file("${PROJECT_BINARY_DIR}/docs/${name}.inc.tmp"
+                 "${PROJECT_BINARY_DIR}/docs/${name}.inc" COPYONLY)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${xml}")
+endforeach()
 
 list(REMOVE_ITEM all_SRCS
   "${PROJECT_SOURCE_DIR}/src/sipp_unittest.cpp")
@@ -284,9 +370,15 @@ if(BUILD_STATIC)
 endif(BUILD_STATIC)
 
 find_library(RT_LIBRARY NAMES rt)
+# res_query() for DNS NAPTR and SRV: in libresolv on macOS and glibc before 2.34,
+# in libc on musl.
+find_library(RESOLV_LIBRARY NAMES resolv)
 
 if(USE_GSL)
   find_library(GSLCBLAS_LIBRARY gslcblas)
+  if(NOT GSLCBLAS_LIBRARY)
+    message(FATAL_ERROR "USE_GSL is on, but libgslcblas is missing: install the GSL development package")
+  endif()
 endif(USE_GSL)
 
 if(USE_PCAP)
@@ -310,22 +402,27 @@ add_sipp_target(sipp
 )
 target_compile_features(sipp PUBLIC cxx_auto_type cxx_range_for)
 
-set(USE_SYSTEM_GTEST "AUTO" CACHE STRING "Use system GTest: AUTO, ON, or OFF")
-
-if(USE_SYSTEM_GTEST STREQUAL "AUTO" AND EXISTS ${PROJECT_SOURCE_DIR}/gtest/googletest)
+# AUTO takes the bundled copy if its submodule is there, else the system one,
+# and builds no unit tests if there is neither.
+tristate_option(USE_SYSTEM_GTEST "Use system GTest: AUTO, ON, or OFF")
+set(BUNDLED_GTEST ${PROJECT_SOURCE_DIR}/gtest/googletest)
+if(USE_SYSTEM_GTEST_MODE STREQUAL "OFF" OR
+        (USE_SYSTEM_GTEST_MODE STREQUAL "AUTO" AND EXISTS ${BUNDLED_GTEST}))
+  if(NOT EXISTS ${BUNDLED_GTEST})
+    message(FATAL_ERROR "USE_SYSTEM_GTEST is OFF, but the bundled GTest is missing: run 'git submodule update --init'")
+  endif()
   message(STATUS "Using bundled GTest")
   include(GoogleTest)
   add_sipp_target(sipp_unittest
     EXCLUDE_FROM_ALL
     SOURCES "${PROJECT_SOURCE_DIR}/src/sipp_unittest.cpp" ${PUGIXML_SOURCES}
-            "${PROJECT_SOURCE_DIR}/gtest/googletest/src/gtest-all.cc"
+            "${BUNDLED_GTEST}/src/gtest-all.cc"
     COMPILE_DEFINITIONS "-DGTEST"
-    EXTRA_INCLUDES ${PROJECT_SOURCE_DIR}/gtest/googletest
-                   ${PROJECT_SOURCE_DIR}/gtest/googletest/include
+    EXTRA_INCLUDES ${BUNDLED_GTEST}
+                   ${BUNDLED_GTEST}/include
   )
   gtest_discover_tests(sipp_unittest TEST_PREFIX sipp_unittests:)
-elseif(USE_SYSTEM_GTEST STREQUAL "AUTO" OR USE_SYSTEM_GTEST STREQUAL "ON")
-  # Try system
+else()
   find_package(GTest QUIET)
   if(GTest_FOUND)
     message(STATUS "Using system GTest")
@@ -337,6 +434,8 @@ elseif(USE_SYSTEM_GTEST STREQUAL "AUTO" OR USE_SYSTEM_GTEST STREQUAL "ON")
     )
     target_link_libraries(sipp_unittest GTest::gtest GTest::gtest_main)
     gtest_discover_tests(sipp_unittest TEST_PREFIX sipp_unittests:)
+  elseif(USE_SYSTEM_GTEST_MODE STREQUAL "ON")
+    message(FATAL_ERROR "USE_SYSTEM_GTEST is ON, but GTest was not found: install its development package")
   else()
     message(WARNING "GTest not found. Run 'git submodule update --init' or install libgtest-dev")
   endif()
@@ -361,7 +460,9 @@ if(EXISTS ${PROJECT_SOURCE_DIR}/.git)
       -P ${PROJECT_SOURCE_DIR}/include/version.cmake
   )
   add_dependencies(sipp version)
-  add_dependencies(sipp_unittest version)
+  if(TARGET sipp_unittest)
+    add_dependencies(sipp_unittest version)
+  endif()
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT TINFO_LIBRARY)
@@ -381,3 +482,4 @@ if(CYGWIN)
 endif(CYGWIN)
 
 install(TARGETS sipp DESTINATION bin)
+install(PROGRAMS "${PROJECT_SOURCE_DIR}/sipp-multi.py" DESTINATION bin)

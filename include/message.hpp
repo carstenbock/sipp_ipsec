@@ -38,6 +38,8 @@
 #ifndef __MESSAGE__
 #define __MESSAGE__
 
+#include <optional>
+#include <string>
 #include <vector>
 
 class scenario;
@@ -88,6 +90,7 @@ typedef enum {
     E_Message_Fill,
     E_Message_Injection,
     E_Message_Last_Header,
+    E_Message_Last_Header_Value,
     E_Message_Last_Request_URI,
     E_Message_Last_CSeq_Number,
     E_Message_Last_Message,
@@ -135,6 +138,22 @@ typedef enum {
     E_Message_UEAesCm128Sha1802Video,
     E_Message_UEAesCm128Sha1321Video,
     E_Message_UEAesCm128Sha1322Video,
+    E_Message_CryptoSuiteAesCm192Sha1801Audio,
+    E_Message_CryptoSuiteAesCm192Sha1802Audio,
+    E_Message_CryptoSuiteAesCm192Sha1321Audio,
+    E_Message_CryptoSuiteAesCm192Sha1322Audio,
+    E_Message_CryptoSuiteAesCm256Sha1801Audio,
+    E_Message_CryptoSuiteAesCm256Sha1802Audio,
+    E_Message_CryptoSuiteAesCm256Sha1321Audio,
+    E_Message_CryptoSuiteAesCm256Sha1322Audio,
+    E_Message_CryptoSuiteAesCm192Sha1801Video,
+    E_Message_CryptoSuiteAesCm192Sha1802Video,
+    E_Message_CryptoSuiteAesCm192Sha1321Video,
+    E_Message_CryptoSuiteAesCm192Sha1322Video,
+    E_Message_CryptoSuiteAesCm256Sha1801Video,
+    E_Message_CryptoSuiteAesCm256Sha1802Video,
+    E_Message_CryptoSuiteAesCm256Sha1321Video,
+    E_Message_CryptoSuiteAesCm256Sha1322Video,
 #ifdef USE_IPSEC
     E_Message_Security_Client,
     E_Message_Security_Verify,
@@ -150,7 +169,7 @@ public:
     struct MessageComponent *getComponent(int);
     int numComponents();
 
-    char *getMethod();
+    const char *getMethod();
     int getCode();
 
     bool isResponse();
@@ -162,7 +181,8 @@ public:
 private:
     std::vector <struct MessageComponent *> messageComponents;
 
-    char *method = nullptr;
+    /* None for a response, or a message parsed without its sanity check */
+    std::optional<std::string> method;
     int code = 0;
 
     bool ack = false;
@@ -174,7 +194,7 @@ private:
     // Get parameters from a [keyword]
     static void getQuotedParam(char * dest, char * src, int * len);
     static void getHexStringParam(char * dest, char * src, int * len);
-    static void getKeywordParam(char * src, const char * param, char * output);
+    static void getKeywordParam(char * src, const char * param, char * output, bool decode_hex = true);
 };
 
 /* Custom Keyword Function Type. */
@@ -186,10 +206,15 @@ int registerKeyword(char *keyword, customKeyword fxn);
 
 struct MessageComponent {
     MessageCompType type;
-    char *literal;
-    int literalLen;
+    std::string literal;
     int offset;
     int varId;
+    /* Field Substitution. */
+    struct {
+        std::string filename;
+        int field;
+        SendingMessage *line;
+    } field_param;
     union u {
         /* Authentication Parameters. */
         struct {
@@ -200,12 +225,6 @@ struct MessageComponent {
             SendingMessage *aka_AMF;
             SendingMessage *aka_K;
         } auth_param;
-        /* Field Substitution. */
-        struct {
-            char *filename;
-            int field;
-            SendingMessage *line;
-        } field_param;
         SendingMessage *filename;
         customKeyword fxn;
     } comp_param;

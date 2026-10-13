@@ -41,19 +41,23 @@ List of attributes common to all commands
       - Description
       - Example
     * - ``start_rtd``
-      - Starts one of the " Response Time Duration" timer. (see statistics section).
+      - Starts one or more " Response Time Duration" timers. (see statistics section).
       - ::
 
           <send start_rtd="invite">
 
         the timer named "invite" will start when the message is sent.
+        A comma-separated list starts several timers:
+        ``<send start_rtd="invite,setup">``.
     * - ``rtd``
-      - Stops one of the 5 " Response Time Duration"
+      - Stops one or more " Response Time Duration" timers.
       - ::
 
           <send rtd="2">
 
-        the timer number 2 will stop when the message is sent.
+        the timer named "2" will stop when the message is sent.
+        A comma-separated list stops several timers:
+        ``<recv response="200" rtd="invite,setup">``.
     * - ``repeat_rtd``
       - Used with a rtd attribute, it allows the
         corresponding " Response Time Duration" timer to be counted more
@@ -247,6 +251,30 @@ List of commands with their attributes
           <send ack_txn="invite">
 
         References the branch ID of the transaction named "invite".
+    * -
+      - ``response_txn``
+      - Indicates that this response answers the request received with
+        a start_txn attribute. The [last_*] keywords (such as [last_Via:],
+        [last_CSeq:] and [last_Request_URI]) take their values from that
+        request, not from the last message received, so a request can be
+        answered after other requests came. A retransmission of that
+        request gets the last response sent in the transaction again.
+      - ::
+
+          <send response_txn="invite">
+
+        Answers the request received with start_txn="invite".
+    * -
+      - ``dialog``
+      - The dialog of the call this message is in, 1 by default (or the
+        dialog of its response_txn or ack_txn transaction). See
+        `Several dialogs in a call`_.
+      - ::
+
+          <send dialog="2">
+
+        Sends this message with the Call-ID, [cseq], peer tag and
+        [last_*] keywords of dialog 2.
     * - **<recv>**
       - response
       - Indicates what SIP message code is expected.
@@ -314,9 +342,37 @@ List of commands with their attributes
       - Specify a timeout while waiting for a message. If the
         message is not received, the call is aborted, unless an ontimeout
         label is defined.
+
+        The timeout may contain keywords, such as ``[$wait]`` or
+        ``[field3]``, expanded in milliseconds each time the call
+        reaches this message. A value that is not a number, or is less
+        than 1, sets no timeout.
+
+        The timeout (and ontimeout) only applies while the call waits at
+        this message. After a run of optional recvs, the call waits at
+        the first of them until a mandatory message arrives, so it is the
+        timeout and ontimeout of that first optional recv that apply
+        (or -recv_timeout if it has none), not those of the mandatory
+        recv after it. To time out such a sequence, put the timeout and
+        ontimeout on the optional recvs too.
       - ::
 
           <recv timeout="100000">
+
+        A timeout from the fourth field of the ``-inf`` file:
+
+        ::
+
+          <recv request="BYE" timeout="[field3]" ontimeout="5">
+
+        Timing out while waiting for 180 or 200:
+
+        ::
+
+          <recv response="180" optional="true" timeout="4000" ontimeout="5">
+          </recv>
+          <recv response="200" timeout="4000" ontimeout="5">
+          </recv>
     * -
       - ``ontimeout``
       - Specify a label to jump to if the timeout popped before the message to be received.
@@ -369,6 +425,27 @@ List of commands with their attributes
 
         Matches only responses to the message sent with start_txn="invite"
         attribute.
+    * -
+      - ``start_txn``
+      - Keeps this received request in the named transaction, for the
+        responses sent with a response_txn attribute.
+      - ::
+
+          <recv request="INVITE" start_txn="invite" />
+          <recv request="PRACK" start_txn="prack" />
+          <send response_txn="prack"> <!-- 200 for the PRACK -->
+          <send response_txn="invite"> <!-- 200 for the INVITE -->
+    * -
+      - ``dialog``
+      - The dialog of the call this message is in, 1 by default (or the
+        dialog of its response_txn transaction). A request of a dialog
+        whose Call-ID the call does not have yet starts it. See
+        `Several dialogs in a call`_.
+      - ::
+
+          <recv request="INVITE" dialog="2" />
+
+        Matches only an INVITE of dialog 2, or one that starts it.
     * - ``<pause>``
       - milliseconds
       - Specify the pause delay, in milliseconds. When this delay is not set, the value of
@@ -600,7 +677,7 @@ let's start::
           Content-Length: [len]
 
           v=0
-          o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+          o=user1 53655765 2353687637 IN IP[media_ip_type] [media_ip]
           s=-
           t=0 0
           c=IN IP[media_ip_type] [media_ip]
@@ -729,6 +806,49 @@ scenarios. For example, a UAS example will look like::
 
 The answering message, 180 Ringing in this case, is built with the
 content of headers received in the INVITE message.
+
+
+Several dialogs in a call
+`````````````````````````
+
+A call can have more than one dialog, each with a Call-ID of its own:
+for instance a REGISTER and the INVITE that comes to the registered
+user, or a transfer. The ``dialog="N"`` attribute of **<send>** and
+**<recv>** tells which dialog a message is in; without it, a message is
+in dialog 1, whose Call-ID is the call's own (the one it was created
+with, or generated for it), or in the dialog of its transaction
+(``response_txn``, ``ack_txn``).
+
+Each dialog has its own Call-ID, ``[cseq]``, peer tag
+(``[peer_tag_param]``), route set (``[routes]``, ``[next_url]``) and last
+received message (the ``[last_*]`` keywords). A message sent in a dialog
+takes those of its dialog, and a **<recv>** of a dialog matches only the
+messages of its Call-ID.
+
+The Call-ID of a dialog other than 1 is known:
+
+* when the call sends its first message: ``[call_id]`` then gives
+  ``N-`` followed by the call's Call-ID, or the Call-ID written in that
+  message is taken;
+* or when a request with a Call-ID no call has comes, and the next
+  message the call waits for is a **<recv>** of that request in a dialog
+  whose Call-ID it does not know yet. The oldest call waiting for it
+  takes it, before the request could start a new call. So in server
+  mode, a scenario whose second dialog begins with the same request as
+  the call (such as two INVITEs) works for calls one after the other.
+
+::
+
+    <recv request="INVITE" />
+    <send> <!-- 200 of the first INVITE -->
+    <recv request="ACK" />
+    <recv request="INVITE" dialog="2" /> <!-- another Call-ID -->
+    <send dialog="2"> <!-- 200 of the second INVITE -->
+    <recv request="ACK" dialog="2" />
+
+To use the Call-ID of another dialog in a message, such as in the
+``Replaces`` header of a REFER, keep it in a variable with an
+``<ereg>`` on a message of that dialog.
 
 
 

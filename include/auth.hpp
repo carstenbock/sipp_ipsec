@@ -14,25 +14,27 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#include <stdint.h>
+#ifndef __SIPP_AUTH_H__
+#define __SIPP_AUTH_H__
 
-int createAuthHeader(const char *user,
-                     const char *password,
-                     const char *method,
-                     const char *uri,
-                     const char *msgbody,
-                     const char *auth,
-                     const char *aka_OP,
-                     const char *aka_AMF,
-                     const char *aka_K,
-                     unsigned int nonce_count,
-                     char *result,
-                     size_t result_len,
-                     unsigned char *out_ck = nullptr,
-                     unsigned char *out_ik = nullptr,
-                     const char *aka_OPc = nullptr);
-int verifyAuthHeader(const char *user, const char *password,
-                     const char *method, const char *auth,
-                     const char *msgbody);
-int getAuthParameter(const char *name, const char *header, char *result,
-                     int len);
+#include <string>
+#include <string_view>
+
+/* The credentials answering the challenge auth in result, true; or why
+ * there are none in result, false. An AKAv1-MD5 challenge also gives
+ * CK and IK in out_ck and out_ik (16 bytes each), for the IPsec SAs of
+ * 3GPP TS 33.203. aka_OPc, if any, is used instead of aka_OP. */
+bool createAuthHeader(std::string_view user, std::string_view password, const char *method, std::string_view uri,
+                      std::string_view msgbody, std::string_view auth, const char *aka_OP, const char *aka_AMF,
+                      const char *aka_K, unsigned int nonce_count, std::string &result,
+                      unsigned char *out_ck = nullptr, unsigned char *out_ik = nullptr,
+                      const char *aka_OPc = nullptr);
+int verifyAuthHeader(std::string_view user, std::string_view password, std::string_view method, std::string_view auth,
+                     std::string_view msgbody);
+/* The value of parameter name in header, in it: "" if it has none */
+std::string_view getAuthParameter(std::string_view name, std::string_view header);
+/* Of the challenges in auth (headers joined by ", "), the first that
+ * createAuthHeader() can answer, in auth; all of them if none. */
+std::string_view selectAuthChallenge(std::string_view auth);
+
+#endif /* __SIPP_AUTH_H__ */
