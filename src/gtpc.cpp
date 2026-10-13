@@ -665,7 +665,7 @@ bool GtpcEndpoint::open(std::string &error)
     memset(&local, 0, sizeof(local));
     local.sin_family = AF_INET;
     local.sin_port = htons(GTPC_PORT);
-    const char *bind_ip = s8_local_ip ? s8_local_ip : local_ip;
+    const char *bind_ip = s8_local_ip ? s8_local_ip : local_ip.c_str();
     int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (s < 0 || inet_pton(AF_INET, bind_ip, &local.sin_addr) != 1 ||
         bind(s, (struct sockaddr *)&local, sizeof(local)) < 0) {

@@ -1,11 +1,14 @@
 # Usage (from within the git repo):
 #   git submodule update --init
 #   docker build -t sipp -f docker/Dockerfile.debian .
+# Add --build-arg UNITTEST=1 to also build and run sipp_unittest, and
+# --build-arg REGRESS="github-#0773 ..." to run those regress tests.
 
 FROM debian:12-slim AS build
 
 ARG FULL=''
 ARG WOLFSSL=''
+ARG REGRESS=''
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -21,15 +24,18 @@ RUN apt-get update \
   make \
   ninja-build \
   ${WOLFSSL:+libwolfssl-dev} \
-  ${FULL:+libsctp-dev libssl-dev}
+  ${FULL:+libsctp-dev libssl-dev} \
+  ${REGRESS:+openssl perl procps}
 
 WORKDIR /sipp
 COPY CMakeLists.txt ./
 COPY src src
 COPY include include
+COPY docs/*.xml docs/
 COPY gtest gtest
 
 ARG DEBUG=''
+ARG UNITTEST=''
 RUN --mount=type=bind,target=.git,source=.git \
   git config --global --add safe.directory /sipp && \
   cmake . -G Ninja \
@@ -40,7 +46,16 @@ RUN --mount=type=bind,target=.git,source=.git \
     ${WOLFSSL:+-DUSE_WOLFSSL=1} \
     ${DEBUG:+-DDEBUG=1} \
     ${FULL:+-DUSE_SCTP=1} \
-  && ninja
+  && ninja \
+  && if [ -n "$UNITTEST" ]; then ninja sipp_unittest && ./sipp_unittest; fi
+
+COPY regress regress
+# -t ln takes more open files than the soft limit of a build allows.
+RUN ulimit -n "$(ulimit -Hn)"; \
+  for t in $REGRESS; do \
+    SIPP=/sipp/sipp "regress/$t/run" || failed="$failed $t"; \
+  done; \
+  test -z "$failed" || { echo "Failed:$failed"; exit 1; }
 
 FROM debian:12-slim
 CMD ["sipp"]

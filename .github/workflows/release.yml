@@ -7,11 +7,13 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
+    - name: prepare
+      run: git submodule update --init
     - name: build-static
       run: docker build -f docker/Dockerfile --output=. --target=bin .
     - name: Set version

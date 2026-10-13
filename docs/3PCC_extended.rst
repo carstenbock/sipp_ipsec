@@ -19,6 +19,9 @@ names and their addresses must be stored in a file (provided by
 
 Each SIPp instance must access a different copy of this file.
 
+The ``-primary``, ``-secondary`` and ``-secondary_cfg`` options are
+aliases for ``-master``, ``-slave`` and ``-slave_cfg``, respectively.
+
 sendCmd and recvCmd have additional attributes::
 
     <sendCmd dest="s1">
@@ -52,6 +55,10 @@ Indicates that the twin command is expected to be received from the
 "m" peer instance.
 
 Note that the master must be the launched at last.
+
+A master or slave scenario may have only sendCmd and recvCmd, and no
+SIP messages, e.g. a master that only drives its slaves. Such an
+instance needs no remote host.
 
 There is no integrated scenarios for the 3pcc extended mode, but you
 can easily adapt those from 3pcc.

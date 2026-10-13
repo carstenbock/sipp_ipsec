@@ -25,7 +25,11 @@
 #define __SCENARIO__
 
 #include <map>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include <sys/socket.h>
 #include "actions.hpp"
@@ -68,7 +72,7 @@ public:
     CSample        *pause_distribution;
     int            pause_variable;
     /* This string is used for the display screen. */
-    char           *pause_desc;
+    std::string pause_desc;
     /* Is this a final pause, intended for catching retransmissions? */
     bool           timewait;
 
@@ -86,39 +90,42 @@ public:
     unsigned int   retrans_delay;
     /* The receive/send timeout. */
     unsigned int   timeout;
+    /* The receive timeout when it has keywords, or null. */
+    SendingMessage *timeout_scheme;
 
     /* 3pcc extended mode: if this is a sendCmd */
-    char         * peer_dest;
+    std::string peer_dest;
 
     /* 3pcc extended mode: if this is a recvCmd */
-    char         * peer_src;
+    std::string peer_src;
 
     /* If this is a recv */
-    char         * recv_response;
-    char         * recv_request;
+    std::optional<std::string> recv_response;
+    int recv_response_code; /* atoi(recv_response) */
+    std::optional<std::string> recv_request;
     int            optional;
     bool           advance_state;
     int            regexp_match;
     regex_t      * regexp_compile;
 
     /* Anyway */
-    int            start_rtd;
-    int            stop_rtd;
+    std::vector<int> start_rtd;
+    std::vector<int> stop_rtd;
     bool           repeat_rtd;
     int            counter;
     double         lost;
     int            crlf;
     bool           ignoresdp;
     bool           hide;
-    char *         display_str;
+    std::optional<std::string> display_str;
     int            next;
-    char *         nextLabel;
+    std::optional<std::string> nextLabel;
     int            test;
     int            condexec;
     bool           condexec_inverse;
     int            chance;/* 0=always, RAND_MAX+1=never (test rand() >= chance) */
     int            on_timeout;
-    char *         onTimeoutLabel;
+    std::optional<std::string> onTimeoutLabel;
 
     /* Statistics */
     unsigned long   nb_sent;
@@ -145,15 +152,22 @@ public:
 
     ContentLengthFlag   content_length_flag ;
 
-    char           *recv_response_for_cseq_method_list;
+    std::string recv_response_for_cseq_method_list;
     int            start_txn;
     int            ack_txn;
     int            response_txn;
+    /* dialog="N", 0 if not given: dialog 1, or its transaction's */
+    int            dialog;
     int            index;
     const char *   desc;
 
     message(int index, const char *desc);
     ~message();
+
+    /* Is this the <recv request> for method? */
+    bool matchesRequest(const char *method);
+    /* Is this a <recv response> for code (not checking the transaction)? */
+    bool matchesResponse(int code);
 };
 
 typedef std::vector<message *> msgvec;
@@ -164,6 +178,9 @@ struct txnControlInfo {
     int acks;
     int started;
     int responses;
+    /* Started by a received request, answered by sent responses */
+    bool server = false;
+    int sent_responses = 0;
 };
 typedef std::vector<txnControlInfo> txnvec;
 
@@ -178,26 +195,31 @@ public:
 
     msgvec messages;
     msgvec initmessages;
-    char *name;
+    std::string name;
     int duration;
     txnvec transactions;
     int unexpected_jump;
+    /* A message has dialog="N" with N > 1; a <recv request> does */
+    bool dialogs = false;
+    bool new_dialogs = false;
+    /* A <exec lua> can use any variable, so one referenced once is fine */
+    bool uses_lua = false;
     int retaddr;
     int pausedaddr;
 
     void computeSippMode();
+    /* Can a call of this scenario begin with this message? */
+    bool startsWith(const char *msg);
 
     int get_var(const char *varName, const char *what);
     int get_counter(const char *varName, const char *what);
     int get_rtd(const char *ptr, bool start);
+    std::vector<int> get_rtds(const char *ptr, bool start);
     int find_var(const char *varName);
     void setFileName(const char *fileName);
     const std::string &getFileName() const { return fileName; }
     const std::string &getPath() const { return path; }
 
-    void addRtpTaskThreadID(pthread_t id);
-    void removeRtpTaskThreadID(pthread_t id);
-    std::unordered_map<pthread_t, std::string>& fetchRtpTaskThreadIDs();
 
     CStat *stats;
     AllocVariableTable *allocVars;
@@ -226,14 +248,15 @@ private:
     void validate_variable_usage();
     void validate_txn_usage();
 
-    int get_txn(const char *txnName, const char *what, bool start, bool isInvite, bool isAck);
+    /* server: a received request starts it, or a sent response answers it */
+    int get_txn(const char *txnName, const char *what, bool start, bool isInvite, bool isAck,
+                bool server = false);
     int xp_get_var(const char *name, const char *what);
     int xp_get_var(const char *name, const char *what, int defval);
 
     bool hidedefault;
     bool last_recv_optional;
 
-    std::unordered_map<pthread_t, std::string> threadIDs;
 };
 
 /* There are external variable containing the current scenario */
@@ -257,10 +280,8 @@ void parse_slave_cfg();
 void getActionForThisMessage();
 CSample *parse_distribution(bool oldstyle);
 
-/* String table functions. */
-int createStringTable(const char* inputString, char*** stringList, int* sizeOfList);
-void freeStringTable(char ** stringList, int sizeOfList);
-
+/* The comma-separated items of a list */
+std::vector<std::string> createStringTable(std::string_view inputString);
 
 
 int find_scenario(const char *scenario);
@@ -268,13 +289,12 @@ extern const char * default_scenario[12];
 
 /* Useful utility functions for parsing integers, etc. */
 long get_long(const char *ptr, const char *what);
+int get_int(const char *ptr, const char *what);
 unsigned long long get_long_long(const char *ptr, const char *what);
 long get_time(const char *ptr, const char *what, int multiplier);
 double get_double(const char *ptr, const char *what);
 bool get_bool(const char *ptr, const char *what);
 int time_string(double ms, char *res, int reslen);
 int get_var(const char *varName, const char *what);
-
-int get_cr_number(const char *msg);
 
 #endif

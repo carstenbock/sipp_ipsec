@@ -23,7 +23,8 @@ depending on the call. At any place where the keyword "[field1]"
 appears in the scenario file, it will be replaced by either
 "sipphone32" or "sipphone12" or "sipphone94" depending on the call. At
 the end of the file, SIPp will re-start from the beginning. The file
-is not limited in size.
+is not limited in size. To use each line once, run with ``-m_csv``: it
+stops the test after as many calls as the first -inf file has lines.
 
 You can override the default line selection strategy with the optional
 line argument. For example::
@@ -49,7 +50,9 @@ when you want to select different types of data in different ways. For
 example, when running a user-based benchmark, you may have a
 caller.csv with "USER" as the first line and a callee.csv with
 "RANDOM" as the first line. To specify which CSV file is used, add the
-file= parameter to the keyword. For example::
+file= parameter to the keyword. For example:
+
+.. code-block:: text
 
     INVITE sip:[field0 file="callee.csv"] SIP/2.0
     From: sipp user <[field0 file="caller.csv"]>;tag=[pid]SIPpTag00[call_number]

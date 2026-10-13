@@ -38,9 +38,6 @@
 #endif
 #include <sys/time.h>
 #include <poll.h>
-#ifdef HAVE_EPOLL
-#include <sys/epoll.h>
-#endif
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -51,7 +48,9 @@
 #include <signal.h>
 #include <time.h>
 #include <limits.h>
+#include <atomic>
 #include <vector>
+#include <optional>
 #include <string>
 #include <map>
 #include <set>
@@ -104,13 +103,41 @@
 #define T_TCP                      1
 #define T_TLS                      2
 #define T_SCTP                     3
+#define T_WS                       4 /* SIP over WebSocket (RFC 7118) on TCP */
+#define T_WSS                      5 /* ... and on TLS */
 
 #define DEFAULT_TLS_CERT           "cacert.pem"
 #define DEFAULT_TLS_KEY            "cakey.pem"
 #define DEFAULT_TLS_CA             ""
 #define DEFAULT_TLS_CRL            ""
 
-#define TRANSPORT_TO_STRING(p)     ((p==T_TCP) ? "TCP" : ((p==T_TLS)? "TLS" : ((p==T_UDP)? "UDP" : "SCTP")))
+inline const char *TRANSPORT_TO_STRING(int p)
+{
+    switch (p) {
+    case T_TCP:
+        return "TCP";
+    case T_TLS:
+        return "TLS";
+    case T_UDP:
+        return "UDP";
+    case T_WS:
+        return "WS";
+    case T_WSS:
+        return "WSS";
+    default:
+        return "SCTP";
+    }
+}
+
+/* Is it TLS, below a WebSocket or not? */
+#define TRANSPORT_IS_TLS(p)        ((p) == T_TLS || (p) == T_WSS)
+#define TRANSPORT_IS_WS(p)         ((p) == T_WS || (p) == T_WSS)
+
+/* Does it run over a connection (every transport but UDP)? */
+static inline bool transport_is_reliable(int p)
+{
+    return p != T_UDP;
+}
 
 #define SIPP_MAXFDS                65536
 
@@ -131,6 +158,7 @@
 
 #define MAX_RECV_LOOPS_PER_CYCLE   1000
 #define MAX_SCHED_LOOPS_PER_CYCLE  1000
+#define MAX_SCHED_MS_PER_CYCLE     10
 #define NB_UPDATE_PER_CYCLE        1
 
 #define MAX_PEER_SIZE              4096  /* 3pcc extended mode: max size of peer names */
@@ -165,17 +193,26 @@ cmd messages are received */
 #define DEFAULT_BEHAVIOR_PINGREPLY   4
 #define DEFAULT_BEHAVIOR_BADCSEQ     8
 
+#define CID_MODE_FORMAT              0
+#define CID_MODE_UUID                1
+#define CID_MODE_UUID_COMPACT        2
+#define CID_MODE_RANDOM              3
+#define CID_MODE_TIMESTAMP           4
+
 #define DEFAULT_BEHAVIOR_ALL         (DEFAULT_BEHAVIOR_BYE | DEFAULT_BEHAVIOR_ABORTUNEXP | DEFAULT_BEHAVIOR_PINGREPLY | DEFAULT_BEHAVIOR_BADCSEQ)
 
 #define DEFAULT_MIN_RTP_PORT         DEFAULT_MEDIA_PORT
 #define DEFAULT_MAX_RTP_PORT         65535
 #define DEFAULT_RTP_PAYLOAD          8
-#define DEFAULT_RTP_THREADTASKS      20
+#define DEFAULT_RTP_THREADTASKS      50
 
 /************ User controls and command line options ***********/
 
 MAYBE_EXTERN int                duration                DEFVAL(0);
 MAYBE_EXTERN double             rate                    DEFVAL(DEFAULT_RATE);
+MAYBE_EXTERN bool               rate_set                DEFVAL(false);
+/* A scenario plays pcap or DTMF: only then do calls keep where plays go */
+MAYBE_EXTERN bool               pcap_plays              DEFVAL(false);
 MAYBE_EXTERN double             rate_scale              DEFVAL(DEFAULT_RATE_SCALE);
 MAYBE_EXTERN int                rate_increase           DEFVAL(0);
 MAYBE_EXTERN int                rate_max                DEFVAL(0);
@@ -228,19 +265,19 @@ MAYBE_EXTERN int                max_sched_loops         DEFVAL(MAX_SCHED_LOOPS_P
 
 MAYBE_EXTERN unsigned int       global_t2               DEFVAL(DEFAULT_T2_TIMER_VALUE);
 
-MAYBE_EXTERN char               local_ip[127];          /* also used for hostnames */
-MAYBE_EXTERN char               local_ip_w_brackets[42]; /* with [brackets] in case of IPv6 */
+MAYBE_EXTERN std::string local_ip;            /* also used for hostnames */
+MAYBE_EXTERN std::string local_ip_w_brackets; /* with [brackets] in case of IPv6 */
 MAYBE_EXTERN bool               local_ip_is_ipv6;
 MAYBE_EXTERN int                local_port              DEFVAL(0);
 #ifdef USE_SCTP
-MAYBE_EXTERN char               multihome_ip[40];
+MAYBE_EXTERN std::string multihome_ip;
 MAYBE_EXTERN int                heartbeat               DEFVAL(0);
 MAYBE_EXTERN int                assocmaxret             DEFVAL(0);
 MAYBE_EXTERN int                pathmaxret              DEFVAL(0);
 MAYBE_EXTERN int                pmtu                    DEFVAL(0);
 MAYBE_EXTERN bool               gracefulclose           DEFVAL(true);
 #endif
-MAYBE_EXTERN char               control_ip[40];
+MAYBE_EXTERN std::string control_ip;
 MAYBE_EXTERN int                control_port            DEFVAL(0);
 MAYBE_EXTERN int                buff_size               DEFVAL(65536);
 MAYBE_EXTERN int                tcp_readsize            DEFVAL(65536);
@@ -252,16 +289,22 @@ MAYBE_EXTERN int                rtp_tasks_per_thread    DEFVAL(DEFAULT_RTP_THREA
 MAYBE_EXTERN int                rtp_buffsize            DEFVAL(65536);
 MAYBE_EXTERN bool               rtpcheck_debug          DEFVAL(0);
 MAYBE_EXTERN bool               srtpcheck_debug         DEFVAL(0);
+/* a scenario has <rtp_stats> or <rtp_dtmf>: the calls count the RTP
+ * they receive */
+MAYBE_EXTERN bool               rtp_stats_used          DEFVAL(false);
+/* the payload types of the scenarios' <rtp_dtmf>: the calls decode the
+ * RFC 4733 events that come with them */
+MAYBE_EXTERN bool rtp_dtmf_payload_types[128];
 MAYBE_EXTERN double             audiotolerance          DEFVAL(1.0);
 MAYBE_EXTERN double             videotolerance          DEFVAL(1.0);
 
 MAYBE_EXTERN bool               rtp_echo_enabled        DEFVAL(0);
-MAYBE_EXTERN char               media_ip[127];          /* also used for hostnames */
+MAYBE_EXTERN std::string media_ip; /* also used for hostnames */
 MAYBE_EXTERN int                media_port              DEFVAL(0);
 MAYBE_EXTERN size_t             media_bufsize           DEFVAL(2048);
 MAYBE_EXTERN bool               media_ip_is_ipv6        DEFVAL(false);
-MAYBE_EXTERN char               remote_ip[127];         /* also used for hostnames */
-MAYBE_EXTERN char               remote_ip_w_brackets[42]; /* with [brackets] in case of IPv6 */
+MAYBE_EXTERN std::string remote_ip;            /* also used for hostnames */
+MAYBE_EXTERN std::string remote_ip_w_brackets; /* with [brackets] in case of IPv6 */
 MAYBE_EXTERN int                remote_port             DEFVAL(DEFAULT_PORT);
 MAYBE_EXTERN unsigned int       pid                     DEFVAL(0);
 MAYBE_EXTERN bool               print_all_responses     DEFVAL(false);
@@ -271,11 +314,10 @@ MAYBE_EXTERN int                interrupt               DEFVAL(0);
 MAYBE_EXTERN bool               paused                  DEFVAL(false);
 MAYBE_EXTERN int                lose_packets            DEFVAL(0);
 MAYBE_EXTERN double             global_lost             DEFVAL(0.0);
-MAYBE_EXTERN char               remote_host[255];
-MAYBE_EXTERN char               twinSippHost[255];
-MAYBE_EXTERN char               twinSippIp[40];
-MAYBE_EXTERN char             * master_name;
-MAYBE_EXTERN char             * slave_number;
+MAYBE_EXTERN std::string remote_host;
+MAYBE_EXTERN std::string twinSippHost;
+MAYBE_EXTERN std::optional<std::string> master_name;
+MAYBE_EXTERN std::optional<std::string> slave_number;
 MAYBE_EXTERN int                twinSippPort            DEFVAL(DEFAULT_3PCC_PORT);
 MAYBE_EXTERN bool               twinSippMode            DEFVAL(false);
 MAYBE_EXTERN bool               extendedTwinSippMode    DEFVAL(false);
@@ -313,10 +355,12 @@ MAYBE_EXTERN int                ipsec_port_min          DEFVAL(32768);
 MAYBE_EXTERN int                ipsec_port_max          DEFVAL(65535);
 #endif
 MAYBE_EXTERN const char       * call_id_string          DEFVAL("%u-%p@%s");
+MAYBE_EXTERN int                call_id_mode            DEFVAL(CID_MODE_FORMAT);
 typedef std::unordered_map<std::string, std::string> ParamMap;
 MAYBE_EXTERN ParamMap           generic;
 
-MAYBE_EXTERN bool               rtp_echo_state          DEFVAL(true);
+/* whether the -rtp_echo threads echo, which a call's rtp_echo action sets */
+MAYBE_EXTERN std::atomic<bool> rtp_echo_state         DEFVAL(true);
 MAYBE_EXTERN bool               callidSlash             DEFVAL(false);
 
 /* TDM map */
@@ -330,11 +374,14 @@ MAYBE_EXTERN unsigned int       tdm_map_z               DEFVAL(0);
 MAYBE_EXTERN unsigned int       tdm_map_h               DEFVAL(0);
 MAYBE_EXTERN bool               tdm_map[1024];
 
-MAYBE_EXTERN const char       * tls_cert_name           DEFVAL(DEFAULT_TLS_CERT);
-MAYBE_EXTERN const char       * tls_key_name            DEFVAL(DEFAULT_TLS_KEY);
+MAYBE_EXTERN const char       * tls_cert_name           DEFVAL(nullptr);
+MAYBE_EXTERN const char       * tls_key_name            DEFVAL(nullptr);
 MAYBE_EXTERN const char       * tls_ca_name             DEFVAL(DEFAULT_TLS_CA);
 MAYBE_EXTERN const char       * tls_crl_name            DEFVAL(DEFAULT_TLS_CRL);
 MAYBE_EXTERN double             tls_version             DEFVAL(0.0);
+MAYBE_EXTERN int                tls_handshake_timeout   DEFVAL(10000);
+MAYBE_EXTERN const char       * ws_path                 DEFVAL("/");
+MAYBE_EXTERN int                ws_handshake_timeout    DEFVAL(10000);
 
 #ifdef SO_BINDTODEVICE
 MAYBE_EXTERN const char       * bind_to_device_name     DEFVAL(nullptr);
@@ -345,11 +392,9 @@ MAYBE_EXTERN const char       * scenario_file           DEFVAL(nullptr);
 // extern field file management
 typedef std::map<std::string, FileContents *> file_map;
 MAYBE_EXTERN file_map inFiles;
-typedef std::map<std::string, str_int_map *> file_index;
-MAYBE_EXTERN char *rx_ip_file DEFVAL(NULL);
-MAYBE_EXTERN char *rx_default_file DEFVAL(NULL);
-MAYBE_EXTERN char *ip_file DEFVAL(nullptr);
-MAYBE_EXTERN char *default_file DEFVAL(nullptr);
+/* The names of the first -inf file, "" without one */
+MAYBE_EXTERN std::string ip_file;
+MAYBE_EXTERN std::string default_file;
 
 // free user id list
 MAYBE_EXTERN std::list<int> freeUsers;
@@ -377,21 +422,22 @@ MAYBE_EXTERN bool          outbound_congestion          DEFVAL(false);
 MAYBE_EXTERN int           open_calls_user_setting      DEFVAL(0);
 MAYBE_EXTERN int           resynch_send                 DEFVAL(0);
 MAYBE_EXTERN int           resynch_recv                 DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp_pckts                    DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp_bytes                    DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp_pckts_pcap               DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp_bytes_pcap               DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp2_pckts                   DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp2_bytes                   DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp2_pckts_pcap              DEFVAL(0);
-MAYBE_EXTERN unsigned long rtp2_bytes_pcap              DEFVAL(0);
-MAYBE_EXTERN volatile unsigned long rtpstream_numthreads DEFVAL(0);
-MAYBE_EXTERN volatile unsigned long rtpstream_abytes_in  DEFVAL(0);
-MAYBE_EXTERN volatile unsigned long rtpstream_vbytes_in  DEFVAL(0);
-MAYBE_EXTERN volatile unsigned long rtpstream_abytes_out DEFVAL(0);
-MAYBE_EXTERN volatile unsigned long rtpstream_vbytes_out DEFVAL(0);
-MAYBE_EXTERN volatile unsigned long rtpstream_apckts    DEFVAL(0);
-MAYBE_EXTERN volatile unsigned long rtpstream_vpckts    DEFVAL(0);
+/* Updated by the media threads: relaxed atomics, they are only shown */
+MAYBE_EXTERN std::atomic<unsigned long> rtp_pckts            DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtp_bytes            DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtp_pckts_pcap       DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtp_bytes_pcap       DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtp2_pckts           DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtp2_bytes           DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtp2_pckts_pcap      DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtp2_bytes_pcap      DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtpstream_numthreads DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtpstream_abytes_in  DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtpstream_vbytes_in  DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtpstream_abytes_out DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtpstream_vbytes_out DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtpstream_apckts     DEFVAL(0);
+MAYBE_EXTERN std::atomic<unsigned long> rtpstream_vpckts     DEFVAL(0);
 
 /************* Rate Control & Contexts variables **************/
 
@@ -437,9 +483,10 @@ MAYBE_EXTERN int media_socket_audio                     DEFVAL(0);
 MAYBE_EXTERN int media_socket_video                     DEFVAL(0);
 
 MAYBE_EXTERN struct sockaddr_storage local_sockaddr;
+/* media_ip resolved, as it may be a host name */
+MAYBE_EXTERN struct sockaddr_storage media_sockaddr;
 MAYBE_EXTERN struct sockaddr_storage localTwin_sockaddr;
-MAYBE_EXTERN int           user_port                    DEFVAL(0);
-MAYBE_EXTERN char          hostname[80];
+MAYBE_EXTERN int user_port DEFVAL(0);
 
 MAYBE_EXTERN int           reset_number                 DEFVAL(0);
 MAYBE_EXTERN bool          reset_close                  DEFVAL(true);
@@ -456,14 +503,13 @@ MAYBE_EXTERN struct sockaddr_storage twinSipp_sockaddr;
 
 /* 3pcc extended mode */
 typedef struct _T_peer_infos {
-    char peer_host[40];
+    std::string peer_host;
     int peer_port;
     struct sockaddr_storage peer_sockaddr;
-    char peer_ip[40];
     SIPpSocket *peer_socket;
 } T_peer_infos;
 
-typedef std::map<std::string, char*> peer_addr_map;
+typedef std::map<std::string, std::string> peer_addr_map;
 MAYBE_EXTERN peer_addr_map peer_addrs;
 typedef std::map<std::string, T_peer_infos> peer_map;
 MAYBE_EXTERN peer_map      peers;
@@ -476,6 +522,16 @@ MAYBE_EXTERN int           peers_connected              DEFVAL(0);
 MAYBE_EXTERN struct sockaddr_storage remote_sockaddr;
 MAYBE_EXTERN short         use_remote_sending_addr      DEFVAL(0);
 MAYBE_EXTERN struct sockaddr_storage remote_sending_sockaddr;
+
+/* With -round_robin, the addresses of the remote host, which new calls
+ * take in turn; the first is remote_sockaddr. */
+struct remote_address {
+    struct sockaddr_storage addr;
+    std::string ip;               /* as remote_ip */
+    std::string ip_w_brackets;    /* as remote_ip_w_brackets */
+};
+MAYBE_EXTERN bool          round_robin                  DEFVAL(false);
+MAYBE_EXTERN std::vector<remote_address> remote_addresses;
 
 enum E_Alter_YesNo {
     E_ALTER_YES=0,
@@ -490,7 +546,7 @@ enum E_Alter_YesNo {
 
 void sipp_exit(int rc, int rtp_errors, int echo_errors);
 
-char *get_peer_addr(char *);
+const std::string &get_peer_addr(const std::string &peer);
 
 bool reconnect_allowed();
 void reset_connection(SIPpSocket *);
@@ -500,14 +556,13 @@ int open_connections();
 void timeout_alarm(int);
 
 /* extended 3PCC mode */
-SIPpSocket **get_peer_socket(char *);
+SIPpSocket **get_peer_socket(const char *);
 bool is_a_peer_socket(SIPpSocket *);
 bool is_a_local_socket(SIPpSocket *);
 void connect_to_all_peers();
-void connect_local_twin_socket(char *);
+void connect_local_twin_socket();
 void close_peer_sockets();
 void close_local_sockets();
-void free_peer_addr_map();
 void randomseed();
 
 /********************* Reset global kludge  *******************/

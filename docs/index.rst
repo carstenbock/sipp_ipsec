@@ -17,13 +17,21 @@ Welcome to SIPp reference documentation!
    scenarios/index
    3PCC_extended
    controlling
+   control_api
    transport
    ipsec
    swu
    s8hr
    volte_scenarios
+   multi_instance
    media
+   dtls_srtp
+   ice_stun_turn
+   media_impairment
+   rtcp_qos
    statistics
+   observability
+   ci_reports
    error
    perftest
    tools

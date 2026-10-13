@@ -19,8 +19,11 @@
 #define GLOBALS_FULL_DEFINITION
 #include "sipp.hpp"
 
+#include "fileutil.h"
 #include "gtest/gtest.h"
+#include <pwd.h>
 #include <string.h>
+#include <unistd.h>
 
 int main(int argc, char* argv[])
 {
@@ -29,7 +32,9 @@ int main(int argc, char* argv[])
     main_scenario = new scenario(0, 0);
 
     ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    int rc = RUN_ALL_TESTS();
+    delete main_scenario;
+    return rc;
 }
 
 /* Quickfix to fix unittests that depend on sipp_exit availability,
@@ -38,4 +43,33 @@ int main(int argc, char* argv[])
 void sipp_exit(int rc, int rtp_errors, int echo_errors)
 {
     exit(rc);
+}
+
+TEST(find_file, ExpandsUserHome) {
+    const struct passwd* pw = getpwuid(getuid());
+    if (!pw || strlen(pw->pw_name) > 32) {
+        GTEST_SKIP() << "no user name of 32 characters at most";
+    }
+    std::string user = pw->pw_name;
+    std::string home = pw->pw_dir;
+
+    char* path = find_file(("~" + user + "/file.pcap").c_str(), "");
+    EXPECT_EQ(home + "/file.pcap", path);
+    free(path);
+}
+
+TEST(find_file, ExpandsHomeFromUserProfile) {
+    const char* home = getenv("HOME");
+    std::string saved = home ? home : "";
+    unsetenv("HOME");
+    setenv("USERPROFILE", "/profile", 1);
+
+    char* path = find_file("~/file.pcap", "");
+    EXPECT_STREQ("/profile/file.pcap", path);
+    free(path);
+
+    unsetenv("USERPROFILE");
+    if (home) {
+        setenv("HOME", saved.c_str(), 1);
+    }
 }

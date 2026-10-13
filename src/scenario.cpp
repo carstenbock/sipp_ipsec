@@ -28,6 +28,7 @@
  */
 
 #include <stdlib.h>
+#include <sstream>
 #include "config.h"
 #include "sipp.hpp"
 #ifdef HAVE_GSL
@@ -44,7 +45,6 @@ message::message(int index, const char *desc)
     this->desc = desc;
     pause_distribution = nullptr; // delete on exit
     pause_variable = -1;
-    pause_desc = nullptr; // free on exit
     sessions = 0;
     bShouldRecordRoutes = 0;
     bShouldAuthenticate = 0;
@@ -52,36 +52,27 @@ message::message(int index, const char *desc)
     send_scheme = nullptr; // delete on exit
     retrans_delay = 0;
     timeout = 0;
+    timeout_scheme = nullptr; // delete on exit
 
-    recv_response = nullptr; // free on exit
-    recv_request = nullptr; // free on exit
+    recv_response_code = 0;
     optional = 0;
     advance_state = true;
     regexp_match = 0;
     regexp_compile = nullptr; // regfree (if not nullptr) and free on exit
 
     /* Anyway */
-    start_rtd = 0;
-    stop_rtd = 0;
     repeat_rtd = 0;
     lost = -1;
     crlf = 0;
     ignoresdp = false;
     hide = 0;
-    display_str = nullptr; // free on exit
     test = -1;
     condexec = -1;
     condexec_inverse = false;
     chance = 0;/* meaning always */
     next = -1;
-    nextLabel = nullptr; // free on exit
     on_timeout = -1;
-    onTimeoutLabel = nullptr; // free on exit
     timewait = false;
-
-    /* 3pcc extended mode */
-    peer_dest = nullptr; // free on exit
-    peer_src = nullptr; // free on exit
 
     /* Statistics */
     nb_sent = 0;
@@ -107,31 +98,62 @@ message::message(int index, const char *desc)
     start_txn = 0;
     response_txn = 0;
     ack_txn = 0;
-    recv_response_for_cseq_method_list = nullptr; // free on exit
+    dialog = 0;
 }
 
 message::~message()
 {
     delete pause_distribution;
-    free(pause_desc);
     delete send_scheme;
-    free(recv_request);
-    free(recv_response);
+    delete timeout_scheme;
     if (regexp_compile != nullptr) {
         regfree(regexp_compile);
     }
     delete regexp_compile;
 
-    free(display_str);
-    free(nextLabel);
-    free(onTimeoutLabel);
-
-    free(peer_dest);
-    free(peer_src);
-
     delete M_actions;
     delete M_sendCmdData;
-    free(recv_response_for_cseq_method_list);
+}
+
+bool message::matchesRequest(const char *method)
+{
+    if (!recv_request) {
+        return false;
+    }
+    if (!regexp_match) {
+        return *recv_request == method;
+    }
+    if (regexp_compile == nullptr) {
+        regex_t *re = new regex_t;
+        /* No regex match position needed (NOSUB), we're simply
+         * looking for the <request method="INVITE|REGISTER"../>
+         * regex. */
+        if (regcomp(re, recv_request->c_str(), REGCOMP_PARAMS | REG_NOSUB)) {
+            ERROR("Invalid regular expression for index %d: %s", index, recv_request->c_str());
+        }
+        regexp_compile = re;
+    }
+    return !regexec(regexp_compile, method, (size_t)0, nullptr, REGEXEC_PARAMS);
+}
+
+bool message::matchesResponse(int code)
+{
+    if (!recv_response) {
+        return false;
+    }
+    if (!regexp_match) {
+        return recv_response_code == code;
+    }
+    if (regexp_compile == nullptr) {
+        regex_t *re = new regex_t;
+        if (regcomp(re, recv_response->c_str(), REGCOMP_PARAMS | REG_NOSUB)) {
+            ERROR("Invalid regular expression for index %d: %s", index, recv_response->c_str());
+        }
+        regexp_compile = re;
+    }
+    char code_str[8];
+    snprintf(code_str, sizeof(code_str), "%d", code);
+    return !regexec(regexp_compile, code_str, (size_t)0, nullptr, REGEXEC_PARAMS);
 }
 
 /******** Global variables which compose the scenario file **********/
@@ -150,16 +172,38 @@ int sendMode = MODE_CLIENT;
 /* This describes what our 3PCC behavior is. */
 int thirdPartyMode = MODE_3PCC_NONE;
 
-#define KEYWORD_SIZE 256
-
 /*************** Helper functions for various types *****************/
+/* Integers are decimal, or hexadecimal after "0x": a leading 0 does not
+ * make them octal. */
+static int integer_base(const char *ptr)
+{
+    while (isspace((unsigned char)*ptr)) {
+        ptr++;
+    }
+    if (*ptr == '-' || *ptr == '+') {
+        ptr++;
+    }
+    return ptr[0] == '0' && (ptr[1] == 'x' || ptr[1] == 'X') ? 16 : 10;
+}
+
 long get_long(const char *ptr, const char *what)
 {
     char *endptr;
     long ret;
 
-    ret = strtol(ptr, &endptr, 0);
-    if (*endptr) {
+    errno = 0;
+    ret = strtol(ptr, &endptr, integer_base(ptr));
+    if (endptr == ptr || *endptr || errno == ERANGE) {
+        ERROR("%s, \"%s\" is not a valid integer!", what, ptr);
+    }
+    return ret;
+}
+
+int get_int(const char *ptr, const char *what)
+{
+    long ret = get_long(ptr, what);
+
+    if (ret < INT_MIN || ret > INT_MAX) {
         ERROR("%s, \"%s\" is not a valid integer!", what, ptr);
     }
     return ret;
@@ -170,8 +214,9 @@ unsigned long long get_long_long(const char *ptr, const char *what)
     char *endptr;
     unsigned long long ret;
 
-    ret = strtoull(ptr, &endptr, 0);
-    if (*endptr) {
+    errno = 0;
+    ret = strtoull(ptr, &endptr, integer_base(ptr));
+    if (endptr == ptr || *endptr || errno == ERANGE) {
         ERROR("%s, \"%s\" is not a valid integer!", what, ptr);
     }
     return ret;
@@ -232,7 +277,7 @@ double get_double(const char *ptr, const char *what)
     double ret;
 
     ret = strtod(ptr, &endptr);
-    if (*endptr) {
+    if (endptr == ptr || *endptr) {
         ERROR("%s, \"%s\" is not a floating point number!", what, ptr);
     }
     return ret;
@@ -241,77 +286,68 @@ double get_double(const char *ptr, const char *what)
 #ifdef PCAPPLAY
 /* If the value is enclosed in [brackets], it is assumed to be
  * a command-line supplied keyword value (-key). */
-static char* xp_get_keyword_value(const char *name)
+static std::optional<std::string> xp_get_keyword_value(const char *name)
 {
     const char* ptr = xp_get_value(name);
     size_t len;
-    char keyword[KEYWORD_SIZE + 1];
 
     if (ptr && ptr[0] == '[' && (len = strlen(ptr)) && ptr[len - 1] == ']') {
-        memcpy(keyword, ptr + 1, len - 2);
-
-        auto gen = generic.find(keyword);
+        auto gen = generic.find(std::string(ptr + 1, len - 2));
         if (gen != generic.end()) {
-            return strdup((*gen).second.c_str());
+            return (*gen).second;
         }
 
         ERROR("%s \"%s\" looks like a keyword value, but keyword not supplied!", name, ptr);
     }
 
-    return ptr ? strdup(ptr) : nullptr;
+    if (ptr) {
+        return ptr;
+    }
+    return std::nullopt;
 }
 #endif
 
-static char* xp_get_string(const char *name, const char *what)
+static std::string xp_get_string(const char *name, const char *what)
 {
     const char *ptr;
-    char *unescaped;
 
     if (!(ptr = xp_get_value(name))) {
         ERROR("%s is missing the required '%s' parameter.", what, name);
     }
 
-    unescaped = (char *)malloc(strlen(ptr) + 1);
-    if (!unescaped) {
-        ERROR("Out of memory!");
-    }
-    xp_unescape(ptr, unescaped);
+    return ptr;
+}
 
-    return unescaped;
+/* Set the n-th message of an action from the required attribute name. */
+static void xp_set_message(CAction *action, int n, const char *name, const char *what)
+{
+    action->setMessage(xp_get_string(name, what), n);
+}
+
+/* The text naming a required parameter in an error */
+static std::string xp_helptext(const char *name, const char *what)
+{
+    return std::string(what) + " '" + name + "' parameter";
 }
 
 static double xp_get_double(const char *name, const char *what)
 {
     const char *ptr;
-    char *helptext;
-    double val;
 
     if (!(ptr = xp_get_value(name))) {
         ERROR("%s is missing the required '%s' parameter.", what, name);
     }
-    helptext = (char *)malloc(100 + strlen(name) + strlen(what));
-    sprintf(helptext, "%s '%s' parameter", what, name);
-    val = get_double(ptr, helptext);
-    free(helptext);
-
-    return val;
+    return get_double(ptr, xp_helptext(name, what).c_str());
 }
 
 static long xp_get_long(const char *name, const char *what)
 {
     const char *ptr;
-    char *helptext;
-    long val;
 
     if (!(ptr = xp_get_value(name))) {
         ERROR("%s is missing the required '%s' parameter.", what, name);
     }
-    helptext = (char *)malloc(100 + strlen(name) + strlen(what));
-    sprintf(helptext, "%s '%s' parameter", what, name);
-    val = get_long(ptr, helptext);
-    free(helptext);
-
-    return val;
+    return get_long(ptr, xp_helptext(name, what).c_str());
 }
 
 static long xp_get_long(const char *name, const char *what, long defval)
@@ -326,18 +362,11 @@ static long xp_get_long(const char *name, const char *what, long defval)
 static bool xp_get_bool(const char *name, const char *what)
 {
     const char *ptr;
-    char *helptext;
-    bool val;
 
     if (!(ptr = xp_get_value(name))) {
         ERROR("%s is missing the required '%s' parameter.", what, name);
     }
-    helptext = (char *)malloc(100 + strlen(name) + strlen(what));
-    sprintf(helptext, "%s '%s' parameter", what, name);
-    val = get_bool(ptr, helptext);
-    free(helptext);
-
-    return val;
+    return get_bool(ptr, xp_helptext(name, what).c_str());
 }
 
 static bool xp_get_bool(const char *name, const char *what, bool defval)
@@ -348,55 +377,49 @@ static bool xp_get_bool(const char *name, const char *what, bool defval)
     return xp_get_bool(name, what);
 }
 
-int scenario::get_txn(const char *txnName, const char *what, bool start, bool isInvite, bool isAck)
+int scenario::get_txn(const char *txnName, const char *what, bool start, bool isInvite, bool isAck,
+                      bool server)
 {
     /* Check the name's validity. */
     if (txnName[0] == '\0') {
-        ERROR("Variable names may not be empty for %s", what);
+        ERROR("Transaction names may not be empty for %s", what);
     }
     if (strcspn(txnName, "$,") != strlen(txnName)) {
-        ERROR("Variable names may not contain $ or , for %s", what);
+        ERROR("Transaction names may not contain '$' or ',' for %s", what);
     }
 
-    /* If this transaction has already been used, then we have nothing to do. */
+    int txnNum;
     str_int_map::iterator txn_it = txnMap.find(txnName);
     if (txn_it != txnMap.end()) {
-        if (start) {
-            /* We need to fill in the invite field. */
-            transactions[txn_it->second - 1].started++;
-        } else if (isAck) {
-            transactions[txn_it->second - 1].acks++;
-        } else {
-            transactions[txn_it->second - 1].responses++;
-        }
-        return txn_it->second;
-    }
-
-    /* Assign this variable the next slot. */
-    struct txnControlInfo transaction;
-
-    transaction.name = txnName;
-    if (start) {
-        transaction.started = 1;
-        transaction.responses = 0;
-        transaction.acks = 0;
-        transaction.isInvite = isInvite;
-    } else if (isAck) {
-        /* Does not start or respond to this txn. */
-        transaction.started = 0;
-        transaction.responses = 0;
-        transaction.acks = 1;
-        transaction.isInvite = false;
+        txnNum = txn_it->second;
     } else {
+        /* Assign this variable the next slot. */
+        struct txnControlInfo transaction;
+
+        transaction.name = txnName;
         transaction.started = 0;
-        transaction.responses = 1;
+        transaction.responses = 0;
         transaction.acks = 0;
-        transaction.isInvite = false;
+        transaction.isInvite = start && isInvite;
+        transactions.push_back(std::move(transaction));
+        txnNum = transactions.size();
+        txnMap[txnName] = txnNum;
     }
 
-    transactions.push_back(std::move(transaction));
-    int txnNum = transactions.size();
-    txnMap[txnName] = txnNum;
+    txnControlInfo &transaction = transactions[txnNum - 1];
+    if (start) {
+        if (transaction.started && transaction.server != server) {
+            ERROR("Transaction %s is started by both a sent and a received message", txnName);
+        }
+        transaction.started++;
+        transaction.server = server;
+    } else if (isAck) {
+        transaction.acks++;
+    } else if (server) {
+        transaction.sent_responses++;
+    } else {
+        transaction.responses++;
+    }
 
     return txnNum;
 }
@@ -404,11 +427,6 @@ int scenario::get_txn(const char *txnName, const char *what, bool start, bool is
 int scenario::find_var(const char *varName)
 {
     return allocVars->find(varName, false);
-}
-
-void scenario::addRtpTaskThreadID(pthread_t id)
-{
-    threadIDs[id] = "threadID";
 }
 
 void scenario::setFileName(const char *name)
@@ -430,24 +448,14 @@ void scenario::setFileName(const char *name)
     stats->setFileName(fileName.c_str(), ".csv");
 }
 
-void scenario::removeRtpTaskThreadID(pthread_t id)
-{
-    threadIDs.erase(id);
-}
-
-std::unordered_map<pthread_t, std::string>& scenario::fetchRtpTaskThreadIDs()
-{
-    return threadIDs;
-}
-
 int scenario::get_var(const char *varName, const char *what)
 {
     /* Check the name's validity. */
     if (varName[0] == '\0') {
-        ERROR("Transaction names may not be empty for %s", what);
+        ERROR("Variable names may not be empty for %s", what);
     }
     if (strcspn(varName, "$,") != strlen(varName)) {
-        ERROR("Transaction names may not contain '$' or ',' for %s", what);
+        ERROR("Variable names may not contain '$' or ',' for %s", what);
     }
 
     return allocVars->find(varName, true);
@@ -509,8 +517,8 @@ bool get_bool(const char *ptr, const char *what)
         return false;
     }
 
-    ret = strtol(ptr, &endptr, 0);
-    if (*endptr) {
+    ret = strtol(ptr, &endptr, integer_base(ptr));
+    if (endptr == ptr || *endptr) {
         ERROR("%s, \"%s\" is not a valid boolean!", what, ptr);
     }
     return ret ? true : false;
@@ -563,15 +571,30 @@ int scenario::get_rtd(const char *ptr, bool start)
     return stats->findRtd(ptr, start);
 }
 
+/* Get the RTDs of a comma-separated list of names. */
+std::vector<int> scenario::get_rtds(const char *ptr, bool start)
+{
+    std::vector<int> rtds;
+    std::istringstream names(ptr);
+    std::string name;
+
+    while (std::getline(names, name, ',')) {
+        if (int rtd = get_rtd(name.c_str(), start)) {
+            rtds.push_back(rtd);
+        }
+    }
+    return rtds;
+}
+
 /* Get a counter */
 int scenario::get_counter(const char *ptr, const char *what)
 {
     /* Check the name's validity. */
     if (ptr[0] == '\0') {
-        ERROR("Counter names names may not be empty for %s", what);
+        ERROR("Counter names may not be empty for %s", what);
     }
     if (strcspn(ptr, "$,") != strlen(ptr)) {
-        ERROR("Counter names may not contain $ or , for %s", what);
+        ERROR("Counter names may not contain '$' or ',' for %s", what);
     }
 
     return stats->findCounter(ptr, true);
@@ -582,7 +605,9 @@ int scenario::get_counter(const char *ptr, const char *what)
 
 void scenario::validate_variable_usage()
 {
-    allocVars->validate();
+    if (!uses_lua) {
+        allocVars->validate();
+    }
 }
 
 void scenario::validate_txn_usage()
@@ -590,6 +615,20 @@ void scenario::validate_txn_usage()
     for (unsigned int i = 0; i < transactions.size(); i++) {
         if(transactions[i].started == 0) {
             ERROR("Transaction %s is never started!", transactions[i].name.c_str());
+        }
+        if (transactions[i].server) {
+            /* Started by a received request: we send its responses */
+            if (transactions[i].sent_responses == 0) {
+                ERROR("Transaction %s has no responses defined!", transactions[i].name.c_str());
+            } else if (transactions[i].responses || transactions[i].acks) {
+                ERROR("Transaction %s is started by a received request: it takes no received responses or ACK!",
+                      transactions[i].name.c_str());
+            }
+            continue;
+        }
+        if (transactions[i].sent_responses) {
+            ERROR("Transaction %s is started by a sent request: it takes no sent responses!",
+                  transactions[i].name.c_str());
         } else if(transactions[i].responses == 0) {
             ERROR("Transaction %s has no responses defined!", transactions[i].name.c_str());
         }
@@ -607,80 +646,59 @@ void scenario::apply_labels(msgvec v, str_int_map labels)
 {
     for (unsigned int i = 0; i < v.size(); i++) {
         if (v[i]->nextLabel) {
-            str_int_map::iterator label_it = labels.find(v[i]->nextLabel);
+            str_int_map::iterator label_it = labels.find(*v[i]->nextLabel);
             if (label_it == labels.end()) {
-                ERROR("The label '%s' was not defined (index %d, next attribute)", v[i]->nextLabel, i);
+                ERROR("The label '%s' was not defined (index %d, next attribute)", v[i]->nextLabel->c_str(), i);
             }
             v[i]->next = label_it->second;
         }
         if (v[i]->onTimeoutLabel) {
-            str_int_map::iterator label_it = labels.find(v[i]->onTimeoutLabel);
+            str_int_map::iterator label_it = labels.find(*v[i]->onTimeoutLabel);
             if (label_it == labels.end()) {
-                ERROR("The label '%s' was not defined (index %d, ontimeout attribute)", v[i]->onTimeoutLabel, i);
+                ERROR("The label '%s' was not defined (index %d, ontimeout attribute)", v[i]->onTimeoutLabel->c_str(),
+                      i);
             }
             v[i]->on_timeout = label_it->second;
         }
     }
 }
 
-int get_cr_number(const char *src)
+/* Remove the character at offset which of each pair in msg, until none is left */
+static void remove_pairs(std::string &msg, const char *pair, int which)
 {
-    int res=0;
-    while(*src) {
-        if(*src == '\n') res++;
-        src++;
+    size_t pos;
+    while ((pos = msg.find(pair)) != std::string::npos) {
+        msg.erase(pos + which, 1);
     }
-    return res;
 }
 
-static char* clean_cdata(char *ptr, int *removed_crlf = nullptr)
+static std::string clean_cdata(const char *ptr, int *removed_crlf = nullptr)
 {
-    char * msg;
-
     while((*ptr == ' ') || (*ptr == '\t') || (*ptr == '\n')) ptr++;
 
-    msg = (char *) malloc(strlen(ptr) + 3);
-    if(!msg) {
-        ERROR("Memory Overflow");
-    }
-    strcpy(msg, ptr);
+    std::string msg = ptr;
 
-    ptr = msg + strlen(msg);
-    ptr--;
-
-    while((ptr >= msg) &&
-            ((*ptr == ' ')  ||
-             (*ptr == '\t') ||
-             (*ptr == '\n'))) {
-        if(*ptr == '\n' && removed_crlf) {
+    while (!msg.empty() && (msg.back() == ' ' || msg.back() == '\t' || msg.back() == '\n')) {
+        if (msg.back() == '\n' && removed_crlf) {
             (*removed_crlf)++;
         }
-        *ptr-- = 0;
+        msg.pop_back();
     }
 
-    if(ptr == msg) {
+    if (msg.empty()) {
         ERROR("Empty cdata in xml scenario file");
     }
-    while ((ptr = strstr(msg, "\n "))) {
-        memmove(ptr + 1, ptr + 2, strlen(ptr) - 1);
-    }
-    while ((ptr = strstr(msg, " \n"))) {
-        memmove(ptr, ptr + 1, strlen(ptr));
-    }
-    while ((ptr = strstr(msg, "\n\t"))) {
-        memmove(ptr + 1, ptr + 2, strlen(ptr) - 1);
-    }
-    while ((ptr = strstr(msg, "\t\n"))) {
-        memmove(ptr, ptr + 1, strlen(ptr));
-    }
+    remove_pairs(msg, "\n ", 1);
+    remove_pairs(msg, " \n", 0);
+    remove_pairs(msg, "\n\t", 1);
+    remove_pairs(msg, "\t\n", 0);
 
-    if (!strstr(msg, "\n\n")) {
-        strcat(msg, "\n\n");
+    if (msg.find("\n\n") == std::string::npos) {
+        msg += "\n\n";
     }
 
     return msg;
 }
-
 
 
 /********************** Scenario File analyser **********************/
@@ -700,16 +718,20 @@ static bool access_action_found = false;
 scenario::scenario(char * filename, int deflt)
 {
     char * elem;
-    char *method_list = nullptr;
+    /* The methods of the requests sent so far, run together */
+    std::string method_list;
     unsigned int scenario_file_cursor = 0;
-    int    L_content_length = 0 ;
-    char * peer;
+    int L_content_length = 0;
     const char* cptr;
 
     last_recv_optional = false;
 
     if(filename) {
         if(!xp_set_xml_buffer_from_file(filename)) {
+            if (*xp_get_error()) {
+                ERROR("Unable to load '%s' xml scenario file: %s", filename,
+                      xp_get_error());
+            }
             ERROR("Unable to load or parse '%s' xml scenario file", filename);
         }
     } else {
@@ -735,9 +757,7 @@ scenario::scenario(char * filename, int deflt)
     }
 
     if ((cptr = xp_get_value("name"))) {
-        name = strdup(cptr);
-    } else {
-        name = strdup("");
+        name = cptr;
     }
 
     duration = 0;
@@ -750,68 +770,37 @@ scenario::scenario(char * filename, int deflt)
         scenario_file_cursor ++;
 
         if(!strcmp(elem, "CallLengthRepartition")) {
-            ptr = xp_get_string("value", "CallLengthRepartition");
-            stats->setRepartitionCallLength(ptr);
-            free(ptr);
+            stats->setRepartitionCallLength(xp_get_string("value", "CallLengthRepartition").data());
         } else if(!strcmp(elem, "ResponseTimeRepartition")) {
-            ptr = xp_get_string("value", "ResponseTimeRepartition");
-            stats->setRepartitionResponseTime(ptr);
-            free(ptr);
+            stats->setRepartitionResponseTime(xp_get_string("value", "ResponseTimeRepartition").data());
         } else if(!strcmp(elem, "Global")) {
-            ptr = xp_get_string("variables", "Global");
-
-            char **       currentTabVarName = nullptr;
-            int           currentNbVarNames;
-
-            createStringTable(ptr, &currentTabVarName, &currentNbVarNames);
-            for (int i = 0; i < currentNbVarNames; i++) {
-                globalVariables->find(currentTabVarName[i], true);
+            for (const std::string &varName : createStringTable(xp_get_string("variables", "Global"))) {
+                globalVariables->find(varName.c_str(), true);
             }
-            freeStringTable(currentTabVarName, currentNbVarNames);
-            free(ptr);
         } else if(!strcmp(elem, "User")) {
-            ptr = xp_get_string("variables", "User");
-
-            char **       currentTabVarName = nullptr;
-            int           currentNbVarNames;
-
-            createStringTable(ptr, &currentTabVarName, &currentNbVarNames);
-            for (int i = 0; i < currentNbVarNames; i++) {
-                userVariables->find(currentTabVarName[i], true);
+            for (const std::string &varName : createStringTable(xp_get_string("variables", "User"))) {
+                userVariables->find(varName.c_str(), true);
             }
-            freeStringTable(currentTabVarName, currentNbVarNames);
-            free(ptr);
         } else if(!strcmp(elem, "Reference")) {
-            ptr = xp_get_string("variables", "Reference");
-
-            char **       currentTabVarName = nullptr;
-            int           currentNbVarNames;
-
-            createStringTable(ptr, &currentTabVarName, &currentNbVarNames);
-            for (int i = 0; i < currentNbVarNames; i++) {
-                int id = allocVars->find(currentTabVarName[i], false);
+            for (const std::string &varName : createStringTable(xp_get_string("variables", "Reference"))) {
+                int id = allocVars->find(varName.c_str(), false);
                 if (id == -1) {
-                    ERROR("Could not reference non-existent variable '%s'", currentTabVarName[i]);
+                    ERROR("Could not reference non-existent variable '%s'", varName.c_str());
                 }
             }
-            freeStringTable(currentTabVarName, currentNbVarNames);
-            free(ptr);
         } else if(!strcmp(elem, "DefaultMessage")) {
-            char *id = xp_get_string("id", "DefaultMessage");
+            std::string id = xp_get_string("id", "DefaultMessage");
             if(!(ptr = xp_get_cdata())) {
                 ERROR("No CDATA in 'send' section of xml scenario file");
             }
-            char *msg = clean_cdata(ptr);
-            set_default_message(id, msg);
-            free(id);
+            set_default_message(id.c_str(), clean_cdata(ptr));
             /* XXX: This should really be per scenario. */
         } else if(!strcmp(elem, "label")) {
-            ptr = xp_get_string("id", "label");
-            if (labelMap.find(ptr) != labelMap.end()) {
-                ERROR("The label name '%s' is used twice.", ptr);
+            std::string id = xp_get_string("id", "label");
+            if (labelMap.find(id) != labelMap.end()) {
+                ERROR("The label name '%s' is used twice.", id.c_str());
             }
-            labelMap[ptr] = messages.size();
-            free(ptr);
+            labelMap[std::move(id)] = messages.size();
         } else if (!strcmp(elem, "init")) {
             /* We have an init section, which must be full of nops or labels. */
             int nop_cursor = 0;
@@ -825,11 +814,11 @@ scenario::scenario(char * filename, int deflt)
                     getCommonAttributes(nopmsg);
                 } else if (!strcmp(initelem, "label")) {
                     /* Add an init label. */
-                    cptr = xp_get_value("id");
-                    if (initLabelMap.find(cptr) != initLabelMap.end()) {
-                        ERROR("The label name '%s' is used twice.", cptr);
+                    std::string id = xp_get_string("id", "label");
+                    if (initLabelMap.find(id) != initLabelMap.end()) {
+                        ERROR("The label name '%s' is used twice.", id.c_str());
                     }
-                    initLabelMap[cptr] = initmessages.size();
+                    initLabelMap[std::move(id)] = initmessages.size();
                 } else {
                     ERROR("Invalid element in an init stanza: '%s'", initelem);
                 }
@@ -839,7 +828,7 @@ scenario::scenario(char * filename, int deflt)
             if (found_timewait) {
                 ERROR("<timewait> can only be the last message in a scenario!");
             }
-            message *curmsg = new message(messages.size(), name ? name : "unknown scenario");
+            message *curmsg = new message(messages.size(), name.c_str());
             messages.push_back(curmsg);
 
             if(!strcmp(elem, "send")) {
@@ -851,10 +840,10 @@ scenario::scenario(char * filename, int deflt)
                 }
 
                 int removed_clrf = 0;
-                char * msg = clean_cdata(ptr, &removed_clrf);
+                std::string msg = clean_cdata(ptr, &removed_clrf);
 
-                char* cl_str = get_header(msg, "Content-Length:", true);
-                L_content_length = (cl_str && *cl_str) ? atoi(cl_str) : -1;
+                const header_value cl = get_header(msg.c_str(), "Content-Length:", true);
+                L_content_length = !cl.empty() ? (int)header_number(cl.view()) : -1;
                 switch (L_content_length) {
                 case  -1 :
                     // the msg does not contain content-length field
@@ -869,17 +858,14 @@ scenario::scenario(char * filename, int deflt)
                     break ;
                 }
 
-                if((msg[strlen(msg) - 1] != '\n') && (removed_clrf)) {
-                    strcat(msg, "\n");
+                if ((msg.back() != '\n') && (removed_clrf)) {
+                    msg += "\n";
                 }
-                char *tsrc = msg;
-                while(*tsrc++);
-                curmsg -> send_scheme = new SendingMessage(this, msg);
-                free(msg);
+                curmsg->send_scheme = new SendingMessage(this, msg.c_str());
 
                 // If this is a request we are sending, then store our transaction/method matching information.
                 if (!curmsg->send_scheme->isResponse()) {
-                    char *method = curmsg->send_scheme->getMethod();
+                    const char *method = curmsg->send_scheme->getMethod();
                     bool isInvite = !strcmp(method, "INVITE");
                     bool isAck = !strcmp(method, "ACK");
 
@@ -894,12 +880,10 @@ scenario::scenario(char * filename, int deflt)
                         }
                         curmsg->ack_txn = get_txn(cptr, "ack transaction", false, false, true);
                     } else {
-                        int len = method_list ? strlen(method_list) : 0;
-                        method_list = (char *)realloc(method_list, len + strlen(method) + 1);
-                        if (!method_list) {
-                            ERROR_NO("Out of memory allocating method_list!");
-                        }
-                        strcpy(method_list + len, method);
+                        method_list += method;
+                    }
+                    if (xp_get_value("response_txn")) {
+                        ERROR("response_txn can only be used for received responses or sent responses.");
                     }
                 } else {
                     if (xp_get_value("start_txn")) {
@@ -908,10 +892,9 @@ scenario::scenario(char * filename, int deflt)
                     if (xp_get_value("ack_txn")) {
                         ERROR("Responses can not ACK a transaction");
                     }
-                }
-
-                if (xp_get_value("response_txn")) {
-                    ERROR("response_txn can only be used for received messages.");
+                    if ((cptr = xp_get_value("response_txn"))) {
+                        curmsg->response_txn = get_txn(cptr, "transaction response", false, false, false, true);
+                    }
                 }
 
                 curmsg -> retrans_delay = xp_get_long("retrans", "retransmission timer", 0);
@@ -920,19 +903,24 @@ scenario::scenario(char * filename, int deflt)
                 curmsg->M_type = MSG_TYPE_RECV;
                 /* Received messages descriptions */
                 if((cptr = xp_get_value("response"))) {
-                    curmsg ->recv_response = strdup(cptr);
-                    if (method_list) {
-                        curmsg->recv_response_for_cseq_method_list = strdup(method_list);
-                    }
+                    curmsg->recv_response = cptr;
+                    curmsg->recv_response_code = atoi(cptr);
+                    curmsg->recv_response_for_cseq_method_list = method_list;
                     if ((cptr = xp_get_value("response_txn"))) {
                         curmsg->response_txn = get_txn(cptr, "transaction response", false, false, false);
                     }
                 }
 
                 if ((cptr = xp_get_value("request"))) {
-                    curmsg->recv_request = strdup(cptr);
+                    curmsg->recv_request = cptr;
                     if (xp_get_value("response_txn")) {
                         ERROR("response_txn can only be used for received responses.");
+                    }
+                    if ((cptr = xp_get_value("start_txn"))) {
+                        if (*curmsg->recv_request == "ACK") {
+                            ERROR("An ACK message can not start a transaction!");
+                        }
+                        curmsg->start_txn = get_txn(cptr, "start transaction", true, false, false, true);
                     }
                 }
 
@@ -949,7 +937,11 @@ scenario::scenario(char * filename, int deflt)
                     }
                 }
 
-                curmsg->timeout = xp_get_long("timeout", "message timeout", 0);
+                if ((cptr = xp_get_value("timeout")) && strchr(cptr, '[')) {
+                    curmsg->timeout_scheme = new SendingMessage(this, cptr, true /* skip sanity */);
+                } else {
+                    curmsg->timeout = xp_get_long("timeout", "message timeout", 0);
+                }
 
                 /* record the route set  */
                 /* TODO disallow optional and rrs to coexist? */
@@ -1005,7 +997,7 @@ scenario::scenario(char * filename, int deflt)
 
                 /* 3pcc extended mode */
                 if ((cptr = xp_get_value("src"))) {
-                    curmsg->peer_src = strdup(cptr);
+                    curmsg->peer_src = cptr;
                 } else if (extendedTwinSippMode) {
                     ERROR("You must specify a 'src' for recvCmd when using extended 3pcc mode!");
                 }
@@ -1016,10 +1008,10 @@ scenario::scenario(char * filename, int deflt)
 
                 /* 3pcc extended mode */
                 if ((cptr = xp_get_value("dest"))) {
-                    peer = strdup(cptr);
-                    curmsg->peer_dest = peer;
+                    curmsg->peer_dest = cptr;
+                    const std::string &peer = curmsg->peer_dest;
                     peer_map::iterator peer_it;
-                    peer_it = peers.find(peer_map::key_type(peer));
+                    peer_it = peers.find(peer);
                     if(peer_it == peers.end())
                         /* the peer (slave or master)
                         has not been added in the map
@@ -1027,8 +1019,8 @@ scenario::scenario(char * filename, int deflt)
                     {
                         T_peer_infos infos = {};
                         infos.peer_socket = 0;
-                        strncpy(infos.peer_host, get_peer_addr(peer), sizeof(infos.peer_host) - 1);
-                        peers[std::string(peer)] = infos;
+                        infos.peer_host = get_peer_addr(peer);
+                        peers[peer] = std::move(infos);
                     }
                 } else if (extendedTwinSippMode) {
                     ERROR("You must specify a 'dest' for sendCmd with extended 3pcc mode!");
@@ -1037,20 +1029,29 @@ scenario::scenario(char * filename, int deflt)
                 if (!(ptr = xp_get_cdata())) {
                     ERROR("No CDATA in 'sendCmd' section of xml scenario file");
                 }
-                char *msg = clean_cdata(ptr);
-
-                curmsg -> M_sendCmdData = new SendingMessage(this, msg, true /* skip sanity */);
-                free(msg);
+                curmsg->M_sendCmdData = new SendingMessage(this, clean_cdata(ptr).c_str(), true /* skip sanity */);
             } else {
                 ERROR("Unknown element '%s' in xml scenario file", elem);
+            }
+
+            if (curmsg->M_type == MSG_TYPE_SEND || curmsg->M_type == MSG_TYPE_RECV) {
+                long dialog = xp_get_long("dialog", "dialog number", 0);
+                if (xp_get_value("dialog") && (dialog < 1 || dialog > INT_MAX)) {
+                    ERROR("dialog must be a positive number, not '%s'", xp_get_value("dialog"));
+                }
+                curmsg->dialog = dialog;
+                if (dialog > 1) {
+                    dialogs = true;
+                    if (curmsg->recv_request) {
+                        new_dialogs = true;
+                    }
+                }
             }
 
             getCommonAttributes(curmsg);
         } /** end * Message case */
         xp_close_element();
     } // end while
-
-    free(method_list);
 
     /* Close scenario element */
     xp_close_element();
@@ -1084,13 +1085,17 @@ scenario::scenario(char * filename, int deflt)
     if (messages.size() == 0) {
         ERROR("Did not find any messages inside of scenario!");
     }
+    if (messages[0]->M_type == MSG_TYPE_RECV && messages[0]->dialog > 1) {
+        ERROR("A call begins in dialog 1: its first message can not have dialog=\"%d\"",
+              messages[0]->dialog);
+    }
 }
 
 void scenario::runInit()
 {
     call *initcall;
     if (initmessages.size() > 0) {
-        initcall = new call(main_scenario, nullptr, nullptr, "///main-init", 0, false, false, true);
+        initcall = new call(this, nullptr, nullptr, "///main-init", 0, false, false, true);
         initcall->run();
     }
 }
@@ -1101,8 +1106,10 @@ scenario::~scenario()
         delete *i;
     }
     messages.clear();
-
-    free(name);
+    for (msgvec::iterator i = initmessages.begin(); i != initmessages.end(); i++) {
+        delete *i;
+    }
+    initmessages.clear();
 
     allocVars->putTable();
     delete stats;
@@ -1198,7 +1205,7 @@ CSample *parse_distribution(bool oldstyle = false)
         ERROR("The distribution '%s' is only available with GSL", distname);
 #endif
     } else {
-        ERROR("Unknown distribution: %s", ptr);
+        ERROR("Unknown distribution: %s", distname);
     }
 
     return distribution;
@@ -1216,8 +1223,7 @@ void parse_slave_cfg()
     FILE * f;
     char line[MAX_PEER_SIZE];
     char * temp_peer;
-    char * temp_host;
-    char * peer_host;
+    char *temp_host;
 
     f = fopen(slave_cfg_file, "r");
     if(f) {
@@ -1230,17 +1236,40 @@ void parse_slave_cfg()
             if (!temp_host)
                 continue;
 
-            peer_host = strdup(temp_host);
-            if (!peer_host)
-                ERROR("Cannot allocate memory!");
-
-            peer_addrs[std::string(temp_peer)] = peer_host;
+            peer_addrs[temp_peer] = temp_host;
         }
     } else {
-        ERROR("Can not open slave_cfg file %s", slave_cfg_file);
+        ERROR("Can not open -slave_cfg/-secondary_cfg file %s", slave_cfg_file);
     }
 
     fclose(f);
+}
+
+bool scenario::startsWith(const char *msg)
+{
+    /* A call jumps to _unexp.main on any message it doesn't expect. */
+    if (unexpected_jump >= 0) {
+        return true;
+    }
+
+    int code = get_reply_code(msg);
+    std::string method(msg, strcspn(msg, " \t\r\n"));
+
+    for (message *curmsg : messages) {
+        if (curmsg->M_type == MSG_TYPE_PAUSE || curmsg->M_type == MSG_TYPE_NOP) {
+            continue;
+        }
+        if (curmsg->M_type != MSG_TYPE_RECV) {
+            return true;
+        }
+        if (code ? curmsg->matchesResponse(code) : curmsg->matchesRequest(method.c_str())) {
+            return true;
+        }
+        if (curmsg->optional == OPTIONAL_FALSE) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Determine in which mode the sipp tool has been
@@ -1305,7 +1334,7 @@ void scenario::computeSippMode()
                     }
                 }
                 if((thirdPartyMode == MODE_MASTER_PASSIVE || thirdPartyMode == MODE_MASTER) && !master_name) {
-                    ERROR("Inconsistency between command line and scenario: master scenario but -master option not set");
+                    ERROR("Inconsistency between command line and scenario: master scenario but -master/-primary option not set");
                 }
                 if(!twinSippMode && !extendedTwinSippMode)
                     ERROR("sendCmd message found in scenario but no twin sipp"
@@ -1324,7 +1353,7 @@ void scenario::computeSippMode()
                 } else if(extendedTwinSippMode) {
                     thirdPartyMode = MODE_SLAVE;
                     if(!slave_number) {
-                        ERROR("Inconsistency between command line and scenario: slave scenario but -slave option not set");
+                        ERROR("Inconsistency between command line and scenario: slave scenario but -slave/-secondary option not set");
                     } else {
                         thirdPartyMode = MODE_SLAVE;
                     }
@@ -1348,6 +1377,11 @@ void scenario::computeSippMode()
         if (sendMode == -1) {
             sendMode = MODE_CLIENT;
         }
+    }
+    /* A 3PCC scenario with only commands sends no SIP: like a server, it
+     * needs no remote host. */
+    if (sendMode == -1 && (isSendCmdFound || isRecvCmdFound)) {
+        sendMode = MODE_SERVER;
     }
     if(creationMode == -1)
         ERROR("Unable to determine creation mode of the tool (server, client)");
@@ -1382,17 +1416,14 @@ void scenario::parseAction(CActions *actions)
 {
     char *        actionElem;
     unsigned int recvScenarioLen = 0;
-    char **       currentTabVarName = nullptr;
-    int           currentNbVarNames;
-    int           sub_currentNbVarId;
-    char* ptr;
+    int sub_currentNbVarId;
     const char* cptr;
 
     while((actionElem = xp_open_element(recvScenarioLen))) {
         CAction *tmpAction = new CAction(this);
 
         if(!strcmp(actionElem, "ereg")) {
-            ptr = xp_get_string("regexp", "ereg");
+            std::string regexp = xp_get_string("regexp", "ereg");
 
             tmpAction->setActionType(CAction::E_AT_ASSIGN_FROM_REGEXP);
 
@@ -1406,10 +1437,8 @@ void scenario::parseAction(CActions *actions)
 
                 if (strcmp(cptr, "msg") == 0) {
                     tmpAction->setLookingPlace(CAction::E_LP_MSG);
-                    tmpAction->setLookingChar (nullptr);
                 } else if (strcmp(cptr, "body") == 0) {
                     tmpAction->setLookingPlace(CAction::E_LP_BODY);
-                    tmpAction->setLookingChar (nullptr);
                 } else if (strcmp(cptr, "var") == 0) {
                     tmpAction->setVarInId(xp_get_var("variable", "ereg"));
                     tmpAction->setLookingPlace(CAction::E_LP_VAR);
@@ -1431,7 +1460,6 @@ void scenario::parseAction(CActions *actions)
                 }
             } else {
                 tmpAction->setLookingPlace(CAction::E_LP_MSG);
-                tmpAction->setLookingChar(nullptr);
             } // end if-else search_in
 
             if (xp_get_value("check_it")) {
@@ -1447,38 +1475,28 @@ void scenario::parseAction(CActions *actions)
                 ERROR("assign_to value is missing");
             }
 
-            createStringTable(cptr, &currentTabVarName, &currentNbVarNames);
+            std::vector<std::string> varNames = createStringTable(cptr);
 
-            int varId = get_var(currentTabVarName[0], "assign_to");
+            int varId = get_var(varNames[0].c_str(), "assign_to");
             tmpAction->setVarId(varId);
 
-            tmpAction->setRegExp(ptr);
-            if (currentNbVarNames > 1 ) {
-                sub_currentNbVarId = currentNbVarNames - 1 ;
+            tmpAction->setRegExp(regexp);
+            if (varNames.size() > 1) {
+                sub_currentNbVarId = varNames.size() - 1;
                 tmpAction->setNbSubVarId(sub_currentNbVarId);
 
                 for(int i=1; i<= sub_currentNbVarId; i++) {
-                    int varId = get_var(currentTabVarName[i], "sub expression assign_to");
-                    tmpAction->setSubVarId(varId);
+                    tmpAction->setSubVarId(get_var(varNames[i].c_str(), "sub expression assign_to"));
                 }
             }
-
-            freeStringTable(currentTabVarName, currentNbVarNames);
-            free(ptr);
         } /* end !strcmp(actionElem, "ereg") */ else if(!strcmp(actionElem, "log")) {
-            ptr = xp_get_string("message", "log");
-            tmpAction->setMessage(ptr);
-            free(ptr);
+            tmpAction->setMessage(xp_get_string("message", "log"));
             tmpAction->setActionType(CAction::E_AT_LOG_TO_FILE);
         } else if(!strcmp(actionElem, "warning")) {
-            ptr = xp_get_string("message", "warning");
-            tmpAction->setMessage(ptr);
-            free(ptr);
+            tmpAction->setMessage(xp_get_string("message", "warning"));
             tmpAction->setActionType(CAction::E_AT_LOG_WARNING);
         } else if(!strcmp(actionElem, "error")) {
-            ptr = xp_get_string("message", "error");
-            tmpAction->setMessage(ptr);
-            free(ptr);
+            tmpAction->setMessage(xp_get_string("message", "error"));
             tmpAction->setActionType(CAction::E_AT_LOG_ERROR);
         } else if(!strcmp(actionElem, "assign")) {
             tmpAction->setActionType(CAction::E_AT_ASSIGN_FROM_VALUE);
@@ -1486,27 +1504,23 @@ void scenario::parseAction(CActions *actions)
         } else if(!strcmp(actionElem, "assignstr")) {
             tmpAction->setActionType(CAction::E_AT_ASSIGN_FROM_STRING);
             tmpAction->setVarId(xp_get_var("assign_to", "assignstr"));
-            ptr = xp_get_string("value", "assignstr");
-            tmpAction->setMessage(ptr);
-            free(ptr);
+            tmpAction->setMessage(xp_get_string("value", "assignstr"));
         } else if(!strcmp(actionElem, "gettimeofday")) {
             tmpAction->setActionType(CAction::E_AT_ASSIGN_FROM_GETTIMEOFDAY);
 
             if (!(cptr = xp_get_value("assign_to"))) {
                 ERROR("assign_to value is missing");
             }
-            createStringTable(cptr, &currentTabVarName, &currentNbVarNames);
-            if (currentNbVarNames != 2 ) {
+            std::vector<std::string> varNames = createStringTable(cptr);
+            if (varNames.size() != 2) {
                 ERROR("The gettimeofday action requires two output variables!");
             }
             tmpAction->setNbSubVarId(1);
 
-            int varId = get_var(currentTabVarName[0], "gettimeofday seconds assign_to");
+            int varId = get_var(varNames[0].c_str(), "gettimeofday seconds assign_to");
             tmpAction->setVarId(varId);
-            varId = get_var(currentTabVarName[1], "gettimeofday useconds assign_to");
+            varId = get_var(varNames[1].c_str(), "gettimeofday useconds assign_to");
             tmpAction->setSubVarId(varId);
-
-            freeStringTable(currentTabVarName, currentNbVarNames);
         } else if(!strcmp(actionElem, "index")) {
             tmpAction->setVarId(xp_get_var("assign_to", "index"));
             tmpAction->setActionType(CAction::E_AT_ASSIGN_FROM_INDEX);
@@ -1566,51 +1580,47 @@ void scenario::parseAction(CActions *actions)
                 tmpAction->setVarIn2Id(xp_get_var("variable2", "test"));
             }
             tmpAction->setActionType(CAction::E_AT_VAR_TEST);
-            ptr = xp_get_string("compare", "test");
-            if (!strcmp(ptr, "equal")) {
+            std::string compare = xp_get_string("compare", "test");
+            if (compare == "equal") {
                 tmpAction->setComparator(CAction::E_C_EQ);
-            } else if (!strcmp(ptr, "not_equal")) {
+            } else if (compare == "not_equal") {
                 tmpAction->setComparator(CAction::E_C_NE);
-            } else if (!strcmp(ptr, "greater_than")) {
+            } else if (compare == "greater_than") {
                 tmpAction->setComparator(CAction::E_C_GT);
-            } else if (!strcmp(ptr, "less_than")) {
+            } else if (compare == "less_than") {
                 tmpAction->setComparator(CAction::E_C_LT);
-            } else if (!strcmp(ptr, "greater_than_equal")) {
+            } else if (compare == "greater_than_equal") {
                 tmpAction->setComparator(CAction::E_C_GEQ);
-            } else if (!strcmp(ptr, "less_than_equal")) {
+            } else if (compare == "less_than_equal") {
                 tmpAction->setComparator(CAction::E_C_LEQ);
             } else {
-                ERROR("Invalid 'compare' parameter: %s", ptr);
+                ERROR("Invalid 'compare' parameter: %s", compare.c_str());
             }
-            free(ptr);
         } else if(!strcmp(actionElem, "verifyauth")) {
             tmpAction->setVarId(xp_get_var("assign_to", "verifyauth"));
-            char* username_ptr = xp_get_string("username", "verifyauth");
-            char* password_ptr = xp_get_string("password", "verifyauth");
-            tmpAction->setMessage(username_ptr, 0);
-            tmpAction->setMessage(password_ptr, 1);
+            std::string username = xp_get_string("username", "verifyauth");
+            std::string password = xp_get_string("password", "verifyauth");
+            tmpAction->setMessage(username, 0);
+            tmpAction->setMessage(password, 1);
             tmpAction->setActionType(CAction::E_AT_VERIFY_AUTH);
-            free(username_ptr);
-            free(password_ptr);
-            username_ptr = password_ptr = nullptr;
         } else if(!strcmp(actionElem, "lookup")) {
             tmpAction->setVarId(xp_get_var("assign_to", "lookup"));
-            tmpAction->setMessage(xp_get_string("file", "lookup"), 0);
-            tmpAction->setMessage(xp_get_string("key", "lookup"), 1);
+            xp_set_message(tmpAction, 0, "file", "lookup");
+            xp_set_message(tmpAction, 1, "key", "lookup");
             tmpAction->setActionType(CAction::E_AT_LOOKUP);
         } else if(!strcmp(actionElem, "insert")) {
-            tmpAction->setMessage(xp_get_string("file", "insert"), 0);
-            tmpAction->setMessage(xp_get_string("value", "insert"), 1);
+            xp_set_message(tmpAction, 0, "file", "insert");
+            xp_set_message(tmpAction, 1, "value", "insert");
             tmpAction->setActionType(CAction::E_AT_INSERT);
         } else if(!strcmp(actionElem, "replace")) {
-            tmpAction->setMessage(xp_get_string("file", "replace"), 0);
-            tmpAction->setMessage(xp_get_string("line", "replace"), 1);
-            tmpAction->setMessage(xp_get_string("value", "replace"), 2);
+            xp_set_message(tmpAction, 0, "file", "replace");
+            xp_set_message(tmpAction, 1, "line", "replace");
+            xp_set_message(tmpAction, 2, "value", "replace");
             tmpAction->setActionType(CAction::E_AT_REPLACE);
         } else if(!strcmp(actionElem, "setdest")) {
-            tmpAction->setMessage(xp_get_string("host", actionElem), 0);
-            tmpAction->setMessage(xp_get_string("port", actionElem), 1);
-            tmpAction->setMessage(xp_get_string("protocol", actionElem), 2);
+            xp_set_message(tmpAction, 0, "host", "setdest");
+            xp_set_message(tmpAction, 1, "port", "setdest");
+            xp_set_message(tmpAction, 2, "protocol", "setdest");
             tmpAction->setActionType(CAction::E_AT_SET_DEST);
         } else if(!strcmp(actionElem, "closecon")) {
             tmpAction->setActionType(CAction::E_AT_CLOSE_CON);
@@ -1743,7 +1753,17 @@ void scenario::parseAction(CActions *actions)
             if ((cptr = xp_get_value("command"))) {
                 tmpAction->setActionType(CAction::E_AT_EXECUTE_CMD);
                 tmpAction->setMessage(cptr);
-            } else if((cptr = xp_get_value("int_cmd"))) {
+            } else if ((cptr = xp_get_value("lua"))) {
+#ifndef USE_LUA
+                ERROR("Scenario specifies a lua action, but this version of SIPp does not have Lua support");
+#endif
+                uses_lua = true;
+                tmpAction->setActionType(CAction::E_AT_EXEC_LUA);
+                tmpAction->setMessage(cptr);
+            } else if ((cptr = xp_get_value("verify"))) {
+                tmpAction->setActionType(CAction::E_AT_VERIFY_CMD);
+                tmpAction->setMessage(cptr);
+            } else if ((cptr = xp_get_value("int_cmd"))) {
                 CAction::T_IntCmdType type(CAction::E_INTCMD_STOPCALL); /* assume the default */
 
                 if (strcmp(cptr, "stop_now") == 0) {
@@ -1759,24 +1779,40 @@ void scenario::parseAction(CActions *actions)
                 tmpAction->setActionType(CAction::E_AT_EXEC_INTCMD);
                 tmpAction->setIntCmd(type);
 #ifdef PCAPPLAY
-            } else if ((ptr = xp_get_keyword_value("play_pcap_audio"))) {
-                tmpAction->setPcapArgs(ptr);
+            } else if (std::optional<std::string> args = xp_get_keyword_value("play_pcap_audio")) {
+                tmpAction->setPcapArgs(args->c_str());
                 tmpAction->setActionType(CAction::E_AT_PLAY_PCAP_AUDIO);
+                pcap_plays = true;
                 hasMedia = 1;
-                free(ptr);
-            } else if ((ptr = xp_get_keyword_value("play_pcap_image"))) {
-                tmpAction->setPcapArgs(ptr);
+            } else if (std::optional<std::string> args = xp_get_keyword_value("play_pcap_image")) {
+                tmpAction->setPcapArgs(args->c_str());
                 tmpAction->setActionType(CAction::E_AT_PLAY_PCAP_IMAGE);
+                pcap_plays = true;
                 hasMedia = 1;
-                free(ptr);
-            } else if ((ptr = xp_get_keyword_value("play_pcap_video"))) {
-                tmpAction->setPcapArgs(ptr);
+            } else if (std::optional<std::string> args = xp_get_keyword_value("play_pcap_video")) {
+                tmpAction->setPcapArgs(args->c_str());
                 tmpAction->setActionType(CAction::E_AT_PLAY_PCAP_VIDEO);
+                pcap_plays = true;
                 hasMedia = 1;
-                free(ptr);
+            } else if (std::optional<std::string> args = xp_get_keyword_value("play_pcap_text")) {
+                tmpAction->setPcapArgs(args->c_str());
+                tmpAction->setActionType(CAction::E_AT_PLAY_PCAP_TEXT);
+                pcap_plays = true;
+                hasMedia = 1;
             } else if ((cptr = xp_get_value("play_dtmf"))) {
+                /* without keywords, what would be played is known now */
+                if (!strchr(cptr, '[')) {
+                    unsigned long tone_len;
+                    uint8_t payload_type;
+                    std::string args = cptr;
+                    const char *error = parse_dtmf(args.data(), &tone_len, &payload_type);
+                    if (error) {
+                        ERROR("Invalid play_dtmf \"%s\": %s", cptr, error);
+                    }
+                }
                 tmpAction->setMessage(cptr);
                 tmpAction->setActionType(CAction::E_AT_PLAY_DTMF);
+                pcap_plays = true;
                 hasMedia = 1;
 #else
             } else if (xp_get_value("play_pcap_audio")) {
@@ -1785,11 +1821,15 @@ void scenario::parseAction(CActions *actions)
                 ERROR("Scenario specifies a play_pcap_image action, but this version of SIPp does not have PCAP support");
             } else if (xp_get_value("play_pcap_video")) {
                 ERROR("Scenario specifies a play_pcap_video action, but this version of SIPp does not have PCAP support");
+            } else if (xp_get_value("play_pcap_text")) {
+                ERROR(
+                    "Scenario specifies a play_pcap_text action, but this version of SIPp does not have PCAP support");
             } else if (xp_get_value("play_dtmf")) {
                 ERROR("Scenario specifies a play_dtmf action, but this version of SIPp does not have PCAP support");
 #endif
             } else if ((cptr = xp_get_value("rtp_stream"))) {
-                ptr = strdup(cptr);
+                std::string value = cptr;
+                const char *ptr = value.c_str();
                 hasMedia = 1;
                 if (!strcmp(ptr, "pauseapattern"))
                 {
@@ -1825,14 +1865,28 @@ void scenario::parseAction(CActions *actions)
                 {
                     tmpAction->setActionType(CAction::E_AT_RTP_STREAM_RESUME);
                 }
+                else if (!strcmp(ptr, "wait"))
+                {
+                    tmpAction->setActionType(CAction::E_AT_RTP_STREAM_WAIT);
+                    long timeout = xp_get_long("timeout", "rtp_stream wait", 0);
+                    if (timeout < 0) {
+                        ERROR("rtp_stream wait timeout must not be negative");
+                    }
+                    tmpAction->setDoubleValue(timeout);
+                }
                 else
                 {
+                    /* Check a plain filename now; a filename with
+                     * keywords can only be checked when played. */
+                    if (!strchr(ptr, '[')) {
+                        tmpAction->setRTPStreamActInfo(ptr);
+                    }
                     tmpAction->setMessage(ptr);
                     tmpAction->setActionType(CAction::E_AT_RTP_STREAM_PLAY);
                 }
-                free(ptr);
             } else if ((cptr = xp_get_value("rtp_echo"))) {
-                ptr = strdup(cptr);
+                std::string value = cptr;
+                const char *ptr = value.c_str();
                 hasMedia = 1;
                 if (!strncmp(ptr, "startaudio", 10))
                 {
@@ -1867,11 +1921,47 @@ void scenario::parseAction(CActions *actions)
             } else {
                 ERROR("illegal <exec> in the scenario");
             }
+        } else if (!strcmp(actionElem, "rtp_stats")) {
+            tmpAction->setActionType(CAction::E_AT_RTP_STATS);
+            if (!(cptr = xp_get_value("assign_to"))) {
+                ERROR("assign_to value is missing in rtp_stats");
+            }
+            std::vector<std::string> varNames = createStringTable(cptr);
+            if (varNames.size() < 1 || varNames.size() > 3) {
+                ERROR("rtp_stats assigns one to three variables: the packets, and the payload type and payload of the first");
+            }
+            tmpAction->setVarId(get_var(varNames[0].c_str(), "rtp_stats packets assign_to"));
+            tmpAction->setNbSubVarId(varNames.size() - 1);
+            for (size_t i = 1; i < varNames.size(); i++) {
+                tmpAction->setSubVarId(get_var(varNames[i].c_str(), "rtp_stats assign_to"));
+            }
+            cptr = xp_get_value("media");
+            if (cptr && strcmp(cptr, "audio") && strcmp(cptr, "video")) {
+                ERROR("rtp_stats media must be audio or video, not %s", cptr);
+            }
+            tmpAction->setDoubleValue(cptr && !strcmp(cptr, "video"));
+            rtp_stats_used = true;
+        } else if (!strcmp(actionElem, "rtp_dtmf")) {
+            tmpAction->setActionType(CAction::E_AT_RTP_DTMF);
+            if (!(cptr = xp_get_value("assign_to"))) {
+                ERROR("assign_to value is missing in rtp_dtmf");
+            }
+            tmpAction->setVarId(get_var(cptr, "rtp_dtmf assign_to"));
+            long pt = 96;
+            if ((cptr = xp_get_value("payload_type"))) {
+                pt = get_long(cptr, "rtp_dtmf payload_type");
+                if (pt < 0 || pt > 127) {
+                    ERROR("rtp_dtmf payload_type must be from 0 to 127, not %s", cptr);
+                }
+            }
+            tmpAction->setDoubleValue(pt);
+            rtp_dtmf_payload_types[pt] = true;
+            rtp_stats_used = true;
         } else if (!strcmp(actionElem, "rtp_echo")) {
             tmpAction->setActionType(CAction::E_AT_RTP_ECHO);
             handle_rhs(tmpAction, "rtp_echo");
         } else {
-          ERROR("Unknown action: %s", actionElem);
+            ERROR("Unknown action: %s", actionElem);
         }
 
         /* If the action was not well-formed, there should have already been an
@@ -1912,10 +2002,10 @@ void scenario::getBookKeeping(message *message)
     const char *ptr;
 
     if ((ptr = xp_get_value("rtd"))) {
-        message->stop_rtd = get_rtd(ptr, false);
+        message->stop_rtd = get_rtds(ptr, false);
     }
     if ((ptr = xp_get_value("repeat_rtd"))) {
-        if (message->stop_rtd) {
+        if (!message->stop_rtd.empty()) {
             message->repeat_rtd = get_bool(ptr, "repeat_rtd");
         } else {
             ERROR("There is a repeat_rtd element without an rtd element");
@@ -1923,7 +2013,7 @@ void scenario::getBookKeeping(message *message)
     }
 
     if ((ptr = xp_get_value("start_rtd"))) {
-        message->start_rtd = get_rtd(ptr, true);
+        message->start_rtd = get_rtds(ptr, true);
     }
 
     if ((ptr = xp_get_value("counter"))) {
@@ -1956,7 +2046,7 @@ void scenario::getCommonAttributes(message *message)
     }
     message -> hide = xp_get_bool("hide", "hide", hidedefault);
     if((ptr = xp_get_value((char *)"display"))) {
-        message -> display_str = strdup(ptr);
+        message->display_str = ptr;
     }
 
     message -> condexec = xp_get_var("condexec", "condexec variable", -1);
@@ -1966,7 +2056,7 @@ void scenario::getCommonAttributes(message *message)
         if (found_timewait) {
             ERROR("next labels are not allowed in <timewait> elements.");
         }
-        message->nextLabel = strdup(ptr);
+        message->nextLabel = ptr;
         message->test = xp_get_var("test", "test variable", -1);
         if ( 0 != ( ptr = xp_get_value((char *)"chance") ) ) {
             float chance = get_double(ptr,"chance");
@@ -1984,43 +2074,21 @@ void scenario::getCommonAttributes(message *message)
         if (found_timewait) {
             ERROR("ontimeout labels are not allowed in <timewait> elements.");
         }
-        message -> onTimeoutLabel = strdup(ptr);
+        message->onTimeoutLabel = ptr;
     }
 }
 
-int createStringTable(const char* inputString, char*** stringList, int* sizeOfList)
+std::vector<std::string> createStringTable(std::string_view inputString)
 {
-    if(!inputString) {
-        return 0;
+    std::vector<std::string> stringList;
+    size_t comma;
+
+    while ((comma = inputString.find(',')) != std::string_view::npos) {
+        stringList.emplace_back(inputString.substr(0, comma));
+        inputString.remove_prefix(comma + 1);
     }
-
-    *stringList = nullptr;
-    *sizeOfList = 0;
-
-    /* FIXME: temporary workaround: needs rewrite */
-    char* input = const_cast<char*>(inputString);
-    do {
-        char* p = strchr(input, ',');
-        if (p) {
-            *p++ = '\0';
-        }
-
-        *stringList = (char **)realloc(*stringList, sizeof(char *) * (*sizeOfList + 1));
-        (*stringList)[*sizeOfList] = strdup(input);
-        (*sizeOfList)++;
-
-        input = p;
-    } while (input);
-
-    return 1;
-}
-
-void freeStringTable(char ** stringList, int sizeOfList)
-{
-    for (int i = 0; i < sizeOfList; i++) {
-        free(stringList[i]);
-    }
-    free(stringList);
+    stringList.emplace_back(inputString);
+    return stringList;
 }
 
 /* These are the names of the scenarios, they must match the default_scenario table. */
@@ -2054,1382 +2122,41 @@ int find_scenario(const char *scenario)
     return -1;
 }
 
-// TIP: to integrate an existing XML scenario, use the following sed line:
-// cat ../3pcc-controller-B.xml | sed -e 's/\"/\\\"/g' -e 's/\(.*\)/\"\1\\n\"/'
-const char * default_scenario [] = {
-    /************* Default_scenario[0] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp default 'uac' scenario.                       -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"Basic Sipstone UAC\">\n"
-    "  <!-- In client mode (sipp placing calls), the Call-ID MUST be         -->\n"
-    "  <!-- generated by sipp. To do so, use [call_id] keyword.                -->\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 INVITE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[media_ip_type] [media_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 0\n"
-    "      a=rtpmap:0 PCMU/8000\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"100\"\n"
-    "        optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"180\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"183\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- By adding rrs=\"true\" (Record Route Sets), the route sets         -->\n"
-    "  <!-- are saved and used for following messages sent. Useful to test   -->\n"
-    "  <!-- against stateful SIP proxies/B2BUAs.                             -->\n"
-    "  <recv response=\"200\" rtd=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- Packet lost can be simulated in any send/recv message by         -->\n"
-    "  <!-- by adding the 'lost = \"10\"'. Value can be [1-100] percent.       -->\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 ACK\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- This delay can be customized by the -d command-line option       -->\n"
-    "  <!-- or by adding a 'milliseconds = \"value\"' option here.             -->\n"
-    "  <pause/>\n"
-    "\n"
-    "  <!-- The 'crlf' option inserts a blank line in the statistics report. -->\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag00[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 2 BYE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"200\" crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"10, 20, 30, 40, 50, 100, 150, 200\"/>\n"
-    "\n"
-    "  <!-- definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"10, 50, 100, 500, 1000, 5000, 10000\"/>\n"
-    "\n"
-    "</scenario>\n"
-    "\n"
-    ,
-
-    /************* Default_scenario[1] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp default 'uas' scenario.                       -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"Basic UAS responder\">\n"
-    "  <!-- By adding rrs=\"true\" (Record Route Sets), the route sets         -->\n"
-    "  <!-- are saved and used for following messages sent. Useful to test   -->\n"
-    "  <!-- against stateful SIP proxies/B2BUAs.                             -->\n"
-    "  <!-- Adding ignoresdp=\"true\" here would ignore the SDP data: that     -->\n"
-    "  <!-- can be useful if you want to reject reINVITEs and keep the       -->\n"
-    "  <!-- media stream flowing.                                            -->\n"
-    "  <recv request=\"INVITE\" crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- The '[last_*]' keyword is replaced automatically by the          -->\n"
-    "  <!-- specified header if it was present in the last message received  -->\n"
-    "  <!-- (except if it was a retransmission). If the header was not       -->\n"
-    "  <!-- present or if no message has been received, the '[last_*]'       -->\n"
-    "  <!-- keyword is discarded, and all bytes until the end of the line    -->\n"
-    "  <!-- are also discarded.                                              -->\n"
-    "  <!--                                                                  -->\n"
-    "  <!-- If the specified header was present several times in the         -->\n"
-    "  <!-- message, all occurrences are concatenated (CRLF separated)       -->\n"
-    "  <!-- to be used in place of the '[last_*]' keyword.                   -->\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 180 Ringing\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag01[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_Record-Route:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag01[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[media_ip_type] [media_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 0\n"
-    "      a=rtpmap:0 PCMU/8000\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv request=\"ACK\"\n"
-    "        optional=\"true\"\n"
-    "        rtd=\"true\"\n"
-    "        crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv request=\"BYE\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- Keep the call open for a while in case the 200 is lost to be     -->\n"
-    "  <!-- able to retransmit it if we receive the BYE again.               -->\n"
-    "  <timewait milliseconds=\"4000\"/>\n"
-    "\n"
-    "\n"
-    "  <!-- definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"10, 20, 30, 40, 50, 100, 150, 200\"/>\n"
-    "\n"
-    "  <!-- definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"10, 50, 100, 500, 1000, 5000, 10000\"/>\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-
-    /************* Default_scenario[2] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp default 'regexp client' scenario.             -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"Client with regexp scenario\">\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag02[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 INVITE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[media_ip_type] [media_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 0\n"
-    "      a=rtpmap:0 PCMU/8000\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"100\"\n"
-    "        optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"180\" optional=\"true\">\n"
-    "  </recv>\n"
-    "  <recv response=\"183\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"200\" start_rtd=\"true\">\n"
-    "    <!-- Definition of regexp in the action tag. The regexp must follow -->\n"
-    "    <!-- the Posix Extended standard (POSIX 1003.2), see:               -->\n"
-    "    <!--                                                                -->\n"
-    "    <!--   http://www.opengroup.org/onlinepubs/007908799/xbd/re.html    -->\n"
-    "    <!--                                                                -->\n"
-    "    <!-- regexp    : Contain the regexp to use for matching the         -->\n"
-    "    <!--             received message                                   -->\n"
-    "    <!--             MANDATORY                                          -->\n"
-    "    <!-- search_in : msg (try to match against the entire message)      -->\n"
-    "    <!--           : hdr (try to match against a specific SIP header    -->\n"
-    "    <!--             (passed in the header tag)                         -->\n"
-    "    <!--             OPTIONAL - default value : msg                     -->\n"
-    "    <!-- header    : Header to try to match against.                    -->\n"
-    "    <!--             Only used when the search_in tag is set to hdr     -->\n"
-    "    <!--             MANDATORY IF search_in is equal to hdr             -->\n"
-    "    <!-- check_it  : if set to true, the call is marked as failed if    -->\n"
-    "    <!--             the regexp doesn't match.                          -->\n"
-    "    <!--             OPTIONAL - default value : false                   -->\n"
-    "    <!-- assign_to : contain the variable id (integer) or a list of     -->\n"
-    "    <!--             variable id which will be used to store the        -->\n"
-    "    <!--             result of the matching process between the regexp  -->\n"
-    "    <!--             and the message. This variable can be re-used at   -->\n"
-    "    <!--             a later time in the scenario using '[$n]' syntax   -->\n"
-    "    <!--             where n is the variable id.                        -->\n"
-    "    <!--             MANDATORY                                          -->\n"
-    "    <action>\n"
-    "      <ereg regexp=\"[0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[.][0-9]{1,3}[:][0-9]{1,5}\" \n"
-    "            search_in=\"msg\" \n"
-    "            check_it=\"true\" \n"
-    "            assign_to=\"1\"/>\n"
-    "      <ereg regexp=\".*\" \n"
-    "            search_in=\"hdr\" \n"
-    "            header=\"Contact:\" \n"
-    "            check_it=\"true\" \n"
-    "            assign_to=\"6\"/>\n"
-    "      <ereg regexp=\"o=([[:alnum:]]*) ([[:alnum:]]*) ([[:alnum:]]*)\"\n"
-    "            search_in=\"msg\" \n"
-    "            check_it=\"true\" \n"
-    "            assign_to=\"3,4,5,8\"/>\n"
-    "    </action>\n"
-    "  </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag02[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 ACK\n"
-    "      retrievedIp: [$1]\n"
-    "      retrievedContact:[$6]\n"
-    "      retrievedSdpOrigin:[$3]\n"
-    "      retrievedSdpOrigin-username:[$4]\n"
-    "      retrievedSdpOrigin-session-id:[$5]\n"
-    "      retrievedSdpOrigin-version:[$8]\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- This delay can be customized by the -d command-line option       -->\n"
-    "  <!-- or by adding a 'milliseconds = \"value\"' option here.           -->\n"
-    "  <pause milliseconds = \"1000\"/>\n"
-    "\n"
-    "  <!-- The 'crlf' option inserts a blank line in the statistics report. -->\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag02[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 2 BYE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"200\" crlf=\"true\" rtd=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"1000, 1040, 1080, 1120, 1160, 1200\"/>\n"
-    "\n"
-    "  <!-- definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"1000, 1100, 1200, 1300, 1400\"/>\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-
-    /************* Default_scenario[3] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 3PCC - Controller - A side                         -->\n"
-    "<!--                                                                    -->\n"
-    "<!--             A              Controller               B              -->\n"
-    "<!--             |(1) INVITE no SDP  |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(2) 200 offer1     |                   |              -->\n"
-    "<!--             |==================>|                   |              -->\n"
-    "<!--             |                   |(3) INVITE offer1  |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |                   |(4) 200 OK answer1 |              -->\n"
-    "<!--             |                   |<==================|              -->\n"
-    "<!--             |                   |(5) ACK            |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |(6) ACK answer1    |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(7) RTP            |                   |              -->\n"
-    "<!--             |.......................................|              -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"3PCC Controller - A side\">\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag03[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 INVITE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"100\" optional=\"true\"> </recv>\n"
-    "  <recv response=\"180\" optional=\"true\"> </recv>\n"
-    "  <recv response=\"183\" optional=\"true\"> </recv>\n"
-    "  <recv response=\"200\" crlf=\"true\" start_rtd=\"true\">\n"
-    "    <action>\n"
-    "       <ereg regexp=\"Content-Type:.*\" \n"
-    "             search_in=\"msg\"  \n"
-    "             assign_to=\"1\" /> \n"
-    "    </action>\n"
-    "  </recv>\n"
-    "\n"
-    "  <sendCmd>\n"
-    "    <![CDATA[\n"
-    "      Call-ID: [call_id]\n"
-    "      [$1]\n"
-    "\n"
-    "     ]]>\n"
-    "  </sendCmd>\n"
-    "  \n"
-    "  <recvCmd>\n"
-    "    <action>\n"
-    "       <ereg regexp=\"Content-Type:.*\"  \n"
-    "             search_in=\"msg\"  \n"
-    "             assign_to=\"2\" /> \n"
-    "    </action>\n"
-    "  \n"
-    "  </recvCmd>\n"
-    "  \n"
-    "  <send rtd=\"true\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag03[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 ACK\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      [$2]\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <pause milliseconds=\"1000\"/>\n"
-    "\n"
-    "  <!-- The 'crlf' option inserts a blank line in the statistics report. -->\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag03[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 2 BYE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"200\" crlf=\"true\"> </recv>\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-
-    /************* Default_scenario[4] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 3PCC - Controller - B side                         -->\n"
-    "<!--                                                                    -->\n"
-    "<!--             A              Controller               B              -->\n"
-    "<!--             |(1) INVITE no SDP  |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(2) 200 offer1     |                   |              -->\n"
-    "<!--             |==================>|                   |              -->\n"
-    "<!--             |                   |(3) INVITE offer1  |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |                   |(4) 200 OK answer1 |              -->\n"
-    "<!--             |                   |<==================|              -->\n"
-    "<!--             |                   |(5) ACK            |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |(6) ACK answer1    |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(7) RTP            |                   |              -->\n"
-    "<!--             |.......................................|              -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "\n"
-    "<scenario name=\"3PCC Controller - B side\">\n"
-    "\n"
-    "<recvCmd>\n"
-    "  <action>\n"
-    "       <ereg regexp=\"Content-Type:.*\"  \n"
-    "             search_in=\"msg\"  \n"
-    "             assign_to=\"1\" /> \n"
-    "  </action>\n"
-    "</recvCmd>\n"
-    "\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag04[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 INVITE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      [$1]\n"
-    "\n"
-    "     ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"100\" optional=\"true\"> </recv>\n"
-    "  <recv response=\"180\" optional=\"true\"> </recv>\n"
-    "  <recv response=\"183\" optional=\"true\"> </recv>\n"
-    "  <recv response=\"200\" crlf=\"true\">\n"
-    "    <action>\n"
-    "       <ereg regexp=\"Content-Type:.*\"  \n"
-    "             search_in=\"msg\"  \n"
-    "             assign_to=\"2\" /> \n"
-    "    </action>\n"
-    "  </recv>\n"
-    "  \n"
-    "    \n"
-    "  <send start_rtd=\"true\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag04[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 ACK\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <sendCmd>\n"
-    "    <![CDATA[\n"
-    "      Call-ID: [call_id]\n"
-    "      [$2]\n"
-    "\n"
-    "    ]]>\n"
-    "  </sendCmd>\n"
-    " \n"
-    "  <pause milliseconds=\"1000\"/>\n"
-    "\n"
-    "\n"
-    "  <!-- The 'crlf' option inserts a blank line in the statistics report. -->\n"
-    "  <send retrans=\"500\" rtd=\"true\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag04[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 2 BYE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"200\" crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-
-    /************* Default_scenario[5] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 3PCC - A side emulator                             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--             A              Controller               B              -->\n"
-    "<!--             |(1) INVITE no SDP  |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(2) 200 offer1     |                   |              -->\n"
-    "<!--             |==================>|                   |              -->\n"
-    "<!--             |                   |(3) INVITE offer1  |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |                   |(4) 200 OK answer1 |              -->\n"
-    "<!--             |                   |<==================|              -->\n"
-    "<!--             |                   |(5) ACK            |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |(6) ACK answer1    |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(7) RTP            |                   |              -->\n"
-    "<!--             |.......................................|              -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "\n"
-    "<scenario name=\"3PCC A side\">\n"
-    "  <recv request=\"INVITE\" crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag05[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[media_ip_type] [media_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 0\n"
-    "      a=rtpmap:0 PCMU/8000\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv request=\"ACK\" rtd=\"true\" crlf=\"true\"> </recv>\n"
-    "\n"
-    "  <!-- RTP flow starts from here! -->\n"
-    "\n"
-    "  <recv request=\"BYE\" crlf=\"true\"> </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- Keep the call open for a while in case the 200 is lost to be     -->\n"
-    "  <!-- able to retransmit it if we receive the BYE again.               -->\n"
-    "  <timewait milliseconds=\"2000\"/>\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-
-    /************* Default_scenario[6] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 3PCC - B side emulator                             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--             A              Controller               B              -->\n"
-    "<!--             |(1) INVITE no SDP  |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(2) 200 offer1     |                   |              -->\n"
-    "<!--             |==================>|                   |              -->\n"
-    "<!--             |                   |(3) INVITE offer1  |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |                   |(4) 200 OK answer1 |              -->\n"
-    "<!--             |                   |<==================|              -->\n"
-    "<!--             |                   |(5) ACK            |              -->\n"
-    "<!--             |                   |==================>|              -->\n"
-    "<!--             |(6) ACK answer1    |                   |              -->\n"
-    "<!--             |<==================|                   |              -->\n"
-    "<!--             |(7) RTP            |                   |              -->\n"
-    "<!--             |.......................................|              -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "\n"
-    "\n"
-    "<scenario name=\"3PCC B side\">\n"
-    "  <recv request=\"INVITE\" crlf=\"true\"> </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag06[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[media_ip_type] [media_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 0\n"
-    "      a=rtpmap:0 PCMU/8000\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv request=\"ACK\" rtd=\"true\" crlf=\"true\"> </recv>\n"
-    "\n"
-    "  <!-- RTP flow starts from here! -->\n"
-    "\n"
-    "  <recv request=\"BYE\"> </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- Keep the call open for a while in case the 200 is lost to be     -->\n"
-    "  <!-- able to retransmit it if we receive the BYE again.               -->\n"
-    "  <timewait milliseconds=\"2000\"/>\n"
-    "\n"
-    "</scenario>\n",
-
-    /************* Default_scenario[7] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp default 'branchc' scenario.                   -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"branch_client\">\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      REGISTER sip:CA.cym.com SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: ua1 <sip:ua1@nnl.cym:[local_port]>;tag=[pid]SIPpTag07[call_number]\n"
-    "      To: ua1 <sip:ua1@nnl.cym:[local_port]>\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 REGISTER\n"
-    "      Contact: sip:ua1@[local_ip]:[local_port]\n"
-    "      Content-Length: 0\n"
-    "      Expires: 300\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- simple case - just jump over a line   -->\n"
-    "  <recv response=\"200\" rtd=\"true\" next=\"5\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"200\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <label id=\"5\"/>\n"
-    "\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      INVITE sip:ua2@CA.cym.com SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: ua[call_number] <sip:ua1@nnl.cym:[local_port]>;tag=[pid]SIPpTag07b[call_number]\n"
-    "      To: ua2 <sip:ua2@nnl.cym:[remote_port]>\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 INVITE\n"
-    "      Contact: sip:ua1@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[media_ip_type] [media_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 0\n"
-    "      a=rtpmap:0 PCMU/8000\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"100\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"180\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"183\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- Do something different on an optional receive   -->\n"
-    "  <recv response=\"403\" optional=\"true\" next=\"1\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"200\">\n"
-    "    <action>\n"
-    "      <ereg regexp=\"ua25\"\n"
-    "            search_in=\"hdr\"\n"
-    "            header=\"From: \"\n"
-    "            assign_to=\"8\"/>\n"
-    "    </action>\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- set variable 8 above on 25th call, send the ACK but skip the pause for it   -->\n"
-    "  <send next=\"1\" test=\"8\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      ACK sip:ua2@CA.cym.com SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: ua1 <sip:ua1@nnl.cym:[local_port]>;tag=[pid]SIPpTag07b[call_number]\n"
-    "      To: ua2 <sip:ua2@nnl.cym:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 ACK\n"
-    "      Contact: sip:ua1@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <pause milliseconds=\"5000\"/>\n"
-    "\n"
-    "  <label id=\"1\"/>\n"
-    "\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      BYE sip:ua2@CA.cym.com SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: ua1 <sip:ua1@nnl.cym:[local_port]>;tag=[pid]SIPpTag07b[call_number]\n"
-    "      To: ua2 <sip:ua2@nnl.cym:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 2 BYE\n"
-    "      Contact: sip:ua1@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"200\" crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <pause milliseconds=\"4000\"/>\n"
-    "\n"
-    "  <!-- definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"10, 20, 30, 40, 50, 100, 150, 200\"/>\n"
-    "\n"
-    "  <!-- definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"10, 50, 100, 500, 1000, 5000, 10000\"/>\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-
-    /************* Default_scenario[8] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp default 'branchs' scenario.                   -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"branch_server\">\n"
-    "  <recv request=\"REGISTER\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag08[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "      Expires: 300\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- Set variable 3 if the ua is of the form ua2... -->\n"
-    "  <recv request=\"INVITE\" crlf=\"true\">\n"
-    "    <action>\n"
-    "      <ereg regexp=\"ua2\"\n"
-    "            search_in=\"hdr\"\n"
-    "            header=\"From: \"\n"
-    "            assign_to=\"3\"/>\n"
-    "    </action>\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- send 180 then trying if variable 3 is set -->\n"
-    "  <send next=\"1\" test=\"3\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 180 Ringing\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag08b[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- if not, send a 403 error then skip to wait for a BYE -->\n"
-    "  <send next=\"2\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 403 Error\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag08b[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <label id=\"1\"/>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 100 Trying\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag08b[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:];tag=[pid]SIPpTag08b[call_number]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[media_ip_type] [media_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 0\n"
-    "      a=rtpmap:0 PCMU/8000\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv request=\"ACK\"\n"
-    "        optional=\"true\"\n"
-    "        rtd=\"true\"\n"
-    "        crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <label id=\"2\"/>\n"
-    "\n"
-    "  <recv request=\"BYE\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- Keep the call open for a while in case the 200 is lost to be     -->\n"
-    "  <!-- able to retransmit it if we receive the BYE again.               -->\n"
-    "  <timewait milliseconds=\"4000\"/>\n"
-    "\n"
-    "  <!-- Definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"10, 20, 30, 40, 50, 100, 150, 200\"/>\n"
-    "\n"
-    "  <!-- Definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"10, 50, 100, 500, 1000, 5000, 10000\"/>\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-
-    /* Although this scenario will not work without pcap play enabled, there is no
-     * harm in including it in the binary anyway, because the user could have
-     * dumped it and passed it with -sf. */
-
-    /************* Default_scenario[9] ***************/
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp 'uac' scenario with pcap (rtp) play           -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"UAC with media\">\n"
-    "  <!-- In client mode (sipp placing calls), the Call-ID MUST be         -->\n"
-    "  <!-- generated by sipp. To do so, use [call_id] keyword.                -->\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag09[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 INVITE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Type: application/sdp\n"
-    "      Content-Length: [len]\n"
-    "\n"
-    "      v=0\n"
-    "      o=user1 53655765 2353687637 IN IP[local_ip_type] [local_ip]\n"
-    "      s=-\n"
-    "      c=IN IP[local_ip_type] [local_ip]\n"
-    "      t=0 0\n"
-    "      m=audio [media_port] RTP/AVP 8 101\n"
-    "      a=rtpmap:8 PCMA/8000\n"
-    "      a=rtpmap:101 telephone-event/8000\n"
-    "      a=fmtp:101 0-11,16\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"100\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <recv response=\"180\" optional=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- By adding rrs=\"true\" (Record Route Sets), the route sets         -->\n"
-    "  <!-- are saved and used for following messages sent. Useful to test   -->\n"
-    "  <!-- against stateful SIP proxies/B2BUAs.                             -->\n"
-    "  <recv response=\"200\" rtd=\"true\" crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- Packet lost can be simulated in any send/recv message by         -->\n"
-    "  <!-- by adding the 'lost = \"10\"'. Value can be [1-100] percent.       -->\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag09[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 1 ACK\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- Play a pre-recorded PCAP file (RTP stream)                       -->\n"
-    "  <nop>\n"
-    "    <action>\n"
-    "      <exec play_pcap_audio=\"pcap/g711a.pcap\"/>\n"
-    "    </action>\n"
-    "  </nop>\n"
-    "\n"
-    "  <!-- Pause 8 seconds, which is approximately the duration of the      -->\n"
-    "  <!-- PCAP file                                                        -->\n"
-    "  <pause milliseconds=\"8000\"/>\n"
-    "\n"
-    "  <!-- Play an out of band DTMF '1'                                     -->\n"
-    "  <nop>\n"
-    "    <action>\n"
-    "      <exec play_pcap_audio=\"pcap/dtmf_2833_1.pcap\"/>\n"
-    "    </action>\n"
-    "  </nop>\n"
-    "\n"
-    "  <pause milliseconds=\"1000\"/>\n"
-    "\n"
-    "  <!-- The 'crlf' option inserts a blank line in the statistics report. -->\n"
-    "  <send retrans=\"500\">\n"
-    "    <![CDATA[\n"
-    "\n"
-    "      BYE sip:[service]@[remote_ip]:[remote_port] SIP/2.0\n"
-    "      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]\n"
-    "      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag09[call_number]\n"
-    "      To: [service] <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]\n"
-    "      Call-ID: [call_id]\n"
-    "      CSeq: 2 BYE\n"
-    "      Contact: sip:sipp@[local_ip]:[local_port]\n"
-    "      Max-Forwards: 70\n"
-    "      Subject: Performance Test\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <recv response=\"200\" crlf=\"true\">\n"
-    "  </recv>\n"
-    "\n"
-    "  <!-- definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"10, 20, 30, 40, 50, 100, 150, 200\"/>\n"
-    "\n"
-    "  <!-- definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"10, 50, 100, 500, 1000, 5000, 10000\"/>\n"
-    "\n"
-    "</scenario>\n"
-    "\n",
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp default 'uas' scenario.                       -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"Out-of-call UAS\">\n"
-    "  <recv request=\".*\" regexp_match=\"true\" />\n"
-    "\n"
-    "  <send>\n"
-    "    <![CDATA[\n"
-    "      SIP/2.0 200 OK\n"
-    "      [last_Via:]\n"
-    "      [last_From:]\n"
-    "      [last_To:]\n"
-    "      [last_Call-ID:]\n"
-    "      [last_CSeq:]\n"
-    "      Contact: <sip:[local_ip]:[local_port];transport=[transport]>\n"
-    "      Content-Length: 0\n"
-    "\n"
-    "    ]]>\n"
-    "  </send>\n"
-    "\n"
-    "  <!-- Keep the call open for a while in case the 200 is lost to be     -->\n"
-    "  <!-- able to retransmit it if we receive the BYE again.               -->\n"
-    "  <timewait milliseconds=\"4000\"/>\n"
-    "\n"
-    "\n"
-    "  <!-- definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"10, 20, 30, 40, 50, 100, 150, 200\"/>\n"
-    "\n"
-    "  <!-- definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"10, 50, 100, 500, 1000, 5000, 10000\"/>\n"
-    "\n"
-    "</scenario>\n",
-    "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n"
-    "<!DOCTYPE scenario SYSTEM \"sipp.dtd\">\n"
-    "\n"
-    "<!-- This program is free software; you can redistribute it and/or      -->\n"
-    "<!-- modify it under the terms of the GNU General Public License as     -->\n"
-    "<!-- published by the Free Software Foundation; either version 2 of the -->\n"
-    "<!-- License, or (at your option) any later version.                    -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- This program is distributed in the hope that it will be useful,    -->\n"
-    "<!-- but WITHOUT ANY WARRANTY; without even the implied warranty of     -->\n"
-    "<!-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the      -->\n"
-    "<!-- GNU General Public License for more details.                       -->\n"
-    "<!--                                                                    -->\n"
-    "<!-- You should have received a copy of the GNU General Public License  -->\n"
-    "<!-- along with this program; if not, write to the                      -->\n"
-    "<!-- Free Software Foundation, Inc.,                                    -->\n"
-    "<!-- 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA             -->\n"
-    "<!--                                                                    -->\n"
-    "<!--                 Sipp default 'uas' scenario.                       -->\n"
-    "<!--                                                                    -->\n"
-    "\n"
-    "<scenario name=\"Out-of-call UAS\">\n"
-    "  <recv request=\"DUMMY\" />\n"
-    "\n"
-    "  <!-- definition of the response time repartition table (unit is ms)   -->\n"
-    "  <ResponseTimeRepartition value=\"10, 20, 30, 40, 50, 100, 150, 200\"/>\n"
-    "\n"
-    "  <!-- definition of the call length repartition table (unit is ms)     -->\n"
-    "  <CallLengthRepartition value=\"10, 50, 100, 500, 1000, 5000, 10000\"/>\n"
-    "\n"
-    "</scenario>\n",
+// docs/<name>.xml, made into a string literal by CMakeLists.txt, in
+// scenario_table's order.
+const char *default_scenario[] = {
+#include "docs/uac.xml.inc"
+#include "docs/uas.xml.inc"
+#include "docs/regexp.xml.inc"
+#include "docs/3pcc-C-A.xml.inc"
+#include "docs/3pcc-C-B.xml.inc"
+#include "docs/3pcc-A.xml.inc"
+#include "docs/3pcc-B.xml.inc"
+#include "docs/branchc.xml.inc"
+#include "docs/branchs.xml.inc"
+#include "docs/uac_pcap.xml.inc"
+#include "docs/ooc_default.xml.inc"
+#include "docs/ooc_dummy.xml.inc"
 };
+
+#ifdef GTEST
+#include "gtest/gtest.h"
+
+TEST(get_long, decimal_or_hex) {
+    EXPECT_EQ(10, get_long("010", "test"));
+    EXPECT_EQ(-10, get_long("-010", "test"));
+    EXPECT_EQ(16, get_long("0x10", "test"));
+    EXPECT_EQ(8ULL, get_long_long("08", "test"));
+    EXPECT_TRUE(get_bool("08", "test"));
+    EXPECT_FALSE(get_bool("0x0", "test"));
+}
+
+TEST(get_long, refuses_empty_and_garbage) {
+    EXPECT_DEATH(get_long("", "test"), "is not a valid integer");
+    EXPECT_DEATH(get_long("5x", "test"), "is not a valid integer");
+    EXPECT_DEATH(get_long_long("", "test"), "is not a valid integer");
+    EXPECT_DEATH(get_int("4294967296", "test"), "is not a valid integer");
+    EXPECT_DEATH(get_bool("", "test"), "is not a valid boolean");
+    EXPECT_DEATH(get_double("", "test"), "is not a floating point number");
+}
+#endif //GTEST

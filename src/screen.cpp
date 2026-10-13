@@ -30,10 +30,35 @@ int           screen_inited = 0;
 
 ScreenPrinter* sp;
 
-double last_artpstream_rate_out = 0;
-double last_vrtpstream_rate_out = 0;
-double last_artpstream_rate_in = 0;
-double last_vrtpstream_rate_in = 0;
+/* The RTP rates of the last display period, in kB/s, which every screen
+ * drawn until the next one shows. */
+#ifdef PCAPPLAY
+static double last_pcap_rate = 0;
+#endif
+static double last_echo_rate = 0;
+static double last_echo2_rate = 0;
+static double last_artpstream_rate_out = 0;
+static double last_vrtpstream_rate_out = 0;
+static double last_artpstream_rate_in = 0;
+static double last_vrtpstream_rate_in = 0;
+
+void screen_take_rtp_rates()
+{
+    unsigned long ms = clock_tick - last_report_time;
+    if (!ms) {
+        return;
+    }
+#ifdef PCAPPLAY
+    last_pcap_rate = (double)rtp_bytes_pcap.exchange(0, std::memory_order_relaxed) / ms;
+    rtp2_bytes_pcap.store(0, std::memory_order_relaxed);
+#endif
+    last_echo_rate = (double)rtp_bytes.exchange(0, std::memory_order_relaxed) / ms;
+    last_echo2_rate = (double)rtp2_bytes.exchange(0, std::memory_order_relaxed) / ms;
+    last_artpstream_rate_out = (double)rtpstream_abytes_out.exchange(0, std::memory_order_relaxed) / ms;
+    last_vrtpstream_rate_out = (double)rtpstream_vbytes_out.exchange(0, std::memory_order_relaxed) / ms;
+    last_artpstream_rate_in = (double)rtpstream_abytes_in.exchange(0, std::memory_order_relaxed) / ms;
+    last_vrtpstream_rate_in = (double)rtpstream_vbytes_in.exchange(0, std::memory_order_relaxed) / ms;
+}
 
 /* ERR is actually -1, but this prevents us from needing to use curses.h in
  * sipp.cpp. */
@@ -94,14 +119,14 @@ static bool display_server()
 void ScreenPrinter::print_closing_stats() {
     M_last = true;
     get_lines();
-    for (auto line : lines) {
+    for (const auto& line : lines) {
         printf("%s\n", line.c_str());
     }
 
     if (currentScreenToDisplay != DISPLAY_STAT_SCREEN) {
         currentScreenToDisplay = DISPLAY_STAT_SCREEN;
         get_lines();
-        for (auto line : lines) {
+        for (const auto& line : lines) {
             printf("%s\n", line.c_str());
         }
     }
@@ -111,13 +136,13 @@ void ScreenPrinter::print_closing_stats() {
 void ScreenPrinter::print_to_file(FILE* f)
 {
     get_lines();
-    for (auto line : lines) {
+    for (const auto& line : lines) {
         fprintf(f, "%s\n", line.c_str());
     }
 }
 
 extern int command_mode;
-extern char* command_buffer;
+extern std::string command_buffer;
 
 
 void ScreenPrinter::redraw()
@@ -125,12 +150,12 @@ void ScreenPrinter::redraw()
     if (!M_headless) {
         get_lines();
         erase();
-        for (auto line : lines) {
+        for (const auto& line : lines) {
             printw("%s\n", line.c_str());
         }
 
         if (command_mode) {
-            printw("\nCommand: %s", command_buffer ? command_buffer : "");
+            printw("\nCommand: %s", command_buffer.c_str());
         }
 
         refresh();
@@ -178,14 +203,10 @@ void ScreenPrinter::get_lines()
     unsigned const bufsiz = 80;
     char buf[bufsiz];
     if (!M_last && screen_last_error[0]) {
-      char* errstart = screen_last_error;
-      int colonsleft = 3; /* We want to skip the time. */
-      while (*errstart && colonsleft) {
-        if (*errstart == ':') {
-          colonsleft--;
-        }
-        errstart++;
-      }
+      /* Past the time, which ends with the first ": ". Counting its
+       * colons fails with -rfc3339, whose offset may have one. */
+      char* errstart = strstr(screen_last_error, ": ");
+      errstart = errstart ? errstart + 2 : screen_last_error;
       while (isspace(*errstart)) {
         errstart++;
       }
@@ -304,21 +325,16 @@ void ScreenPrinter::draw_scenario_screen()
         if (users >= 0) {
             lines.push_back("  Users (length)   Port   Total-time  "
                             "Total-calls  Remote-host");
-            snprintf(buf, bufsiz,
-                     "  %d (%d ms)   %-5d %6lu.%02lu s     %8llu  %.20s:%d(%s)",
-                     users, duration, local_port, clock_tick / 1000,
-                     (clock_tick % 1000) / 10, total_calls, remote_ip,
+            snprintf(buf, bufsiz, "  %d (%d ms)   %-5d %6lu.%02lu s     %8llu  %.20s:%d(%s)", users, duration,
+                     local_port, clock_tick / 1000, (clock_tick % 1000) / 10, total_calls, remote_ip.c_str(),
                      remote_port, TRANSPORT_TO_STRING(transport));
             lines.push_back(buf);
         } else {
             lines.push_back("  Call rate (length)   Port   Total-time  "
                             "Total-calls  Remote-host");
-            snprintf(
-                buf, bufsiz,
-                "  %3.1f(%d ms)/%5.3fs   %-5d %6lu.%02lu s     %8llu  %.20s:%d(%s)",
-                rate, duration, (double)rate_period_ms / 1000.0, local_port,
-                clock_tick / 1000, (clock_tick % 1000) / 10, total_calls,
-                remote_ip, remote_port, TRANSPORT_TO_STRING(transport));
+            snprintf(buf, bufsiz, "  %3.1f(%d ms)/%5.3fs   %-5d %6lu.%02lu s     %8llu  %.20s:%d(%s)", rate, duration,
+                     (double)rate_period_ms / 1000.0, local_port, clock_tick / 1000, (clock_tick % 1000) / 10,
+                     total_calls, remote_ip.c_str(), remote_port, TRANSPORT_TO_STRING(transport));
             lines.push_back(buf);
         }
     }
@@ -335,7 +351,7 @@ void ScreenPrinter::draw_scenario_screen()
     } else {
         snprintf(left_buf_long, 60,
                  "Call limit %lu hit, %0.1f s period ", stop_after,
-                 (double)ms_since_last_tick / 100.0);
+                 (double)ms_since_last_tick / 1000.0);
     }
     snprintf(right_buf, 40, "%lu ms scheduler resolution",
              ms_since_last_tick / std::max(scheduling_loops, 1ul));
@@ -391,55 +407,22 @@ void ScreenPrinter::draw_scenario_screen()
     /* if has media abilities */
     if (hasMedia != 5) {
         snprintf(left_buf, 40, "%lu Total RTP pckts sent ",
-                rtp_pckts_pcap);
-        if (ms_since_last_tick) {
-            snprintf(buf, bufsiz, "  %-38s  %lu.%03lu last period RTP rate (kB/s)",
-                    left_buf,
-                    rtp_bytes_pcap / ms_since_last_tick,
-                    rtp_bytes_pcap % ms_since_last_tick);
-        }
-        rtp_bytes_pcap = 0;
-        rtp2_bytes_pcap = 0;
+                rtp_pckts_pcap.load(std::memory_order_relaxed));
+        snprintf(buf, bufsiz, "  %-38s  %.3f last period RTP rate (kB/s)",
+                left_buf, last_pcap_rate);
         lines.push_back(buf);
     }
 #endif
     /* if we have rtp stream thread running */
     if (rtpstream_numthreads) {
-        unsigned long TempABytes;
-        unsigned long TempVBytes;
-        if (ms_since_last_tick) {
-            TempABytes= rtpstream_abytes_out;
-            TempVBytes= rtpstream_vbytes_out;
-            /* Calculate integer and fraction parts of rtp bandwidth; this value
-             * will be saved and reused in the case where last_tick==last_report_time
-             */
-            last_artpstream_rate_out= ((double)TempABytes)/ ms_since_last_tick;
-            last_vrtpstream_rate_out= ((double)TempVBytes)/ ms_since_last_tick;
-            /* Potential race condition between multiple threads updating the
-             * rtpstream_bytes value. We subtract the saved TempBytes value
-             * rather than setting it to zero to minimise the chances of missing
-             * an update to rtpstream_bytes [update between printing stats and
-             * zeroing the counter]. Ideally we would atomically subtract
-             * TempBytes from rtpstream_bytes.
-             */
-            rtpstream_abytes_out -= TempABytes;
-            rtpstream_vbytes_out -= TempVBytes;
-            TempABytes= rtpstream_abytes_in;
-            TempVBytes= rtpstream_vbytes_in;
-            last_artpstream_rate_in= ((double)TempABytes)/ ms_since_last_tick;
-            last_vrtpstream_rate_in= ((double)TempVBytes)/ ms_since_last_tick;
-            rtpstream_abytes_in -= TempABytes;
-            rtpstream_vbytes_in -= TempVBytes;
-        }
-
-        snprintf(left_buf, 40, "%lu Total AUDIO RTP pckts sent", rtpstream_apckts);
+        snprintf(left_buf, 40, "%lu Total AUDIO RTP pckts sent", rtpstream_apckts.load(std::memory_order_relaxed));
         snprintf(buf, bufsiz, "  %-38s  %.3f kB/s AUDIO RTP OUT", left_buf, last_artpstream_rate_out);
         lines.push_back(buf);
-        snprintf(left_buf, 40, "%lu Total VIDEO RTP pckts sent", rtpstream_vpckts);
+        snprintf(left_buf, 40, "%lu Total VIDEO RTP pckts sent", rtpstream_vpckts.load(std::memory_order_relaxed));
         snprintf(buf, bufsiz, "  %-38s  %.3f KB/s VIDEO RTP OUT", left_buf, last_vrtpstream_rate_out);
         lines.push_back(buf);
 
-        snprintf(left_buf, 40, "%lu RTP sending threads active", rtpstream_numthreads);
+        snprintf(left_buf, 40, "%lu RTP sending threads active", rtpstream_numthreads.load());
         snprintf(buf, bufsiz, "  %-38s  %.3f kB/s AUDIO RTP IN", left_buf, last_artpstream_rate_in);
         lines.push_back(buf);
         snprintf(buf, bufsiz, "  %-38s  %.3f KB/s VIDEO RTP IN", left_buf, last_vrtpstream_rate_in);
@@ -449,27 +432,16 @@ void ScreenPrinter::draw_scenario_screen()
     /* 5th line, RTP echo statistics */
     if (rtp_echo_enabled && media_socket_audio > 0) {
         snprintf(left_buf, 40, "%lu Total echo RTP pckts 1st stream",
-                rtp_pckts);
-
-        if (ms_since_last_tick) {
-            snprintf(buf, bufsiz, "  %-38s  %lu.%03lu last period RTP rate (kB/s)",
-                    left_buf,
-                    rtp_bytes / ms_since_last_tick,
-                    rtp_bytes % ms_since_last_tick);
-            lines.push_back(buf);
-        }
+                rtp_pckts.load(std::memory_order_relaxed));
+        snprintf(buf, bufsiz, "  %-38s  %.3f last period RTP rate (kB/s)",
+                left_buf, last_echo_rate);
+        lines.push_back(buf);
 
         snprintf(left_buf, 40, "%lu Total echo RTP pckts 2nd stream",
-                rtp2_pckts);
-        if (ms_since_last_tick) {
-            snprintf(buf, bufsiz, "  %-38s  %lu.%03lu last period RTP rate (kB/s)",
-                    left_buf,
-                    rtp2_bytes / ms_since_last_tick,
-                    rtp2_bytes % ms_since_last_tick);
-            lines.push_back(buf);
-        }
-        rtp_bytes = 0;
-        rtp2_bytes = 0;
+                rtp2_pckts.load(std::memory_order_relaxed));
+        snprintf(buf, bufsiz, "  %-38s  %.3f last period RTP rate (kB/s)",
+                left_buf, last_echo2_rate);
+        lines.push_back(buf);
     }
 
     /* Scenario counters */
@@ -516,12 +488,12 @@ void ScreenPrinter::draw_scenario_screen()
                 }
             }
 
-            if (curmsg->start_rtd) {
+            if (!curmsg->start_rtd.empty()) {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, " B-RTD%d ",
-                                    curmsg->start_rtd);
-            } else if (curmsg->stop_rtd) {
+                                    curmsg->start_rtd[0]);
+            } else if (!curmsg->stop_rtd.empty()) {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, " E-RTD%d ",
-                                    curmsg->stop_rtd);
+                                    curmsg->stop_rtd[0]);
             } else {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, "        ");
             }
@@ -545,19 +517,19 @@ void ScreenPrinter::draw_scenario_screen()
             }
         } else if (curmsg->recv_response) {
             if (display_server()) {
-                buf_len += snprintf(buf + buf_len, bufsiz - buf_len,
-                                    "  ----------> %-10s ", curmsg->recv_response);
+                buf_len +=
+                    snprintf(buf + buf_len, bufsiz - buf_len, "  ----------> %-10s ", curmsg->recv_response->c_str());
             } else {
-                buf_len += snprintf(buf + buf_len, bufsiz - buf_len,
-                                    "  %10s <---------- ", curmsg->recv_response);
+                buf_len +=
+                    snprintf(buf + buf_len, bufsiz - buf_len, "  %10s <---------- ", curmsg->recv_response->c_str());
             }
 
-            if (curmsg->start_rtd) {
+            if (!curmsg->start_rtd.empty()) {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, " B-RTD%d ",
-                                    curmsg->start_rtd);
-            } else if (curmsg->stop_rtd) {
+                                    curmsg->start_rtd[0]);
+            } else if (!curmsg->stop_rtd.empty()) {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, " E-RTD%d ",
-                                    curmsg->stop_rtd);
+                                    curmsg->stop_rtd[0]);
             } else {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, "        ");
             }
@@ -571,9 +543,8 @@ void ScreenPrinter::draw_scenario_screen()
                                     : "");
         } else if (curmsg->pause_distribution ||
                    (curmsg->pause_variable != -1)) {
-            char* desc = curmsg->pause_desc;
-            if (!desc) {
-                desc = (char*)malloc(24);
+            if (curmsg->pause_desc.empty()) {
+                char desc[24];
                 if (curmsg->pause_distribution) {
                     desc[0] = '\0';
                     curmsg->pause_distribution->timeDescr(desc, 23);
@@ -585,7 +556,8 @@ void ScreenPrinter::draw_scenario_screen()
                 desc[23] = '\0';
                 curmsg->pause_desc = desc;
             }
-            int len = strlen(desc) < 9 ? 9 : strlen(desc);
+            const char *desc = curmsg->pause_desc.c_str();
+            int len = curmsg->pause_desc.size() < 9 ? 9 : curmsg->pause_desc.size();
 
             if (display_server()) {
                 snprintf(left_buf, 40, "  [%9s] Pause%*s", desc,
@@ -602,20 +574,18 @@ void ScreenPrinter::draw_scenario_screen()
         } else if (curmsg->recv_request) {
             if (display_server()) {
                 buf_len +=
-                    snprintf(buf + buf_len, bufsiz - buf_len,
-                             "  ----------> %-10s ", curmsg->recv_request);
+                    snprintf(buf + buf_len, bufsiz - buf_len, "  ----------> %-10s ", curmsg->recv_request->c_str());
             } else {
                 buf_len +=
-                    snprintf(buf + buf_len, bufsiz - buf_len, "  %10s <---------- ",
-                             curmsg->recv_request);
+                    snprintf(buf + buf_len, bufsiz - buf_len, "  %10s <---------- ", curmsg->recv_request->c_str());
             }
 
-            if (curmsg->start_rtd) {
+            if (!curmsg->start_rtd.empty()) {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, " B-RTD%d ",
-                                    curmsg->start_rtd);
-            } else if (curmsg->stop_rtd) {
+                                    curmsg->start_rtd[0]);
+            } else if (!curmsg->stop_rtd.empty()) {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, " E-RTD%d ",
-                                    curmsg->stop_rtd);
+                                    curmsg->stop_rtd[0]);
             } else {
                 buf_len += snprintf(buf + buf_len, bufsiz - buf_len, "        ");
             }
@@ -629,7 +599,7 @@ void ScreenPrinter::draw_scenario_screen()
                                     : "");
         } else if (curmsg->M_type == MSG_TYPE_NOP) {
             if (curmsg->display_str) {
-                snprintf(buf, bufsiz, " %s", curmsg->display_str);
+                snprintf(buf, bufsiz, " %s", curmsg->display_str->c_str());
             } else {
                 snprintf(buf, bufsiz, "              [ NOP ]              ");
             }
@@ -738,8 +708,8 @@ void ScreenPrinter::draw_stats_screen()
     DISPLAY_CROSS_LINE();
 
     DISPLAY_TXT_COL ("Elapsed Time",
-                     s->msToHHMMSSus(localElapsedTime),
-                     s->msToHHMMSSus(globalElapsedTime));
+                     s->msToHHMMSSus(localElapsedTime).c_str(),
+                     s->msToHHMMSSus(globalElapsedTime).c_str());
 
     DISPLAY_VAL_RATEF_COL ("Call Rate",  realInstantCallRate, averageCallRate);
     DISPLAY_CROSS_LINE ();
@@ -759,11 +729,10 @@ void ScreenPrinter::draw_stats_screen()
         DISPLAY_CROSS_LINE ();
     }
     for (unsigned int i = 1; i < s->M_genericMap.size() + 1; i++) {
-        char *disp = (char *)malloc(20 + s->M_genericDisplay[i].size());
-        sprintf(disp, "Counter %s", s->M_genericDisplay[i].c_str());
+        std::string disp = "Counter " + s->M_genericDisplay[i];
 
-        DISPLAY_2VAL(disp, s->M_genericCounters[(i - 1)* GENERIC_TYPES + GENERIC_PD], s->M_genericCounters[(i - 1) * GENERIC_TYPES + GENERIC_C]);
-        free(disp);
+        DISPLAY_2VAL(disp.c_str(), s->M_genericCounters[(i - 1) * GENERIC_TYPES + GENERIC_PD],
+                     s->M_genericCounters[(i - 1) * GENERIC_TYPES + GENERIC_C]);
     }
 
     DISPLAY_CROSS_LINE ();
@@ -780,12 +749,12 @@ void ScreenPrinter::draw_stats_screen()
 
         snprintf(buf2, 80, "Response Time %s", s->M_revRtdMap[i].c_str());
         DISPLAY_TXT_COL (buf2,
-                         s->msToHHMMSSus( (unsigned long)s->computeRtdMean(i, GENERIC_PD)),
-                         s->msToHHMMSSus( (unsigned long)s->computeRtdMean(i, GENERIC_C)));
+                         s->msToHHMMSSus( (unsigned long)s->computeRtdMean(i, GENERIC_PD)).c_str(),
+                         s->msToHHMMSSus( (unsigned long)s->computeRtdMean(i, GENERIC_C)).c_str());
     }
     DISPLAY_TXT_COL ("Call Length",
-                     s->msToHHMMSSus( (unsigned long)s->computeMean(s->CPT_PD_AverageCallLength_Sum, s->CPT_PD_NbOfCallUsedForAverageCallLength ) ),
-                     s->msToHHMMSSus( (unsigned long)s->computeMean(s->CPT_C_AverageCallLength_Sum, s->CPT_C_NbOfCallUsedForAverageCallLength) ));
+                     s->msToHHMMSSus( (unsigned long)s->computeMean(s->CPT_PD_AverageCallLength_Sum, s->CPT_PD_NbOfCallUsedForAverageCallLength ) ).c_str(),
+                     s->msToHHMMSSus( (unsigned long)s->computeMean(s->CPT_C_AverageCallLength_Sum, s->CPT_C_NbOfCallUsedForAverageCallLength) ).c_str());
 }
 
 void ScreenPrinter::draw_repartition_screen(int which)
@@ -884,8 +853,9 @@ void ScreenPrinter::draw_vars_screen()
     }
 
     lines.push_back("");
-    for (unsigned int i = 0;
-         i < (display_scenario->messages.size() + 6 - lines.size()); i++) {
+    /* To messages + 6 lines. Past them, an unsigned difference would
+     * wrap and push lines until memory runs out. */
+    while (lines.size() < display_scenario->messages.size() + 6) {
       lines.push_back("");
     }
 }
@@ -919,9 +889,8 @@ void ScreenPrinter::draw_tdm_screen()
     snprintf(buf, bufsiz, "%d/%d circuits (%d%%) in use", in_use, total_circuits,
            int(100 * in_use / total_circuits));
     lines.push_back(buf);
-    for (unsigned int i = 0;
-         i < (display_scenario->messages.size() + 8 - height);
-         i++) {
+    for (size_t row = height; row < display_scenario->messages.size() + 8;
+         row++) {
         lines.push_back("");
     }
 }

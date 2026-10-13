@@ -13,8 +13,10 @@ Create your own XML scenarios
    ownscenarios
    keywords
    actions
+   lua
    variables
    inject_from_csv
    cond_branching
    sipauth
    init_stanza
+   include

@@ -43,7 +43,6 @@ static const char* strIntCmd(CAction::T_IntCmdType type)
     case CAction::E_INTCMD_INVALID:
         return "invalid";
     }
-    return "invalid";
 }
 
 const char * CAction::comparatorToString(T_Comparator comp)
@@ -94,32 +93,28 @@ void CAction::printInfo(char* buf, int len)
 {
     if (M_action == E_AT_ASSIGN_FROM_REGEXP) {
         if (M_lookingPlace == E_LP_MSG) {
-            snprintf(buf, len, "Type[%d] - regexp[%s] where[%s] - checkIt[%d] - checkItInverse[%d] - $%s",
-                   M_action,
-                   M_regularExpression,
-                   "Full Msg",
-                   M_checkIt,
-                   M_checkItInverse,
-                   display_scenario->allocVars->getName(M_varId));
+            snprintf(buf, len, "Type[%d] - regexp[%s] where[%s] - checkIt[%d] - checkItInverse[%d] - $%s", M_action,
+                     M_regularExpression.c_str(), "Full Msg", M_checkIt, M_checkItInverse,
+                     display_scenario->allocVars->getName(M_varId));
         } else {
-            snprintf(buf, len, "Type[%d] - regexp[%s] where[%s-%s] - checkIt[%d] - checkItInverse[%d] - $%s",
-                   M_action,
-                   M_regularExpression,
-                   "Header",
-                   M_lookingChar,
-                   M_checkIt,
-                   M_checkItInverse, display_scenario->allocVars->getName(M_varId));
+            snprintf(buf, len, "Type[%d] - regexp[%s] where[%s-%s] - checkIt[%d] - checkItInverse[%d] - $%s", M_action,
+                     M_regularExpression.c_str(), "Header", M_lookingChar.c_str(), M_checkIt, M_checkItInverse,
+                     display_scenario->allocVars->getName(M_varId));
         }
     } else if (M_action == E_AT_EXECUTE_CMD) {
-        snprintf(buf, len, "Type[%d] - command[%-32.32s]", M_action, M_message_str[0]);
+        snprintf(buf, len, "Type[%d] - command[%-32.32s]", M_action, M_message_str[0].c_str());
+    } else if (M_action == E_AT_EXEC_LUA) {
+        snprintf(buf, len, "Type[%d] - lua[%-32.32s]", M_action, M_message_str[0].c_str());
+    } else if (M_action == E_AT_VERIFY_CMD) {
+        snprintf(buf, len, "Type[%d] - verify[%-32.32s]", M_action, M_message_str[0].c_str());
     } else if (M_action == E_AT_EXEC_INTCMD) {
         snprintf(buf, len, "Type[%d] - intcmd[%-32.32s]", M_action, strIntCmd(M_IntCmd));
     } else if (M_action == E_AT_LOG_TO_FILE) {
-        snprintf(buf, len, "Type[%d] - message[%-32.32s]", M_action, M_message_str[0]);
+        snprintf(buf, len, "Type[%d] - message[%-32.32s]", M_action, M_message_str[0].c_str());
     } else if (M_action == E_AT_LOG_WARNING) {
-        snprintf(buf, len, "Type[%d] - warning[%-32.32s]", M_action, M_message_str[0]);
+        snprintf(buf, len, "Type[%d] - warning[%-32.32s]", M_action, M_message_str[0].c_str());
     } else if (M_action == E_AT_LOG_ERROR) {
-        snprintf(buf, len, "Type[%d] - error[%-32.32s]", M_action, M_message_str[0]);
+        snprintf(buf, len, "Type[%d] - error[%-32.32s]", M_action, M_message_str[0].c_str());
     } else if (M_action == E_AT_ASSIGN_FROM_SAMPLE) {
         char tmp[40];
         M_distribution->textDescr(tmp, sizeof(tmp));
@@ -131,13 +126,16 @@ void CAction::printInfo(char* buf, int len)
     } else if (M_action == E_AT_ASSIGN_FROM_GETTIMEOFDAY) {
         snprintf(buf, len, "Type[%d] - assign gettimeofday[%s, %s]", M_action, display_scenario->allocVars->getName(M_varId), display_scenario->allocVars->getName(M_subVarId[0]));
     } else if (M_action == E_AT_ASSIGN_FROM_STRING) {
-        snprintf(buf, len, "Type[%d] - string assign varId[%s] [%-32.32s]", M_action, display_scenario->allocVars->getName(M_varId), M_message_str[0]);
+        snprintf(buf, len, "Type[%d] - string assign varId[%s] [%-32.32s]", M_action,
+                 display_scenario->allocVars->getName(M_varId), M_message_str[0].c_str());
     } else if (M_action == E_AT_JUMP) {
         snprintf(buf, len, "Type[%d] - jump varInId[%s] %lf", M_action, display_scenario->allocVars->getName(M_varInId), M_doubleValue);
     } else if (M_action == E_AT_PAUSE_RESTORE) {
         snprintf(buf, len, "Type[%d] - restore pause varInId[%s] %lf", M_action, display_scenario->allocVars->getName(M_varInId), M_doubleValue);
     } else if (M_action == E_AT_VAR_ADD) {
         snprintf(buf, len, "Type[%d] - add varId[%s] %lf", M_action, display_scenario->allocVars->getName(M_varId), M_doubleValue);
+    } else if (M_action == E_AT_VAR_SUBTRACT) {
+        snprintf(buf, len, "Type[%d] - subtract varId[%s] %lf", M_action, display_scenario->allocVars->getName(M_varId), M_doubleValue);
     } else if (M_action == E_AT_VAR_MULTIPLY) {
         snprintf(buf, len, "Type[%d] - multiply varId[%s] %lf", M_action, display_scenario->allocVars->getName(M_varId), M_doubleValue);
     } else if (M_action == E_AT_VAR_DIVIDE) {
@@ -149,14 +147,15 @@ void CAction::printInfo(char* buf, int len)
     } else if (M_action == E_AT_VAR_URLENCODE) {
         snprintf(buf, len, "Type[%d] - urlencode varId[%s]", M_action, display_scenario->allocVars->getName(M_varId));
     } else if (M_action == E_AT_VAR_TEST) {
-        snprintf(buf, len, "Type[%d] - divide varId[%s] varInId[%s] %s %lf", M_action, display_scenario->allocVars->getName(M_varId), display_scenario->allocVars->getName(M_varInId), comparatorToString(M_comp), M_doubleValue);
+        snprintf(buf, len, "Type[%d] - test varId[%s] varInId[%s] %s %lf", M_action, display_scenario->allocVars->getName(M_varId), display_scenario->allocVars->getName(M_varInId), comparatorToString(M_comp), M_doubleValue);
     } else if (M_action == E_AT_VAR_TO_DOUBLE) {
         snprintf(buf, len, "Type[%d] - toDouble varId[%s]", M_action, display_scenario->allocVars->getName(M_varId));
 #ifdef PCAPPLAY
-    } else if ((M_action == E_AT_PLAY_PCAP_AUDIO) || (M_action == E_AT_PLAY_PCAP_IMAGE) || (M_action == E_AT_PLAY_PCAP_VIDEO)) {
+    } else if ((M_action == E_AT_PLAY_PCAP_AUDIO) || (M_action == E_AT_PLAY_PCAP_IMAGE) ||
+               (M_action == E_AT_PLAY_PCAP_VIDEO) || (M_action == E_AT_PLAY_PCAP_TEXT)) {
         snprintf(buf, len, "Type[%d] - file[%s]", M_action, M_pcapArgs->file);
     } else if (M_action == E_AT_PLAY_DTMF) {
-        snprintf(buf, len, "Type[%d] - play DTMF digits [%s]", M_action, M_message_str[0]);
+        snprintf(buf, len, "Type[%d] - play DTMF digits [%s]", M_action, M_message_str[0].c_str());
 #endif
     } else if (M_action == E_AT_RTP_STREAM_PLAY) {
         snprintf(buf,
@@ -174,6 +173,14 @@ void CAction::printInfo(char* buf, int len)
         snprintf(buf, len, "Type[%d] - rtp_stream pause", M_action);
     } else if (M_action == E_AT_RTP_STREAM_RESUME) {
         snprintf(buf, len, "Type[%d] - rtp_stream resume", M_action);
+    } else if (M_action == E_AT_RTP_STREAM_WAIT) {
+        snprintf(buf, len, "Type[%d] - rtp_stream wait [timeout=%.0f]", M_action, M_doubleValue);
+    } else if (M_action == E_AT_RTP_STATS) {
+        snprintf(buf, len, "Type[%d] - rtp_stats %s [%s]", M_action, M_doubleValue ? "video" : "audio",
+                 display_scenario->allocVars->getName(M_varId));
+    } else if (M_action == E_AT_RTP_DTMF) {
+        snprintf(buf, len, "Type[%d] - rtp_dtmf payload type %.0f [%s]", M_action, M_doubleValue,
+                 display_scenario->allocVars->getName(M_varId));
     } else if (M_action == E_AT_RTP_STREAM_PLAYAPATTERN) {
         snprintf(buf,
                  len,
@@ -273,9 +280,9 @@ int            CAction::getVarIn2Id()
 {
     return(M_varIn2Id);
 }
-char*          CAction::getLookingChar()
+const char *CAction::getLookingChar()
 {
-    return(M_lookingChar);
+    return M_lookingChar.c_str();
 }
 SendingMessage *CAction::getMessage(int n)
 {
@@ -289,9 +296,9 @@ double         CAction::getDoubleValue()
 {
     return(M_doubleValue);
 }
-char*          CAction::getStringValue()
+const char *CAction::getStringValue()
 {
-    return(M_stringValue);
+    return M_stringValue.c_str();
 }
 #ifdef PCAPPLAY
 pcap_pkts *CAction::getPcapPkts()
@@ -370,9 +377,9 @@ void CAction::setDoubleValue (double P_value)
 }
 
 /* strcmp specific function. */
-void CAction::setStringValue (char *P_value)
+void CAction::setStringValue(const std::string &P_value)
 {
-    M_stringValue       = P_value;
+    M_stringValue = P_value;
 }
 
 void CAction::setSubVarId (int    P_value)
@@ -409,56 +416,39 @@ int  CAction::getNbSubVarId ()
 }
 
 
-void CAction::setLookingChar(const char* P_value)
+void CAction::setLookingChar(const std::string &P_value)
 {
-    if (M_lookingChar != nullptr) {
-        delete [] M_lookingChar;
-        M_lookingChar = nullptr;
-    }
-
-    if (P_value != nullptr) {
-        M_lookingChar = new char[strlen(P_value)+1];
-        strcpy(M_lookingChar, P_value);
-    }
+    M_lookingChar = P_value;
 }
 
-void CAction::setMessage(const char* P_value, int n)
+void CAction::setMessage(const std::string &P_value, int n)
 {
-    if (M_message[n] != nullptr) {
-        delete M_message[n];
-        M_message[n] = nullptr;
-    }
-    free(M_message_str[n]);
-    M_message_str[n] = nullptr;
-
-    if (P_value != nullptr) {
-        M_message_str[n] = strdup(P_value);
-        M_message[n] = new SendingMessage(M_scenario, P_value, true /* skip sanity */);
-    }
+    delete M_message[n];
+    M_message_str[n] = P_value;
+    M_message[n] = new SendingMessage(M_scenario, P_value.c_str(), true /* skip sanity */);
 }
 
-void CAction::setRegExp(const char *P_value)
+void CAction::setRegExp(const std::string &P_value)
 {
     int errorCode;
 
-    free(M_regularExpression);
-    M_regularExpression = strdup(P_value);
+    M_regularExpression = P_value;
     M_regExpSet = true;
 
-    errorCode = regcomp(&M_internalRegExp, P_value, REGCOMP_PARAMS);
+    errorCode = regcomp(&M_internalRegExp, P_value.c_str(), REGCOMP_PARAMS);
     if (errorCode != 0) {
         char buffer[MAX_HEADER_LEN];
         regerror(errorCode, &M_internalRegExp, buffer, sizeof(buffer));
-        ERROR("recomp error : regular expression '%s' - error '%s'", M_regularExpression, buffer);
+        ERROR("recomp error : regular expression '%s' - error '%s'", M_regularExpression.c_str(), buffer);
     }
 }
 
-char *CAction::getRegularExpression()
+const char *CAction::getRegularExpression()
 {
     if (!M_regExpSet) {
         ERROR("Trying to get a regular expression for an action that does not have one!");
     }
-    return M_regularExpression;
+    return M_regularExpression.c_str();
 }
 
 int CAction::executeRegExp(const char* P_string, VariableTable *P_callVarTable)
@@ -466,7 +456,6 @@ int CAction::executeRegExp(const char* P_string, VariableTable *P_callVarTable)
     regmatch_t pmatch[10];
     int error;
     int nbOfMatch = 0;
-    char* result = nullptr ;
 
     if (!M_regExpSet) {
         ERROR("Trying to perform regular expression match on action that does not have one!");
@@ -484,8 +473,8 @@ int CAction::executeRegExp(const char* P_string, VariableTable *P_callVarTable)
 
         for (int i = 0; i <= getNbSubVarId(); i++) {
             if (pmatch[i].rm_eo != -1) {
-                setSubString(&result, P_string, pmatch[i].rm_so, pmatch[i].rm_eo);
-                L_callVar->setMatchingValue(result);
+                L_callVar->setMatchingValue(
+                    std::string_view(P_string + pmatch[i].rm_so, pmatch[i].rm_eo - pmatch[i].rm_so));
                 nbOfMatch++;
             }
             if (i == getNbSubVarId()) {
@@ -496,25 +485,6 @@ int CAction::executeRegExp(const char* P_string, VariableTable *P_callVarTable)
     }
     return(nbOfMatch);
 }
-
-void CAction::setSubString(char** P_target, const char* P_source, int P_start, int P_stop)
-{
-    int sizeOf;
-
-    if (P_source != nullptr) {
-        sizeOf = P_stop - P_start;
-        (*P_target) = new char[sizeOf + 1];
-
-        if (sizeOf > 0) {
-            memcpy((*P_target), &(P_source[P_start]), sizeOf);
-        }
-
-        (*P_target)[sizeOf] = '\0';
-    } else {
-        *P_target = nullptr ;
-    }
-}
-
 
 #ifdef PCAPPLAY
 void CAction::setPcapArgs (pcap_pkts  *  P_value)
@@ -555,8 +525,8 @@ void CAction::setRTPEchoActInfo(const char* P_value)
     char* next_comma;
     char actionstring[RTPECHO_MAX_FILENAMELEN];
 
-    if (strlen(P_value) >= 512) {
-        ERROR("RTPEcho keyword %s is too long -- maximum supported length %u\n", P_value, 512);
+    if (strlen(P_value) >= sizeof(actionstring)) {
+        ERROR("RTPEcho keyword %s is too long -- maximum supported length %zu\n", P_value, sizeof(actionstring) - 1);
     }
 
     memset(actionstring, 0, sizeof(actionstring));
@@ -568,7 +538,7 @@ void CAction::setRTPEchoActInfo(const char* P_value)
     M_rtpecho_actinfo.audio_active = 0;
     M_rtpecho_actinfo.video_active = 0;
 
-    strcpy (actionstring,P_value);
+    snprintf(actionstring, sizeof(actionstring), "%s", P_value);
     param_str = strchr(actionstring,',');
     next_comma = nullptr;
 
@@ -581,7 +551,7 @@ void CAction::setRTPEchoActInfo(const char* P_value)
         if (next_comma) {
             *(next_comma++) = 0;
         }
-        M_rtpecho_actinfo.payload_type = atoi(param_str);
+        M_rtpecho_actinfo.payload_type = get_int(param_str, "rtp_echo payload type");
         param_str = next_comma;
     }
 
@@ -592,7 +562,7 @@ void CAction::setRTPEchoActInfo(const char* P_value)
         if (next_comma) {
             *(next_comma++) = 0;
         }
-        strcpy(M_rtpecho_actinfo.payload_name, param_str);
+        snprintf(M_rtpecho_actinfo.payload_name, sizeof(M_rtpecho_actinfo.payload_name), "%s", param_str);
         param_str = next_comma;
     }
 
@@ -705,7 +675,7 @@ void CAction::setRTPStreamActInfo(const char *P_value)
     }
 
     // Extract filename
-    strcpy(argument_buf, P_value);
+    snprintf(argument_buf, sizeof(argument_buf), "%s", P_value);
     if ((param_str = strchr(argument_buf, ','))) {
         *param_str++ = '\0';
     }
@@ -718,7 +688,7 @@ void CAction::setRTPStreamActInfo(const char *P_value)
                 ERROR("Filename/Pattern keyword %s is too long -- maximum supported length %zu",
                     found_file, sizeof(M_rtpstream_actinfo.filename) - 1);
             }
-            strcpy(M_rtpstream_actinfo.filename, found_file);
+            snprintf(M_rtpstream_actinfo.filename, sizeof(M_rtpstream_actinfo.filename), "%s", found_file);
             free(const_cast<char*>(found_file));
         }
     }
@@ -741,9 +711,9 @@ void CAction::setRTPStreamActInfo(const char *P_value)
         }
 
         if (pattern_mode) {
-            M_rtpstream_actinfo.pattern_id = atoi(param_str);
+            M_rtpstream_actinfo.pattern_id = get_int(param_str, "rtp_stream pattern id");
         } else {
-            M_rtpstream_actinfo.loop_count = atoi(param_str);
+            M_rtpstream_actinfo.loop_count = get_int(param_str, "rtp_stream loop count");
         }
         param_str = next_comma;
     }
@@ -759,7 +729,7 @@ void CAction::setRTPStreamActInfo(const char *P_value)
         {
             *(next_comma++) = 0;
         }
-        M_rtpstream_actinfo.payload_type = atoi(param_str);
+        M_rtpstream_actinfo.payload_type = get_int(param_str, "rtp_stream payload type");
         param_str = next_comma;
     }
 
@@ -770,7 +740,7 @@ void CAction::setRTPStreamActInfo(const char *P_value)
         if (next_comma) {
             *(next_comma++) = 0;
         }
-        strcpy(M_rtpstream_actinfo.payload_name, param_str);
+        snprintf(M_rtpstream_actinfo.payload_name, sizeof(M_rtpstream_actinfo.payload_name), "%s", param_str);
         param_str = next_comma;
     }
 
@@ -904,49 +874,13 @@ void CAction::setScenario(scenario *     P_scenario)
     M_scenario = P_scenario;
 }
 
-void CAction::setAction(CAction P_action)
-{
-    if (P_action.getActionType() == CAction::E_AT_ASSIGN_FROM_SAMPLE) {
-        assert(P_action.getDistribution() != nullptr);
-    }
-    int L_i;
-    setActionType   ( P_action.getActionType()   );
-    setLookingPlace ( P_action.getLookingPlace() );
-    setVarId        ( P_action.getVarId()        );
-    setVarInId      ( P_action.getVarInId()      );
-    setDoubleValue  ( P_action.getDoubleValue()  );
-    setDistribution ( P_action.getDistribution() );
-    setScenario     ( P_action.M_scenario        );
-
-    setNbSubVarId   ( P_action.getNbSubVarId()   );
-    for (L_i = 0; L_i < P_action.getNbSubVarId() ; L_i++ ) {
-        setSubVarId (P_action.getSubVarId(L_i));
-    }
-
-    setLookingChar  ( P_action.getLookingChar()  );
-    setCheckIt      ( P_action.getCheckIt()      );
-    setCheckItInverse      ( P_action.getCheckItInverse()      );
-    setCaseIndep    ( P_action.getCaseIndep()    );
-    setOccurrence   ( P_action.getOccurrence()   );
-    setHeadersOnly  ( P_action.getHeadersOnly()  );
-    for (L_i = 0; L_i < MAX_ACTION_MESSAGE; L_i++) {
-        setMessage(P_action.M_message_str[L_i], L_i);
-    }
-    setRegExp       ( P_action.M_regularExpression);
-    setIntCmd       ( P_action.M_IntCmd          );
-#ifdef PCAPPLAY
-    setPcapArgs     ( P_action.M_pcapArgs        );
-#endif
-    setRTPEchoActInfo(&(P_action.M_rtpecho_actinfo));
-    setRTPStreamActInfo(&(P_action.M_rtpstream_actinfo));
-}
-
 CAction::CAction(scenario *scenario)
 {
     M_action       = E_AT_NO_ACTION;
     M_varId        = 0;
     M_varInId        = 0;
     M_varIn2Id        = 0;
+    M_comp         = E_C_EQ;
 
     M_nbSubVarId    = 0;
     M_maxNbSubVarId = 0;
@@ -955,17 +889,14 @@ CAction::CAction(scenario *scenario)
     M_checkIt      = false;
     M_checkItInverse      = false;
     M_lookingPlace = E_LP_MSG;
-    M_lookingChar  = nullptr;
     M_caseIndep    = false;
     M_occurrence   = 1;
     M_headersOnly  = true;
     for (int i = 0; i < MAX_ACTION_MESSAGE; i++) {
-        M_message[i]   = nullptr;
-        M_message_str[i] = nullptr;
+        M_message[i] = nullptr;
     }
     M_IntCmd       = E_INTCMD_INVALID;
-    M_doubleValue  = 0;
-    M_stringValue  = nullptr;
+    M_doubleValue = 0;
     M_distribution = nullptr;
 #ifdef PCAPPLAY
     M_pcapArgs     = nullptr;
@@ -976,28 +907,21 @@ CAction::CAction(scenario *scenario)
 
     M_scenario     = scenario;
     M_regExpSet    = false;
-    M_regularExpression = nullptr;
+    memset(&M_internalRegExp, 0, sizeof(M_internalRegExp));
 }
 
 CAction::~CAction()
 {
-    if (M_lookingChar != nullptr) {
-        delete [] M_lookingChar;
-        M_lookingChar = nullptr;
-    }
     for (int i = 0; i < MAX_ACTION_MESSAGE; i++) {
         if (M_message[i] != nullptr) {
             delete M_message[i];
             M_message[i] = nullptr;
         }
-        free(M_message_str[i]);
-        M_message_str[i] = nullptr;
     }
     if (M_subVarId != nullptr) {
         delete [] M_subVarId;
         M_subVarId      = nullptr;
     }
-    free(M_stringValue);
 #ifdef PCAPPLAY
     if (M_pcapArgs != nullptr) {
         free_pcaps(M_pcapArgs);
@@ -1006,7 +930,6 @@ CAction::~CAction()
 #endif
     if (M_regExpSet) {
         regfree(&M_internalRegExp);
-        free(M_regularExpression);
     }
     if (M_distribution) {
         delete M_distribution;
@@ -1127,6 +1050,28 @@ TEST(actions, NonMatchingRegexp) {
     ASSERT_EQ(0, results);
     ASSERT_STREQ("", vt.getVar(id)->getString());
     ASSERT_STREQ("", vt.getVar(sub1_id)->getString());
+}
+
+TEST(actions, VariableValues)
+{
+    CCallVariable var;
+    ASSERT_STREQ("", var.getString());
+    /* A C string: up to its first NUL */
+    var.setString(std::string("ab\0cd", 5));
+    ASSERT_STREQ("ab", var.getString());
+    ASSERT_EQ(nullptr, var.getMatchingValue());
+    var.setMatchingValue("12.5 and more");
+    var.setMatchingValue("12.5");
+    ASSERT_STREQ("12.5", var.getMatchingValue());
+    ASSERT_STREQ("12.5", var.getString());
+    double value = 0;
+    ASSERT_TRUE(var.toDouble(&value));
+    ASSERT_EQ(12.5, value);
+    var.setString(" 7");
+    ASSERT_TRUE(var.toDouble(&value));
+    ASSERT_EQ(7, value);
+    var.setString("7x");
+    ASSERT_FALSE(var.toDouble(&value));
 }
 
 #endif

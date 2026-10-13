@@ -7,6 +7,9 @@ init() {
 
     # Print a nice message.
     printf "Testing %s: " "`basename \`pwd\``"
+
+    # Find sipp once, and stop here if it isn't there.
+    SIPP=`get_sipp` || fail
 }
 
 # Allow SIPP=/path/to/sipp to override autodetection.  Please use an
@@ -15,14 +18,20 @@ get_sipp() {
     if test -z "$SIPP"; then
         # The cd in init() jumps to the directory where the test lives.
         # We traverse upwards in the directory until we find the sipp
-        # binary.
+        # binary, next to the sources (in-source build) or in build/.
         tmp=`pwd`
-        while ! test -x "$tmp/sipp"; do
-            tmp=`dirname "$tmp"`
+        while :; do
+            for f in "$tmp/sipp" "$tmp/build/sipp"; do
+                if test -f "$f" && test -x "$f"; then
+                    echo "$f"
+                    return 0
+                fi
+            done
             test "$tmp" = "/" && break
+            tmp=`dirname "$tmp"`
         done
-        test -x "$tmp/sipp" || exit 1
-        SIPP="$tmp/sipp"
+        echo "sipp not found; set SIPP=/path/to/sipp" >&2
+        return 1
     fi
     echo "$SIPP"
 }
@@ -36,7 +45,13 @@ sippversion() {
 }
 
 sippfg() {
-    timeout -sKILL 183 "`get_sipp`" -nostdin "$@"
+    # GNU timeout, if there is one (gtimeout from coreutils on macOS).
+    to=`command -v timeout || command -v gtimeout`
+    if test -n "$to"; then
+        "$to" -sKILL 183 "`get_sipp`" -nostdin "$@"
+    else
+        "`get_sipp`" -nostdin "$@"
+    fi
 }
 
 sippbg() {
@@ -66,7 +81,7 @@ tcplisten() {
         listen(S,1)&&($sa=accept(N,S))&&(($port,$ia)=
         unpack_sockaddr_in($sa))&&($ia=inet_ntoa($ia))&&
         print "Connection from $ia:$port\n")||die($!);
-        close(S);while(1){recv(N,$o,2048,0);print "$o";}'
+        close(S);while(defined(recv(N,$o,2048,0))&&length($o)){print "$o";}'
 }
 
 udplisten() {

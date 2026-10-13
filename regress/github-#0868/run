@@ -1,0 +1,16 @@
+#!/bin/sh
+# This regression test is a part of SIPp.
+# The startup wizard must only take over an interactive no-argument launch:
+# with stdin redirected, a bare sipp still prints the usage text and exits 99.
+. "`dirname "$0"`/../functions"; init
+
+sipp_bin=`get_sipp`
+out=`"$sipp_bin" </dev/null 2>&1`
+status=$?
+
+test $status -ne 99 && fail "expected exit 99 from bare sipp, got $status"
+
+case $out in
+    *"sipp remote_host[:remote_port] [options]"*) ok ;;
+    *) fail "bare non-interactive sipp did not print the usage text" ;;
+esac
