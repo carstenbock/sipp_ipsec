@@ -694,6 +694,9 @@ struct sipp_option options_table[] = {
      "the request is sent again. Default is 3000.", SIPP_OPTION_INT, &s8_t3, 1},
     {"s8_n3", "Set GTP-C N3-REQUESTS: how many times a request is retransmitted before the\n"
      "PGW counts as not answering. Default is 3.", SIPP_OPTION_INT, &s8_n3, 1},
+    {"s8_bearer_cause", "Reject every Create Bearer Request of the PGW with this GTP cause (e.g. 94\n"
+     "Request rejected), as a visited MME does when the UE or the eNodeB refuses the\n"
+     "bearer. Default 0: accept.", SIPP_OPTION_INT, &s8_bearer_cause, 1},
     {"visited_plmn", "Set the visited PLMN as <mcc><mnc> (e.g. 00101 or 310410): the Serving Network\n"
      "and the PLMN of the location (ULI) in the Create Session Request, and the\n"
      "Visited-PLMN-Id on S6a.", SIPP_OPTION_STRING, &visited_plmn, 1},

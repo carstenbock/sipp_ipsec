@@ -340,6 +340,7 @@ MAYBE_EXTERN const char       * s8_pgw                  DEFVAL(nullptr);
 MAYBE_EXTERN const char       * s8_local_ip             DEFVAL(nullptr);
 MAYBE_EXTERN int                s8_t3                   DEFVAL(3000);
 MAYBE_EXTERN int                s8_n3                   DEFVAL(3);
+MAYBE_EXTERN int                s8_bearer_cause         DEFVAL(0);
 MAYBE_EXTERN const char       * visited_plmn            DEFVAL(nullptr);
 /* S6a: SIPp as visited MME toward the home HSS or its DRA (s6a.hpp) */
 MAYBE_EXTERN const char       * s6a_peer                DEFVAL(nullptr);

@@ -1049,6 +1049,20 @@ GtpBytes S8Session::create_bearers(const uint8_t *ies, size_t len)
         return with_cause(GTP_CAUSE_REQUEST_REJECTED, GtpBytes());
     }
     GtpBytes contexts;
+    if (s8_bearer_cause) {
+        /* -s8_bearer_cause: refuse the bearers as a visited MME does when the
+         * UE or the eNodeB does not set them up (PCRF failure reporting tests) */
+        for (size_t i = 0; i < wanted.size(); i++) {
+            GtpBytes fteids;
+            if (!wanted[i].pgw_u_ip.empty()) {
+                put_ie(fteids, IE_FTEID, 3, fteid(FTEID_S5S8_PGW_GTPU, wanted[i].pgw_u_teid, wanted[i].pgw_u_ip));
+            }
+            put_ie(contexts, IE_BEARER_CONTEXT, 0, bearer_answer(0, s8_bearer_cause, fteids));
+            LOG_MSG("%s S8 %s: dedicated bearer (QCI %d) rejected with cause %d (-s8_bearer_cause)\n",
+                    log_time().c_str(), cfg_.imsi.c_str(), wanted[i].qci, s8_bearer_cause);
+        }
+        return with_cause(s8_bearer_cause, contexts);
+    }
     bool any_ok = false;
     for (size_t i = 0; i < wanted.size(); i++) {
         const GtpBearerRequest &w = wanted[i];
