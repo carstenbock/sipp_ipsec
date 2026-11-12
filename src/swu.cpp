@@ -43,6 +43,7 @@
 #include <linux/xfrm.h>
 #include <linux/rtnetlink.h>
 #include <linux/fib_rules.h>
+#include <linux/if_link.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <libmnl/libmnl.h>
@@ -88,6 +89,7 @@ enum {
 #define SWU_RETRANS_MS   1000   /* first retransmission; doubles each time */
 #define SWU_MAX_RETRANS  4
 #define SWU_INNER_DEV    "lo"   /* inner addresses only have to be local */
+#define SWU_XFRMI_MTU    1280   /* IPv6 minimum MTU, as a phone sizes its tunnel */
 
 static std::set<SwuSession *> all_sessions;
 static std::set<SwuSession *> pending_sessions;     /* with an unanswered request */
@@ -357,12 +359,20 @@ static int inner_addr(const char *ip, bool add)
 }
 
 /*
- * Routing for an inner IPv6 address. The kernel only looks for an IPsec
- * policy once it has a route, and a host without IPv6 connectivity has none
- * for the destinations behind the tunnel: so every inner IPv6 address gets a
- * rule "from <address> lookup <our table>", and that table a default route.
- * The route's device does not matter, the policy sends the packet into the
- * tunnel. IPv4 needs nothing like it as long as the host has a default route.
+ * Routing for the inner addresses of a session with IPv6. The kernel only
+ * looks for an IPsec policy once it has a route, and a host without IPv6
+ * connectivity has none for the destinations behind the tunnel: so every
+ * inner address of such a session gets a rule "from <address> lookup <our
+ * table>", and that table a default route per family.
+ *
+ * The route leads through an XFRM interface of this process (MTU 1280),
+ * whose if_id the tunnel SAs and policies carry. A datagram larger than the
+ * tunnel can take is then fragmented before it is encrypted, also when the
+ * IMS IPsec SA protects it, as on a phone; with the inner packet sent whole
+ * the ePDG could not forward it (IPv6 routers do not fragment, KI-143).
+ * Without the interface (kernel without xfrm_interface) the route uses lo
+ * and the tunnel policies alone, as before. IPv4-only sessions need no rule
+ * as long as the host has a default route, and keep the plain policies.
  */
 static uint32_t swu_route_table()
 {
@@ -389,29 +399,95 @@ static int rtnl_send(struct nlmsghdr *nlh)
     return rc;
 }
 
-static int inner6_route(bool add)
+static void xfrmi_name(char *name, size_t len)
 {
-    char buf[256];
+    snprintf(name, len, "sippswu%u", swu_route_table());
+}
+
+/* 1 = this process's XFRM interface is up, -1 = cannot be created, 0 = not tried */
+static int xfrmi_state = 0;
+
+static int xfrmi_link(bool add)
+{
+    char buf[512], name[IFNAMSIZ];
+    xfrmi_name(name, sizeof(name));
+    memset(buf, 0, sizeof(buf));
+    struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type = add ? RTM_NEWLINK : RTM_DELLINK;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
+    struct ifinfomsg *ifi = (struct ifinfomsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*ifi));
+    ifi->ifi_family = AF_UNSPEC;
+    mnl_attr_put_strz(nlh, IFLA_IFNAME, name);
+    if (add) {
+        ifi->ifi_flags = IFF_UP;
+        ifi->ifi_change = IFF_UP;
+        mnl_attr_put_u32(nlh, IFLA_MTU, SWU_XFRMI_MTU);
+        struct nlattr *info = mnl_attr_nest_start(nlh, IFLA_LINKINFO);
+        mnl_attr_put_strz(nlh, IFLA_INFO_KIND, "xfrm");
+        struct nlattr *data = mnl_attr_nest_start(nlh, IFLA_INFO_DATA);
+        mnl_attr_put_u32(nlh, IFLA_XFRM_IF_ID, swu_route_table());
+        mnl_attr_nest_end(nlh, data);
+        mnl_attr_nest_end(nlh, info);
+    }
+    return rtnl_send(nlh);
+}
+
+/* if_id for a new session with IPv6: the interface's, or 0 without one */
+static uint32_t xfrmi_if_id()
+{
+    if (xfrmi_state == 0) {
+        char name[IFNAMSIZ], path[128];
+        xfrmi_name(name, sizeof(name));
+        xfrmi_link(false);      /* left by a run that crashed */
+        if (xfrmi_link(true) < 0) {
+            WARNING("SWu: cannot create the XFRM interface %s (%s): inner IPv6 packets are "
+                    "not fragmented to the tunnel, large protected ones may be lost (KI-143)",
+                    name, strerror(errno));
+            xfrmi_state = -1;
+        } else {
+            xfrmi_state = 1;
+            /* Decrypted inner packets are received on the interface */
+            snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/disable_ipv6", name);
+            int fd = open(path, O_WRONLY);
+            if (fd < 0 || write(fd, "0", 1) != 1) {
+                WARNING("SWu: cannot enable IPv6 on %s: if the host disables it on new "
+                        "interfaces, inner IPv6 packets will not be received", name);
+            }
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+    }
+    return xfrmi_state > 0 ? swu_route_table() : 0;
+}
+
+static int inner_route(int family, bool add)
+{
+    char buf[256], name[IFNAMSIZ];
+    xfrmi_name(name, sizeof(name));
     memset(buf, 0, sizeof(buf));
     struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
     nlh->nlmsg_type = add ? RTM_NEWROUTE : RTM_DELROUTE;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_REPLACE : 0);
     struct rtmsg *rtm = (struct rtmsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*rtm));
-    rtm->rtm_family = AF_INET6;
+    rtm->rtm_family = family;
     rtm->rtm_table = RT_TABLE_UNSPEC;
     rtm->rtm_protocol = RTPROT_STATIC;
     rtm->rtm_scope = RT_SCOPE_UNIVERSE;
     rtm->rtm_type = RTN_UNICAST;
     mnl_attr_put_u32(nlh, RTA_TABLE, swu_route_table());
-    mnl_attr_put_u32(nlh, RTA_OIF, if_nametoindex(SWU_INNER_DEV));
+    if (add) {
+        mnl_attr_put_u32(nlh, RTA_OIF, if_nametoindex(xfrmi_state > 0 ? name : SWU_INNER_DEV));
+    }
     return rtnl_send(nlh);
 }
 
-static int inner6_rule(const char *ip6, bool add)
+static int inner_rule(const char *ip, bool add)
 {
     char buf[256];
     uint8_t a[16];
-    if (inet_pton(AF_INET6, ip6, a) != 1) {
+    int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
+    if (inet_pton(family, ip, a) != 1) {
         return -1;
     }
     memset(buf, 0, sizeof(buf));
@@ -419,11 +495,11 @@ static int inner6_rule(const char *ip6, bool add)
     nlh->nlmsg_type = add ? RTM_NEWRULE : RTM_DELRULE;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
     struct fib_rule_hdr *frh = (struct fib_rule_hdr *)mnl_nlmsg_put_extra_header(nlh, sizeof(*frh));
-    frh->family = AF_INET6;
-    frh->src_len = 128;
+    frh->family = family;
+    frh->src_len = family == AF_INET ? 32 : 128;
     frh->table = RT_TABLE_UNSPEC;
     frh->action = FR_ACT_TO_TBL;
-    mnl_attr_put(nlh, FRA_SRC, 16, a);
+    mnl_attr_put(nlh, FRA_SRC, family == AF_INET ? 4 : 16, a);
     mnl_attr_put_u32(nlh, FRA_TABLE, swu_route_table());
     return rtnl_send(nlh);
 }
@@ -566,9 +642,9 @@ SwuSession::SwuSession(const SwuConfig &cfg) :
     child_spi_i_(0), child_spi_r_(0),
     next_msgid_(0), retrans_at_(0), retrans_count_(0),
     last_peer_msgid_(0xffffffff),
-    keepalive_at_(0), natt_(false), outer_port_(0), reqid_(0),
+    keepalive_at_(0), natt_(false), outer_port_(0), reqid_(0), if_id_(0),
     sa_out_(false), sa_in_(false), pol_out_(false), pol_in_(false), addr_(false),
-    pol6_out_(false), pol6_in_(false), addr6_(false)
+    pol6_out_(false), pol6_in_(false), addr6_(false), rule4_(false)
 {
     memset(spi_i_, 0, sizeof(spi_i_));
     memset(spi_r_, 0, sizeof(spi_r_));
@@ -1393,15 +1469,17 @@ int SwuSession::install_kernel()
      * half of them sent their traffic through another UE's SA. The SPI the
      * ePDG chose for our outbound SA is unique per ePDG. */
     reqid_ = child_spi_r_;
-    XfrmTunnel tun = { local, epdg, reqid_ };
+    /* A session with IPv6 goes through the XFRM interface, both families */
+    if_id_ = inner_ip6_.empty() ? 0 : xfrmi_if_id();
+    XfrmTunnel tun = { local, epdg, reqid_, if_id_ };
 
     if (xfrm_add_tunnel_sa(local, epdg, child_spi_r_, reqid_, outer_port_, IKE_NATT_PORT,
-                           ei, 256, ai, 256) < 0) {
+                           ei, 256, ai, 256, if_id_) < 0) {
         return -1;
     }
     sa_out_ = true;
     if (xfrm_add_tunnel_sa(epdg, local, child_spi_i_, reqid_, IKE_NATT_PORT, outer_port_,
-                           er, 256, ar, 256) < 0) {
+                           er, 256, ar, 256, if_id_) < 0) {
         return -1;
     }
     sa_in_ = true;
@@ -1420,6 +1498,15 @@ int SwuSession::install_kernel()
             return -1;
         }
         addr_ = true;
+        if (if_id_) {
+            inner_route(AF_INET, true);
+            inner_rule(inner_ip_.c_str(), false);   /* left by a run that crashed */
+            if (inner_rule(inner_ip_.c_str(), true) < 0) {
+                WARNING("SWu: cannot add the routing rule for the inner address %s", inner_ip_.c_str());
+                return -1;
+            }
+            rule4_ = true;
+        }
     }
     if (!inner_ip6_.empty()) {
         if (xfrm_add_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_OUT, &tun) < 0) {
@@ -1437,9 +1524,9 @@ int SwuSession::install_kernel()
         }
         addr6_ = true;
         enable_ipv6_on_outer(outer_local_);
-        inner6_route(true);
-        inner6_rule(inner_ip6_.c_str(), false);     /* left by a run that crashed */
-        if (inner6_rule(inner_ip6_.c_str(), true) < 0) {
+        inner_route(AF_INET6, true);
+        inner_rule(inner_ip6_.c_str(), false);      /* left by a run that crashed */
+        if (inner_rule(inner_ip6_.c_str(), true) < 0) {
             WARNING("SWu: cannot add the routing rule for the inner IPv6 address %s", inner_ip6_.c_str());
             return -1;
         }
@@ -1451,25 +1538,29 @@ void SwuSession::remove_kernel()
 {
     const char *local = outer_local_.c_str(), *epdg = cfg_.epdg.c_str();
 
+    if (rule4_) {
+        inner_rule(inner_ip_.c_str(), false);
+    }
     if (addr_) {
         inner_addr(inner_ip_.c_str(), false);
     }
     if (pol_out_) {
-        xfrm_del_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_OUT);
+        xfrm_del_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_OUT, if_id_);
     }
     if (pol_in_) {
-        xfrm_del_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_IN);
+        xfrm_del_tunnel_policy(inner_ip_.c_str(), XFRM_POLICY_IN, if_id_);
     }
     if (addr6_) {
-        inner6_rule(inner_ip6_.c_str(), false);
+        inner_rule(inner_ip6_.c_str(), false);
         inner_addr(inner_ip6_.c_str(), false);
     }
     if (pol6_out_) {
-        xfrm_del_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_OUT);
+        xfrm_del_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_OUT, if_id_);
     }
     if (pol6_in_) {
-        xfrm_del_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_IN);
+        xfrm_del_tunnel_policy(inner_ip6_.c_str(), XFRM_POLICY_IN, if_id_);
     }
+    xfrm_forget_tunnel(reqid_);
     if (sa_out_) {
         xfrm_del_sa(local, epdg, child_spi_r_, 0);
     }
@@ -1477,7 +1568,7 @@ void SwuSession::remove_kernel()
         xfrm_del_sa(epdg, local, child_spi_i_, 0);
     }
     addr_ = pol_out_ = pol_in_ = sa_out_ = sa_in_ = false;
-    addr6_ = pol6_out_ = pol6_in_ = false;
+    addr6_ = pol6_out_ = pol6_in_ = rule4_ = false;
 }
 
 void SwuSession::detach()
@@ -1593,8 +1684,13 @@ void SwuSession::shutdown_all()
         }
         s->remove_kernel();
     }
-    /* The route of inner6_route(); there is none if no session had IPv6 */
-    inner6_route(false);
+    /* The routes and interface of sessions with IPv6; none if there was none */
+    inner_route(AF_INET6, false);
+    if (xfrmi_state > 0) {
+        inner_route(AF_INET, false);
+        xfrmi_link(false);
+        xfrmi_state = 0;
+    }
 }
 
 #ifdef GTEST

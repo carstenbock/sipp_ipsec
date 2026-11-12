@@ -74,6 +74,7 @@ struct XfrmTunnel {
     const char *local;      /* our outer address */
     const char *remote;     /* ePDG address */
     uint32_t    reqid;      /* ties the policies to this tunnel's SAs */
+    uint32_t    if_id;      /* XFRM interface of the tunnel, 0 = none */
 };
 
 /**
@@ -82,13 +83,18 @@ struct XfrmTunnel {
  *
  * @param encap_sport/encap_dport  UDP ports of the encapsulation, as seen
  *                                 in packets of this direction
+ * @param if_id  XFRM interface the SA belongs to (0 = none); the IMS
+ *               policies of such a tunnel are then not nested
  * @return 0 on success, -1 on error
  */
 int xfrm_add_tunnel_sa(const char *src_ip, const char *dst_ip,
                        uint32_t spi, uint32_t reqid,
                        uint16_t encap_sport, uint16_t encap_dport,
                        const unsigned char *enc_key, int enc_bits,
-                       const unsigned char *auth_key, int auth_bits);
+                       const unsigned char *auth_key, int auth_bits,
+                       uint32_t if_id = 0);
+/* The tunnel of reqid is gone: forget its XFRM interface. */
+void xfrm_forget_tunnel(uint32_t reqid);
 
 /**
  * Add / delete the policy that sends everything from (dir out) or to
@@ -96,7 +102,7 @@ int xfrm_add_tunnel_sa(const char *src_ip, const char *dst_ip,
  * IMS policies, which name the tunnel themselves (see xfrm_add_policy).
  */
 int xfrm_add_tunnel_policy(const char *inner_ip, int dir, const XfrmTunnel *tun);
-int xfrm_del_tunnel_policy(const char *inner_ip, int dir);
+int xfrm_del_tunnel_policy(const char *inner_ip, int dir, uint32_t if_id = 0);
 
 /**
  * Add a Security Policy (SP) to the kernel XFRM subsystem.

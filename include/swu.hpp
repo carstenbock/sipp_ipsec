@@ -188,8 +188,9 @@ private:
     std::string inner_ip6_, pcscf6_;        /* IPv6 */
     std::string sip_ip_, sip_pcscf_;
     uint32_t reqid_;
+    uint32_t if_id_;            /* XFRM interface of the tunnel, 0 = none (IPv4 only) */
     bool sa_out_, sa_in_, pol_out_, pol_in_, addr_;
-    bool pol6_out_, pol6_in_, addr6_;
+    bool pol6_out_, pol6_in_, addr6_, rule4_;
 };
 
 #endif /* USE_SWU */

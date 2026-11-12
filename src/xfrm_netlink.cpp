@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
+#include <map>
 
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -286,6 +287,14 @@ int xfrm_del_sa(const char *src_ip, const char *dst_ip,
     return xfrm_send_and_recv(nlh);
 }
 
+/* reqid -> if_id of the SWu tunnels whose SAs belong to an XFRM interface */
+static std::map<uint32_t, uint32_t> tunnel_if_ids;
+
+void xfrm_forget_tunnel(uint32_t reqid)
+{
+    tunnel_if_ids.erase(reqid);
+}
+
 /* Tunnel-mode template of the SWu SA pair, in the direction of the policy. */
 static int fill_tunnel_tmpl(struct xfrm_user_tmpl *tmpl, const XfrmTunnel *tun, int dir)
 {
@@ -314,7 +323,8 @@ int xfrm_add_tunnel_sa(const char *src_ip, const char *dst_ip,
                        uint32_t spi, uint32_t reqid,
                        uint16_t encap_sport, uint16_t encap_dport,
                        const unsigned char *enc_key, int enc_bits,
-                       const unsigned char *auth_key, int auth_bits)
+                       const unsigned char *auth_key, int auth_bits,
+                       uint32_t if_id)
 {
     char buf[XFRM_BUF_SIZE];
     struct nlmsghdr *nlh;
@@ -390,8 +400,15 @@ int xfrm_add_tunnel_sa(const char *src_ip, const char *dst_ip,
         encap.encap_dport = htons(encap_dport);
         mnl_attr_put(nlh, XFRMA_ENCAP, sizeof(encap), &encap);
     }
+    if (if_id) {
+        mnl_attr_put_u32(nlh, XFRMA_IF_ID, if_id);
+    }
 
-    return xfrm_send_and_recv(nlh);
+    int rc = xfrm_send_and_recv(nlh);
+    if (rc == 0 && if_id) {
+        tunnel_if_ids[reqid] = if_id;
+    }
+    return rc;
 }
 
 /* Selector "everything from inner_ip" (out) or "everything to inner_ip" (in). */
@@ -446,11 +463,14 @@ int xfrm_add_tunnel_policy(const char *inner_ip, int dir, const XfrmTunnel *tun)
     pol->lft.soft_packet_limit = XFRM_INF;
     pol->lft.hard_packet_limit = XFRM_INF;
     mnl_attr_put(nlh, XFRMA_TMPL, sizeof(tmpl), &tmpl);
+    if (tun->if_id) {
+        mnl_attr_put_u32(nlh, XFRMA_IF_ID, tun->if_id);
+    }
 
     return xfrm_send_and_recv(nlh);
 }
 
-int xfrm_del_tunnel_policy(const char *inner_ip, int dir)
+int xfrm_del_tunnel_policy(const char *inner_ip, int dir, uint32_t if_id)
 {
     char buf[XFRM_BUF_SIZE];
     struct nlmsghdr *nlh;
@@ -472,6 +492,9 @@ int xfrm_del_tunnel_policy(const char *inner_ip, int dir)
         return -1;
     }
     pol_id->dir = dir;
+    if (if_id) {
+        mnl_attr_put_u32(nlh, XFRMA_IF_ID, if_id);
+    }
 
     return xfrm_send_and_recv(nlh);
 }
@@ -558,6 +581,16 @@ int xfrm_add_policy(const char *src_ip, const char *dst_ip,
     tmpl.ealgos = ~0u;
     tmpl.calgos = ~0u;
 
+    /* A tunnel on an XFRM interface is not nested here: the IMS transport SA
+     * alone protects the datagram, the route of the inner address leads it
+     * through the interface, and the interface's policies put it into the
+     * tunnel. Only then is the protected datagram fragmented to the
+     * interface's MTU before it enters the tunnel; with both templates in
+     * one bundle Linux does not fragment before a transport-mode transform
+     * and the inner IPv6 packet is too large for the ePDG to forward (KI-143) */
+    if (outer && tunnel_if_ids.count(outer->reqid)) {
+        outer = nullptr;
+    }
     if (outer && fill_tunnel_tmpl(&tmpls[1], outer, dir) < 0) {
         return -1;
     }

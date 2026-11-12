@@ -132,6 +132,22 @@ decrypted packets count as received. The second needs a writable
 network creates its interfaces with IPv6 disabled; SIPp warns when it
 cannot do it.
 
+A session with an IPv6 address does not use the nested policies of the
+section above. Each SIPp process creates an XFRM interface
+``sippswu<n>`` (if_id ``<n>``, MTU 1280, ``<n>`` = 21000 + pid mod 1000);
+the tunnel SAs and policies of such a session carry its if_id, every
+inner address of the session (IPv6 and, with ``ipv4v6``, IPv4) gets a
+routing rule to table ``<n>``, whose default routes lead through the
+interface, and the IMS IPSec policies keep only their transport-mode
+template. A protected datagram is then fragmented to the interface's MTU
+before it enters the tunnel, as on a phone. With the nested policies
+Linux does not fragment before a transport-mode transform, so a
+protected IPv6 REGISTER of about 1,800 bytes left as one inner packet
+that the ePDG could not forward to a P-CSCF on another node (IPv6
+routers do not fragment). IPv4-only sessions keep the nested policies.
+Without the ``xfrm_interface`` kernel module SIPp warns and falls back to
+the nested policies.
+
 
 Limitations
 ```````````
@@ -179,3 +195,4 @@ To check the kernel state of a running test::
     ip xfrm state          # 2 tunnel SAs + 4 IMS SAs per registered UE
     ip xfrm policy         # 2 tunnel + 4 IMS policies per UE
     ip addr show lo        # inner addresses
+    ip -d link show type xfrm   # sessions with IPv6: the XFRM interface
