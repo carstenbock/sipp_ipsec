@@ -2,7 +2,8 @@
 #
 # Usage (from within the git repo):
 #   git submodule update --init
-#   docker build -t sipp-ipsec -f docker/Dockerfile.ipsec .
+#   docker build -t sipp-ipsec -f docker/Dockerfile.ipsec \
+#       --build-arg SIPP_VERSION="$(git describe --tags --always --first-parent --dirty)" .
 #
 # Running (requires NET_ADMIN for XFRM Security Associations):
 #   docker run --rm --cap-add=NET_ADMIN --net=host sipp-ipsec \
@@ -50,11 +51,14 @@ COPY gtest gtest
 COPY third_party third_party
 
 ARG DEBUG=''
-# Create a minimal .git so cmake's `git describe` works inside submodule checkouts
-RUN git init --bare /tmp/fake-git && \
-    git -C /tmp/fake-git tag v0.0.0 $(git -C /tmp/fake-git rev-parse HEAD) 2>/dev/null; \
-    rm -rf .git && ln -s /tmp/fake-git .git
+# The build context has no git history (in a submodule checkout .git is a
+# file pointing outside it), so the version comes from the build argument.
+ARG SIPP_VERSION=''
+RUN test -n "$SIPP_VERSION" || { \
+      echo 'Pass --build-arg SIPP_VERSION="$(git describe --tags --always --first-parent --dirty)"' >&2; \
+      exit 1; }
 RUN cmake . -G Ninja \
+    -DSIPP_VERSION="$SIPP_VERSION" \
     -DCMAKE_BUILD_TYPE=Release \
     -DUSE_PCAP=1 \
     -DUSE_GSL=1 \

@@ -396,6 +396,9 @@ protected:
     bool           bye_after_peer_request; // abortCall() sends its BYE
     // after a request from the peer: [last_From] gives the To,
     // [last_To] the From and [last_cseq_number] our [cseq].
+    std::string    auth_error; // why the [authentication] keyword of
+    // the message being built could not be answered; send_scene()
+    // fails the call instead of sending it
 
     /* Call Variable Table */
     VariableTable *M_callVariableTable;

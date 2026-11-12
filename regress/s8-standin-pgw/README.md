@@ -22,7 +22,8 @@ only when the test asks for one with an `X-Bearer` header.
     regress/s8-standin-pgw/run-in-docker.sh [sipp image]
 
 The SIPp image defaults to `sipp-ipsec:s8`; build one from the repository
-root with `docker build -t sipp-ipsec:s8 -f docker/Dockerfile.ipsec .`. The
+root with `docker build -t sipp-ipsec:s8 -f docker/Dockerfile.ipsec
+--build-arg SIPP_VERSION="$(git describe --tags --always)" .`. The
 script needs Docker and starts the SIPp container with `NET_ADMIN` and
 `/dev/net/tun`. It is not part of `regress/runtests`, which runs
 unprivileged.

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- Challenges each REGISTER with the header of its line of the -inf
+     file, then accepts the second REGISTER if one comes. -->
+<scenario name="unanswerable challenge uas">
+  <recv request="REGISTER"/>
+  <send>
+    <![CDATA[
+      SIP/2.0 401 Unauthorized
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=srv
+      [last_Call-ID:]
+      [last_CSeq:]
+      [field0]
+      Content-Length: 0
+    ]]>
+  </send>
+  <recv request="REGISTER" timeout="2000" ontimeout="end"/>
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=srv
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+    ]]>
+  </send>
+  <label id="end"/>
+</scenario>

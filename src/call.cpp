@@ -1998,10 +1998,30 @@ char * call::send_scene(int index, int *send_status, int *len)
     }
 
     char * dest;
+    auth_error.clear();
     dest = createSendingMessage(call_scenario->messages[index]->send_scheme, index, len);
 
     if (!dest) {
         *send_status = -2;
+        return nullptr;
+    }
+
+    /* The challenge cannot be answered: fail this call, not the process.
+     * Like a failed connection, the call is gone when nullptr returns. */
+    if (!auth_error.empty()) {
+        while (!auth_error.empty() && isspace((unsigned char)auth_error.back())) {
+            auth_error.pop_back();
+        }
+        WARNING("Call-Id: %s, cannot answer the challenge on message %d: %s: aborting call",
+                id, index, auth_error.c_str());
+        computeStat(CStat::E_CALL_FAILED);
+        computeStat(CStat::E_FAILED_UNEXPECTED_MSG);
+        *send_status = -2;
+        if (default_behaviors & DEFAULT_BEHAVIOR_BYE) {
+            abortCall(true);
+        } else {
+            delete this;
+        }
         return nullptr;
     }
 
@@ -3907,15 +3927,18 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
 #endif
 
         std::string credentials;
-        if (!createAuthHeader(my_auth_user, my_auth_pass, src->getMethod(), uri,
+        const bool answered = createAuthHeader(my_auth_user, my_auth_pass, src->getMethod(), uri,
                               body == std::string::npos ? "" : out.c_str() + body + 4,
                               auth.dialog_authentication.c_str(), my_aka_OP, my_aka_AMF, my_aka_K,
-                              auth.next_nonce_count++, credentials, ck_ptr, ik_ptr, my_aka_OPc)) {
-            ERROR("%s", credentials.c_str());
+                              auth.next_nonce_count++, credentials, ck_ptr, ik_ptr, my_aka_OPc);
+        if (!answered) {
+            /* A challenge we cannot answer (no nonce, a MAC that does not
+             * match): send_scene() fails this call instead of sending it. */
+            auth_error = credentials.empty() ? "createAuthHeader failed" : credentials;
         }
 
 #ifdef USE_IPSEC
-        if (ipsec_enabled && ck_ptr && ik_ptr) {
+        if (answered && ipsec_enabled && ck_ptr && ik_ptr) {
             if (ipsec_manager) {
                 ipsec_manager->set_keys(ipsec_params, out_ck, out_ik);
                 if (ipsec_params.state == IPSEC_STATE_PARAMS_ALLOCATED) {
@@ -5089,7 +5112,18 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src,
             auth = get_header_content(msg, "WWW-Authenticate:");
         }
         if (auth.empty()) {
-            ERROR("Couldn't find 'Proxy-Authenticate' or 'WWW-Authenticate' in 401 or 407!");
+            /* The peer's fault, not the scenario's: fail this call and
+             * keep the others running. */
+            WARNING("Call-Id: %s, no 'Proxy-Authenticate' or 'WWW-Authenticate' in %d: aborting call",
+                    id, reply_code);
+            assign_exact(last_recv_msg, msg);
+            computeStat(CStat::E_CALL_FAILED);
+            computeStat(CStat::E_FAILED_UNEXPECTED_MSG);
+            if (default_behaviors & DEFAULT_BEHAVIOR_BYE) {
+                return (abortCall(true));
+            }
+            delete this;
+            return false;
         }
         call_cold &c = cold();
         c.dialog_authentication = selectAuthChallenge(auth.view());

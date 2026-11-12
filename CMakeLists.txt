@@ -452,7 +452,14 @@ file(WRITE ${PROJECT_SOURCE_DIR}/include/version.cmake
  )
  configure_file(\${SRC} \${DST} @ONLY)
 ")
-if(EXISTS ${PROJECT_SOURCE_DIR}/.git)
+# A build without the git history (a Docker build of a submodule checkout)
+# gets its version from -DSIPP_VERSION=<git describe> instead.
+set(SIPP_VERSION "" CACHE STRING "Version to build in instead of git describe")
+if(SIPP_VERSION)
+  set(VERSION ${SIPP_VERSION})
+  configure_file(${PROJECT_SOURCE_DIR}/include/version.h.in
+                 ${PROJECT_BINARY_DIR}/version.h @ONLY)
+elseif(EXISTS ${PROJECT_SOURCE_DIR}/.git)
   add_custom_target(
       version
       ${CMAKE_COMMAND} -D SRC=${PROJECT_SOURCE_DIR}/include/version.h.in

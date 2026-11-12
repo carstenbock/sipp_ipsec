@@ -1,0 +1,35 @@
+#!/bin/sh
+# This regression test is a part of SIPp.
+# A 401 the UAC cannot answer fails that call, not the whole process:
+# call 1 gets a 401 without WWW-Authenticate, call 2 one without a nonce
+# (createAuthHeader fails), call 3 a proper challenge. SIPp used to stop
+# with exit code 255 at the first of them; now it fails two calls and
+# completes the third.
+. "`dirname "$0"`/../functions"; init
+
+rm -f err.log stat.csv challenges.csv
+printf 'SEQUENTIAL\nX-Challenge: none\nWWW-Authenticate: Digest realm="r", algorithm=MD5\nWWW-Authenticate: Digest realm="r", nonce="n0", algorithm=MD5\n' >challenges.csv
+sippbg -sf uas.xml -inf challenges.csv -i 127.0.0.1 -p 25521 -m 3
+sippfg -sf uac.xml -i 127.0.0.1 -p 25520 -m 3 -l 1 127.0.0.1:25521 \
+    -timeout 10 -timeout_error -trace_err -error_file err.log \
+    -trace_stat -stf stat.csv >/dev/null 2>&1
+status=$?
+
+test -s stat.csv || fail "no stat.csv, sipp exited with $status"
+header=`head -n1 stat.csv | tr ';' '\n'`
+col() { echo "$header" | grep -n "^$1\$" | cut -d: -f1; }
+successful=`cut -d';' -f\`col 'SuccessfulCall(C)'\` stat.csv | tail -n1`
+failed=`cut -d';' -f\`col 'FailedCall(C)'\` stat.csv | tail -n1`
+no_header=`grep -c "no 'Proxy-Authenticate' or 'WWW-Authenticate' in 401: aborting call" err.log`
+no_nonce=`grep -c "cannot answer the challenge on message 2: createAuthHeader: couldn't parse nonce: aborting call" err.log`
+rm -f err.log stat.csv challenges.csv
+
+if test $status -ne 1; then
+    fail "UAC exited with $status, expected 1 (some calls failed)"
+elif test "$successful" != 1 || test "$failed" != 2; then
+    fail "got $successful successful and $failed failed calls, expected 1 and 2"
+elif test "${no_header:-0}" -ne 1 || test "${no_nonce:-0}" -ne 1; then
+    fail "expected one warning per unanswerable challenge, got $no_header and $no_nonce"
+else
+    ok
+fi

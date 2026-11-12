@@ -201,8 +201,13 @@ and bundles the VoLTE scenario files under `/scenarios`.
 To build:
 ```
 git submodule update --init
-docker build -t sipp-ipsec -f docker/Dockerfile.ipsec .
+docker build -t sipp-ipsec -f docker/Dockerfile.ipsec \
+    --build-arg SIPP_VERSION="$(git describe --tags --always --first-parent --dirty)" .
 ```
+
+`SIPP_VERSION` is required: the build context has no git history (in a
+submodule checkout `.git` points outside it), and it is what `sipp -v` and
+the `[sipp_version]` keyword print.
 
 To run (requires `--cap-add=NET_ADMIN` for XFRM and `--net=host` for
 real network interfaces):
