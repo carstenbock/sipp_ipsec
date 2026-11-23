@@ -2001,20 +2001,12 @@ impl Call {
 
     /// A message, `sdp_done` when its SDP was taken already.
     fn take_message(&mut self, env: &mut Env, raw: &Arc<str>, mut sdp_done: bool) -> Outcome {
-        // checkAckCSeq(): what it can't take for a request ends the run,
-        // once get_cseq_value() has looked at it.
-        let fatal = |env: &mut Env, text: String| {
-            if let Err(w) = sip::cseq_value(raw) {
-                env.log.warning(&w);
-            }
-            env.control.fatal = Some(text);
-            Outcome::Running
-        };
+        // A message with no method, or one of 64 bytes or more, is a
+        // request with none, which the scenario finds unexpected.
         let kind = match sip::kind(raw) {
-            Some(Kind::Request(m)) if m.len() >= 64 => return fatal(env, format!("SIP method too long in received message '{raw}'")),
-            None if !raw.starts_with("SIP/2.0") && !raw.contains(' ') => return fatal(env, format!("Invalid SIP message received '{raw}'")),
+            Some(Kind::Request(m)) if m.len() >= 64 => Kind::Request(""),
             Some(kind) => kind,
-            None => return Outcome::Running,
+            None => Kind::Request(""),
         };
         if self.debugging() {
             let line = format!("Processing {} byte incoming message for call-ID {} (hash {}):\n{raw}\n\n", crate::raw::len(raw), self.id, hash(raw, env.cfg.rtcheck_loose));
@@ -2085,12 +2077,10 @@ impl Call {
             env.log.warning(&w);
             0
         });
-        if let Kind::Request(m) = kind {
-            // Kept in 32 bits: a Call fits the tcache.
-            if m.starts_with("ACK") && env.cfg.default_behaviors & BEHAVIOR_BADCSEQ != 0 && cseq as u32 != self.invite_cseq {
-                env.log.warning("ACK CSeq value does NOT match value of related INVITE CSeq -- aborting call");
-                return Outcome::Failed;
-            }
+        // Kept in 32 bits: a Call fits the tcache.
+        if raw.starts_with("ACK") && env.cfg.default_behaviors & BEHAVIOR_BADCSEQ != 0 && cseq as u32 != self.invite_cseq {
+            env.log.warning("ACK CSeq value does NOT match value of related INVITE CSeq -- aborting call");
+            return Outcome::Failed;
         }
         let sc = env.scenario;
         let steps = &sc.steps;

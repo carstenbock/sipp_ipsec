@@ -18,6 +18,12 @@ marked **Breaking**.
   no longer installed by default; configure with
   `-DINSTALL_SIPP_MULTI=ON` to install it next to `sipp`
 
+### Fixed
+
+- A received request with a method of 64 bytes or more, or a message
+  without a space, no longer ends the run; the call gets it as any
+  other message (#1295, reported by DicksonWu654)
+
 ## [3.8.0] - 2026-10-13
 
 This is the largest pass over the project in its history: every open
