@@ -36,12 +36,12 @@
     <![CDATA[
 
       REGISTER sip:__DOMAIN__ SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       From: <sip:[service]@__DOMAIN__>;tag=[call_number]
       To: <sip:[service]@__DOMAIN__>
       Call-ID: [call_id]
       CSeq: 1 REGISTER
-      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[service]@[local_ip]:[protected_server_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       Supported: path, gruu, sec-agree
       Require: sec-agree
       Proxy-Require: sec-agree
@@ -68,12 +68,12 @@
     <![CDATA[
 
       REGISTER sip:__DOMAIN__ SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       From: <sip:[service]@__DOMAIN__>;tag=[call_number]
       To: <sip:[service]@__DOMAIN__>
       Call-ID: [call_id]
       CSeq: 2 REGISTER
-      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[service]@[local_ip]:[protected_server_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       [authentication username=[service]@__DOMAIN__ aka_K=__AKA_K__ aka_OPc=__AKA_OPC__ aka_AMF=__AKA_AMF__]
       Supported: path, gruu, sec-agree
       Require: sec-agree
@@ -111,13 +111,13 @@
     <![CDATA[
 
       INVITE __TARGET_URI__ SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: <__TARGET_URI__>
       Call-ID: inv///[call_id]
       CSeq: 1 INVITE
-      Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Contact: <sip:__MSISDN__@[local_ip]:[protected_server_port];transport=[transport]>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
       Accept: application/3gpp-ims+xml,application/sdp
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
@@ -159,13 +159,13 @@ __SDP_OFFER__
     <![CDATA[
 
       ACK [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 1 ACK
-      Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:__MSISDN__@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Max-Forwards: 70
       User-Agent: SIPp-VoLTE/1.0
       Security-Verify: [security_verify]
@@ -188,13 +188,13 @@ __SDP_OFFER__
     <![CDATA[
 
       BYE [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 2 BYE
-      Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:__MSISDN__@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
       P-Preferred-Identity: <sip:__MSISDN__@__DOMAIN__>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
@@ -220,7 +220,7 @@ __SDP_OFFER__
     <![CDATA[
 
       PRACK [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [last_To]
@@ -253,13 +253,13 @@ __SDP_OFFER__
     <![CDATA[
 
       ACK [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 1 ACK
-      Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:__MSISDN__@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Max-Forwards: 70
       User-Agent: SIPp-VoLTE/1.0
       Security-Verify: [security_verify]
@@ -282,13 +282,13 @@ __SDP_OFFER__
     <![CDATA[
 
       BYE [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:__MSISDN__@__DOMAIN__>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 3 BYE
-      Contact: <sip:__MSISDN__@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:__MSISDN__@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
       P-Preferred-Identity: <sip:__MSISDN__@__DOMAIN__>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
@@ -311,12 +311,12 @@ __SDP_OFFER__
     <![CDATA[
 
       REGISTER sip:__DOMAIN__ SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       From: <sip:[service]@__DOMAIN__>;tag=[call_number]
       To: <sip:[service]@__DOMAIN__>
       Call-ID: [call_id]
       CSeq: 3 REGISTER
-      Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=0
+      Contact: <sip:[service]@[local_ip]:[protected_server_port];transport=[transport]>;expires=0
       [authentication username=[service]@__DOMAIN__ aka_K=__AKA_K__ aka_OPc=__AKA_OPC__ aka_AMF=__AKA_AMF__]
       Supported: path, gruu, sec-agree
       Require: sec-agree

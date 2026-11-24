@@ -3427,10 +3427,14 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
     bool suppresscrlf = false;
 
 #ifdef USE_IPSEC
+    /* A port keyword written before the [authentication] of this message
+     * set the SAs up: it is written again with its protected port. */
+    enum PortFixupKind { FIXUP_REMOTE, FIXUP_LOCAL, FIXUP_SERVER };
     struct PortFixup {
         int offset;
         int len;
-        bool is_local;
+        PortFixupKind kind;
+        int add; /* [local_port+1]: 1 */
     };
     static const int MAX_PORT_FIXUPS = 16;
     PortFixup port_fixups[MAX_PORT_FIXUPS];
@@ -3487,7 +3491,8 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
             }
             if (ipsec_enabled && num_port_fixups < MAX_PORT_FIXUPS) {
                 port_fixups[num_port_fixups].offset = out.size();
-                port_fixups[num_port_fixups].is_local = false;
+                port_fixups[num_port_fixups].kind = FIXUP_REMOTE;
+                port_fixups[num_port_fixups].add = comp->offset;
                 append_number(out, remote_port + comp->offset);
                 port_fixups[num_port_fixups].len = out.size() - port_fixups[num_port_fixups].offset;
                 num_port_fixups++;
@@ -3508,15 +3513,21 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
 #endif
             out += local_ip_w_brackets;
             break;
-        case E_Message_Local_Port: {
+        case E_Message_Local_Port:
+#ifdef USE_IPSEC
+        /* [protected_server_port]: the UE's protected server port, which
+         * 3GPP TS 24.229 5.1.1.2.2 b), c) and 5.1.2A.1.1 put in the Contact
+         * and the Via; [local_port] is the protected client port. Before the
+         * SAs are up, both are the unprotected port. */
+        case E_Message_Protected_Server_Port:
+#endif
+        {
             int port;
 #ifdef USE_IPSEC
-            /* SPEC-DEVIATION: 3GPP TS 24.229 5.1.1.2.2 b), c) -- a protected
-             * REGISTER's Contact (and Via over UDP) carry the protected server
-             * port; [local_port] gives the client port and no keyword gives
-             * the server port (KI-233). */
-            if (ipsec_params.state >= IPSEC_STATE_ACTIVE && ipsec_params.port_uc != 0) {
-                port = ipsec_params.port_uc;
+            bool server = comp->type == E_Message_Protected_Server_Port;
+            int protected_port = server ? ipsec_params.port_us : ipsec_params.port_uc;
+            if (ipsec_params.state >= IPSEC_STATE_ACTIVE && protected_port != 0) {
+                port = protected_port;
             } else
 #endif
             if ((multisocket) && (sendMode != MODE_SERVER)) {
@@ -3528,7 +3539,8 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
             if (ipsec_enabled && ipsec_params.state < IPSEC_STATE_ACTIVE
                     && num_port_fixups < MAX_PORT_FIXUPS) {
                 port_fixups[num_port_fixups].offset = out.size();
-                port_fixups[num_port_fixups].is_local = true;
+                port_fixups[num_port_fixups].kind = server ? FIXUP_SERVER : FIXUP_LOCAL;
+                port_fixups[num_port_fixups].add = comp->offset;
                 append_number(out, port + comp->offset);
                 port_fixups[num_port_fixups].len = out.size() - port_fixups[num_port_fixups].offset;
                 num_port_fixups++;
@@ -4142,16 +4154,17 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
 #ifdef USE_IPSEC
     /*
      * If IPSec was just activated by the [authentication] block above,
-     * the [local_port] and [remote_port] expansions in the message still
+     * the [local_port], [protected_server_port] and [remote_port] expansions in the message still
      * contain the pre-IPSec values (e.g. 5060).  Patch them in-place
      * with the correct IPSec ports.  Process back-to-front so earlier
      * offsets remain valid after each replacement.
      */
     if (ipsec_params.state >= IPSEC_STATE_ACTIVE && num_port_fixups > 0) {
         for (int i = num_port_fixups - 1; i >= 0; i--) {
-            int new_port = port_fixups[i].is_local
-                ? ipsec_params.port_uc
-                : ipsec_params.port_ps;
+            int new_port = port_fixups[i].kind == FIXUP_LOCAL ? ipsec_params.port_uc
+                           : port_fixups[i].kind == FIXUP_SERVER ? ipsec_params.port_us
+                           : ipsec_params.port_ps;
+            new_port += port_fixups[i].add;
 
             int adj_offset = port_fixups[i].offset;
             if (auth_marker_offset >= 0 && adj_offset > auth_marker_offset) {
@@ -4729,6 +4742,16 @@ void call::remember_request_source(const char *msg, const struct sockaddr_storag
     bool reliable = transport_is_reliable(mixed_transport && socket ? socket->ss_transport : transport);
     bool elsewhere = !reliable ? !same_address(src, &call_peer)
                                : socket && socket != call_socket;
+#ifdef USE_IPSEC
+    /* 3GPP TS 33.203 clause 7.1, UDP: the P-CSCF sends its requests from
+     * its protected client port, and the UE its responses, as its
+     * requests, from port_uc to the P-CSCF's protected server port, the
+     * call's destination: no SA protects port_uc to the P-CSCF's client
+     * port. */
+    if (!reliable && socket && socket == ipsec_server_socket) {
+        elsewhere = false;
+    }
+#endif
     if (!elsewhere && peekCold().request_sources.empty()) {
         return;
     }
@@ -6893,6 +6916,16 @@ public:
     {
         return extract_srtp_remote_info(msg, pA, pV);
     }
+#ifdef USE_IPSEC
+    /* As after <ipsec_setup/> and the protected REGISTER's [authentication] */
+    void set_ipsec_active(int port_uc, int port_us, int port_ps)
+    {
+        ipsec_params.port_uc = port_uc;
+        ipsec_params.port_us = port_us;
+        ipsec_params.port_ps = port_ps;
+        ipsec_params.state = IPSEC_STATE_ACTIVE;
+    }
+#endif
     void set_retransmission_state(const char *msg, int index, int len, unsigned int retrans_at)
     {
         msg_index = index;
@@ -7280,6 +7313,41 @@ TEST(create_sending_message, zero_content_length_keeps_later_headers) {
     EXPECT_STREQ("BYE sip:a@b SIP/2.0\r\nContent-Length:     0\r\nX-Foo: bar\r\n\r\n", out);
     EXPECT_EQ((size_t)len, strlen(out));
 }
+
+#ifdef USE_IPSEC
+/* 3GPP TS 24.229 5.1.1.2.2 b), c): the Contact (and the Via) of a UE under
+ * IMS AKA carry its protected server port, where the P-CSCF sends its
+ * requests; SIPp sends from the protected client port. Mixing them up made
+ * the network send mobile-terminated requests to the client port (KI-233). */
+TEST(create_sending_message, protected_server_port_is_port_s) {
+    mockcall test_call(false);
+    test_call.set_ipsec_active(32768, 32769, 6100);
+    SendingMessage msg(main_scenario,
+                       "REGISTER sip:ims SIP/2.0\n"
+                       "Via: SIP/2.0/UDP 10.0.0.1:[protected_server_port];branch=z9hG4bK-1\n"
+                       "Contact: <sip:ue@10.0.0.1:[protected_server_port]>\n"
+                       "X-Ports: [local_port] [remote_port] [protected_server_port+2]\n\n", true);
+    const char *out = test_call.createSendingMessage(&msg, -1);
+
+    EXPECT_NE(nullptr, strstr(out, "Via: SIP/2.0/UDP 10.0.0.1:32769;"));
+    EXPECT_NE(nullptr, strstr(out, "Contact: <sip:ue@10.0.0.1:32769>"));
+    EXPECT_NE(nullptr, strstr(out, "X-Ports: 32768 6100 32771\r\n"));
+}
+
+/* Before the SAs are up (the unprotected first REGISTER) there is no
+ * protected port: the keyword is the unprotected one, as [local_port]. */
+TEST(create_sending_message, protected_server_port_before_the_sas) {
+    mockcall test_call(false);
+    SendingMessage msg(main_scenario,
+                       "REGISTER sip:ims SIP/2.0\nX-Ports: [local_port] [protected_server_port]\n\n", true);
+    const char *out = test_call.createSendingMessage(&msg, -1);
+    const char *ports = strstr(out, "X-Ports: ");
+    ASSERT_NE(nullptr, ports);
+    int local = -1, server = -2;
+    ASSERT_EQ(2, sscanf(ports, "X-Ports: %d %d", &local, &server));
+    EXPECT_EQ(local, server);
+}
+#endif
 
 TEST(create_sending_message, string_leaves_the_message_buffer)
 {
@@ -8329,6 +8397,16 @@ int call::ipsec_rebind_socket()
         return -1;
     }
     ipsec_server_socket->ss_owner = this;
+    /* -t tn: the P-CSCF connects from its protected client port to this
+     * one for its requests (3GPP TS 33.203 clause 7.1). */
+    if (transport == T_TCP) {
+        if (::listen(ipsec_server_socket->ss_fd, 16)) {
+            WARNING_NO("Failed to listen on the IPSec TCP server port %d",
+                       ipsec_params.port_us);
+            return -1;
+        }
+        ipsec_server_socket->ss_listening = true;
+    }
 
     /* With <send transport=...>, the P-CSCF may also connect to the
      * protected server port, for a request too large for UDP (3GPP TS

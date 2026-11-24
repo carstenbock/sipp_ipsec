@@ -150,6 +150,7 @@ struct KeywordMap SimpleKeywords[] = {
 #ifdef USE_IPSEC
     {"security_client", E_Message_Security_Client },
     {"security_verify", E_Message_Security_Verify },
+    {"protected_server_port", E_Message_Protected_Server_Port },
 #endif
 };
 

@@ -160,6 +160,9 @@ response goes back on the connection its request came on. A TCP
 connection made before the security associations are up is closed when
 they are.
 
+With ``-t tn -ipsec`` (TCP only), SIPp listens for TCP on the protected
+server port too.
+
 Limits: the attribute needs ``-t u1``, ``un`` or ``ui``, and does not work
 with ``-rsa``. Without ``-ipsec``, SIPp does not listen for TCP next to
 its UDP port, so a request that the remote host sends over TCP on its

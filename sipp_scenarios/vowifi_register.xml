@@ -47,13 +47,13 @@
     <![CDATA[
 
       REGISTER sip:[domain] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[field0]@[domain]>;tag=[call_number]
       To: <sip:[field0]@[domain]>
       Call-ID: [call_id]
       CSeq: 1 REGISTER
-      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[field0]@[local_ip]:[protected_server_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       Supported: path, gruu, sec-agree
       Require: sec-agree
       Proxy-Require: sec-agree
@@ -85,13 +85,13 @@
     <![CDATA[
 
       REGISTER sip:[domain] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[field0]@[domain]>;tag=[call_number]
       To: <sip:[field0]@[domain]>
       Call-ID: [call_id]
       CSeq: 2 REGISTER
-      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[field0]@[local_ip]:[protected_server_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
       Supported: path, gruu, sec-agree
       Require: sec-agree
@@ -125,13 +125,13 @@
     <![CDATA[
 
       REGISTER sip:[domain] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[field0]@[domain]>;tag=[call_number]
       To: <sip:[field0]@[domain]>
       Call-ID: [call_id]
       CSeq: 3 REGISTER
-      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=0
+      Contact: <sip:[field0]@[local_ip]:[protected_server_port];transport=[transport]>;expires=0
       [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
       Supported: path, gruu, sec-agree
       Require: sec-agree

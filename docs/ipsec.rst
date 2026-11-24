@@ -84,7 +84,7 @@ Command-line options
 Scenario keywords
 `````````````````
 
-Two new keywords are available when SIPp is built with IPSec support:
+Three keywords are available when SIPp is built with IPSec support:
 
 ``[security_client]``
     Expands to the value of the ``Security-Client`` header for the
@@ -102,6 +102,14 @@ Two new keywords are available when SIPp is built with IPSec support:
     received from the P-CSCF in the 401 response. Per RFC 3329, the
     ``Security-Verify`` header in the re-REGISTER must be an exact
     echo of the ``Security-Server`` value.
+
+``[protected_server_port]``
+    The UE's protected server port (port_s) once the SAs are up, the
+    unprotected port before. Use it in the Contact and the Via of the
+    UE's requests (3GPP TS 24.229 clauses 5.1.1.2.2 b) and c), and
+    5.1.2A.1.1): the P-CSCF sends its requests to the Contact's port,
+    and over UDP its responses to the Via's. ``[local_port]`` is the
+    protected client port (port_c), from which SIPp sends.
 
 
 Scenario actions
@@ -181,12 +189,12 @@ complete example is provided in
       <send retrans="500">
         <![CDATA[
           REGISTER sip:[remote_ip] SIP/2.0
-          Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+          Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
           From: <sip:[service]@ims.example.com>;tag=[call_number]
           To: <sip:[service]@ims.example.com>
           Call-ID: [call_id]
           CSeq: 1 REGISTER
-          Contact: <sip:[service]@[local_ip]:[local_port]>
+          Contact: <sip:[service]@[local_ip]:[protected_server_port]>
           Supported: sec-agree
           Require: sec-agree
           Proxy-Require: sec-agree
@@ -208,12 +216,12 @@ complete example is provided in
       <send retrans="500">
         <![CDATA[
           REGISTER sip:[remote_ip] SIP/2.0
-          Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+          Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
           From: <sip:[service]@ims.example.com>;tag=[call_number]
           To: <sip:[service]@ims.example.com>
           Call-ID: [call_id]
           CSeq: 2 REGISTER
-          Contact: <sip:[service]@[local_ip]:[local_port]>
+          Contact: <sip:[service]@[local_ip]:[protected_server_port]>
           [authentication username=[service]@ims.example.com]
           Supported: sec-agree
           Require: sec-agree

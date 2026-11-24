@@ -49,12 +49,12 @@
     <![CDATA[
 
       REGISTER sip:[domain] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       From: <sip:[field0]@[domain]>;tag=[call_number]
       To: <sip:[field0]@[domain]>
       Call-ID: [call_id]
       CSeq: 1 REGISTER
-      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[field0]@[local_ip]:[protected_server_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       Supported: path, gruu, sec-agree
       Require: sec-agree
       Proxy-Require: sec-agree
@@ -81,12 +81,12 @@
     <![CDATA[
 
       REGISTER sip:[domain] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       From: <sip:[field0]@[domain]>;tag=[call_number]
       To: <sip:[field0]@[domain]>
       Call-ID: [call_id]
       CSeq: 2 REGISTER
-      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[field0]@[local_ip]:[protected_server_port];transport=[transport]>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
       Supported: path, gruu, sec-agree
       Require: sec-agree
@@ -124,13 +124,13 @@
     <![CDATA[
 
       INVITE [field4] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
       From: <sip:[field3]@[domain]>;tag=[call_number]
       To: <[field4]>
       Call-ID: inv///[call_id]
       CSeq: 1 INVITE
-      Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Contact: <sip:[field3]@[local_ip]:[protected_server_port];transport=[transport]>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
       Accept: application/3gpp-ims+xml,application/sdp
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
@@ -189,13 +189,13 @@
     <![CDATA[
 
       ACK [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 1 ACK
-      Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:[field3]@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Max-Forwards: 70
       User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
@@ -234,13 +234,13 @@
     <![CDATA[
 
       BYE [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 2 BYE
-      Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:[field3]@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
       P-Preferred-Identity: <sip:[field3]@[domain]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
@@ -266,7 +266,7 @@
     <![CDATA[
 
       PRACK [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:[field3]@[domain]>;tag=[call_number]
       [last_To:]
@@ -300,13 +300,13 @@
     <![CDATA[
 
       ACK [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 1 ACK
-      Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:[field3]@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Max-Forwards: 70
       User-Agent: SIPp-S8HR/1.0
       Security-Verify: [security_verify]
@@ -345,13 +345,13 @@
     <![CDATA[
 
       BYE [next_url] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 3 BYE
-      Contact: <sip:[field3]@[local_ip]:[local_port];transport=[transport]>;audio
+      Contact: <sip:[field3]@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
       P-Preferred-Identity: <sip:[field3]@[domain]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
@@ -374,12 +374,12 @@
     <![CDATA[
 
       REGISTER sip:[domain] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       From: <sip:[field0]@[domain]>;tag=[call_number]
       To: <sip:[field0]@[domain]>
       Call-ID: [call_id]
       CSeq: 3 REGISTER
-      Contact: <sip:[field0]@[local_ip]:[local_port];transport=[transport]>;expires=0
+      Contact: <sip:[field0]@[local_ip]:[protected_server_port];transport=[transport]>;expires=0
       [authentication username=[field0]@[domain] aka_K=[field1] aka_OPc=[field2]]
       Supported: path, gruu, sec-agree
       Require: sec-agree

@@ -46,13 +46,13 @@
     <![CDATA[
 
       REGISTER sip:[key:domain] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[service]@[key:domain]>;tag=[call_number]
       To: <sip:[service]@[key:domain]>
       Call-ID: reg///[call_id]
       CSeq: 1 REGISTER
-      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[service]@[local_ip]:[protected_server_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       Supported: path, gruu, sec-agree
       Require: sec-agree
       Proxy-Require: sec-agree
@@ -79,13 +79,13 @@
     <![CDATA[
 
       REGISTER sip:[key:domain] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[service]@[key:domain]>;tag=[call_number]
       To: <sip:[service]@[key:domain]>
       Call-ID: reg///[call_id]
       CSeq: 2 REGISTER
-      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
+      Contact: <sip:[service]@[local_ip]:[protected_server_port];transport=tcp>;expires=600000;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+sip.instance="<urn:gsma:imei:35609204-079054-0>"
       [authentication username=[service]@[key:domain]]
       Supported: path, gruu, sec-agree
       Require: sec-agree
@@ -118,13 +118,13 @@
     <![CDATA[
 
       INVITE [key:target_uri] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: <[key:target_uri]>
       Call-ID: [call_id]
       CSeq: 1 INVITE
-      Contact: <sip:[key:msisdn]@[local_ip]:[local_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
+      Contact: <sip:[key:msisdn]@[local_ip]:[protected_server_port];transport=tcp>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";audio
       Accept: application/3gpp-ims+xml,application/sdp
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
@@ -171,7 +171,7 @@ a=sendrecv
     <![CDATA[
 
       CANCEL [last_Request_URI] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: <[key:target_uri]>
@@ -190,7 +190,7 @@ a=sendrecv
     <![CDATA[
 
       ACK [next_url] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
@@ -211,7 +211,7 @@ a=sendrecv
     <![CDATA[
 
       ACK [next_url] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
@@ -227,7 +227,7 @@ a=sendrecv
     <![CDATA[
 
       BYE [next_url] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
@@ -252,7 +252,7 @@ a=sendrecv
     <![CDATA[
 
       ACK [next_url] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
       From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
@@ -273,13 +273,13 @@ a=sendrecv
     <![CDATA[
 
       REGISTER sip:[key:domain] SIP/2.0
-      Via: SIP/2.0/TCP [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: <sip:[remote_ip]:[remote_port];lr>
       From: <sip:[service]@[key:domain]>;tag=[call_number]
       To: <sip:[service]@[key:domain]>
       Call-ID: reg///[call_id]
       CSeq: 3 REGISTER
-      Contact: <sip:[service]@[local_ip]:[local_port];transport=tcp>;expires=0
+      Contact: <sip:[service]@[local_ip]:[protected_server_port];transport=tcp>;expires=0
       [authentication username=[service]@[key:domain]]
       Supported: path, gruu, sec-agree
       Require: sec-agree

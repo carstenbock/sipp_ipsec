@@ -317,3 +317,15 @@ Keyword list
   ``Security-Verify`` header in the re-REGISTER must be an exact echo of the
   ``Security-Server`` value. Use in the ``Security-Verify:`` header of the
   IPSec-protected re-REGISTER message. See :doc:`../ipsec` for details.
+
+``[protected_server_port]``
+===========================
+:Description: Available when built with IPSec support (``-DUSE_IPSEC=ON``).
+  Once the security associations are up, the UE's protected server port
+  (``port-s`` of ``[security_client]``); before that, and without ``-ipsec``,
+  the same as ``[local_port]``. 3GPP TS 24.229 clauses 5.1.1.2.2 and 5.1.2A.1.1
+  put this port, not the protected client port that ``[local_port]`` gives, in
+  the Contact and the Via of a UE's requests; the P-CSCF then sends its own
+  requests to it. In the protected REGISTER it is the protected port too,
+  although the ``[authentication]`` that sets the SAs up comes after it. An
+  offset such as ``[protected_server_port+1]`` is kept. See :doc:`../ipsec`.

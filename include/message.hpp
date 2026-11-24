@@ -157,6 +157,7 @@ typedef enum {
 #ifdef USE_IPSEC
     E_Message_Security_Client,
     E_Message_Security_Verify,
+    E_Message_Protected_Server_Port,
 #endif
 } MessageCompType;
 
