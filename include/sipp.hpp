@@ -60,6 +60,13 @@
 #include <stdarg.h>
 #endif
 
+/* <send transport="...">: none given, or "auto" (see choose_message_transport() in call.cpp) */
+#define T_DEFAULT                  -1
+#define T_AUTO                     -2
+/* RFC 3261 section 18.1.1, which TS 24.229 clause 4.2A applies whatever
+ * the MTU: a larger request goes over TCP. */
+#define SIP_UDP_MAX_REQUEST_SIZE   1300
+
 /* Sipp includes */
 
 #include "xp_parser.h"
@@ -225,6 +232,9 @@ MAYBE_EXTERN unsigned long      defl_recv_timeout       DEFVAL(0);
 MAYBE_EXTERN unsigned long      defl_send_timeout       DEFVAL(0);
 MAYBE_EXTERN unsigned long      global_timeout          DEFVAL(0);
 MAYBE_EXTERN int                transport               DEFVAL(DEFAULT_TRANSPORT);
+/* Does a <send> of the scenario choose its own transport (transport=)?
+ * The calls then have a TCP socket next to the UDP one of -t u*. */
+MAYBE_EXTERN bool               mixed_transport         DEFVAL(false);
 MAYBE_EXTERN bool               retrans_enabled         DEFVAL(1);
 MAYBE_EXTERN int                rtcheck                 DEFVAL(RTCHECK_FULL);
 MAYBE_EXTERN int                max_udp_retrans         DEFVAL(UDP_MAX_RETRANS);

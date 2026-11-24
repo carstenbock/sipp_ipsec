@@ -66,6 +66,8 @@ Keyword list
 ===============
 :Default: UDP
 :Description: Depending on the value of -t parameter, this will take the values "UDP", "TCP", "TLS", "SCTP", "WS" or "WSS".
+  In a request with ``transport="..."`` it is the transport of that request (see
+  :ref:`mixed-transport`); in a response, the transport its request came in on.
 
 ``[local_ip]``
 ==============

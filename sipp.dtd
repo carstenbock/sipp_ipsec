@@ -57,6 +57,7 @@
 <!ATTLIST send dialog NMTOKEN #IMPLIED >
 <!ATTLIST send timeout NMTOKEN #IMPLIED >
 <!ATTLIST send ontimeout NMTOKEN #IMPLIED >
+<!ATTLIST send transport (udp|tcp|auto) #IMPLIED >
 
 <!ELEMENT recv ( action? ) >
 <!ATTLIST recv %messageCmdCommon; >

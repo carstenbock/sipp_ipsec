@@ -95,6 +95,7 @@ message::message(int index, const char *desc)
     content_length_flag = ContentLengthNoPresent;
 
     /* How to match responses to this message. */
+    send_transport = T_DEFAULT;
     start_txn = 0;
     response_txn = 0;
     ack_txn = 0;
@@ -897,6 +898,24 @@ scenario::scenario(char * filename, int deflt)
                     }
                 }
 
+                if ((cptr = xp_get_value("transport"))) {
+                    /* RFC 3261 section 18.2.2: a response goes back the
+                     * way its request came. */
+                    if (curmsg->send_scheme->isResponse()) {
+                        ERROR("transport=\"%s\" on a response: a response goes back on the "
+                              "transport its request came in on", cptr);
+                    }
+                    if (!strcasecmp(cptr, "udp")) {
+                        curmsg->send_transport = T_UDP;
+                    } else if (!strcasecmp(cptr, "tcp")) {
+                        curmsg->send_transport = T_TCP;
+                    } else if (!strcasecmp(cptr, "auto")) {
+                        curmsg->send_transport = T_AUTO;
+                    } else {
+                        ERROR("transport=\"%s\": it is udp, tcp or auto", cptr);
+                    }
+                    mixed_transport = true;
+                }
                 curmsg -> retrans_delay = xp_get_long("retrans", "retransmission timer", 0);
                 curmsg -> timeout = xp_get_long("timeout", "message send timeout", 0);
             } else if (!strcmp(elem, "recv")) {

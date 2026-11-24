@@ -259,6 +259,21 @@ protected:
      * response yet? */
     bool           last_send_unanswered;
 
+    /* <send transport=...> (mixed_transport): the transport of the message
+     * being made, for [transport]; of last_send_msg, for its
+     * retransmissions; of the last INVITE, for its CANCEL and ACK; and of
+     * the last message received. All are the -t one otherwise. */
+    int            msg_transport;
+    int            last_send_transport;
+    int            last_invite_transport;
+    int            last_recv_transport;
+    /* The call's TCP connection next to its UDP socket, made on first use:
+     * from the protected client port to the P-CSCF's protected server port
+     * once IPSec is up (3GPP TS 24.229 clause 5.1.1.2.2). */
+    SIPpSocket    *tcp_socket;
+    SIPpSocket    *get_tcp_socket();
+    void           close_tcp_socket();
+
     /* How long until sending this message times out. */
     unsigned int   send_timeout;
 
@@ -308,6 +323,9 @@ protected:
     char         * security_server_value;
     SIPpSocket    *ipsec_socket;
     SIPpSocket    *ipsec_server_socket;
+    /* The TCP listener on the protected server port next to the UDP one,
+     * with mixed_transport */
+    SIPpSocket    *ipsec_server_tcp_socket;
 
     int  ipsec_setup_sas(const char *msg);
     int  ipsec_activate_sas();
@@ -464,7 +482,11 @@ protected:
                          int search_index);    // 3pcc extended mode:check if
     // the twin message received
     // comes from the expected sender
-    void   sendBuffer(char *buf, int len = 0);     // send a message out of a scenario
+    void   sendBuffer(char *buf, int len = 0, int msg_transport = T_DEFAULT);     // send a message out of a scenario
+    /* Send the ACK or CANCEL of the last INVITE out of the scenario step:
+     * over its transport with mixed_transport (RFC 3261 sections 9.1 and
+     * 17.1.1.2), or as choice (<send transport=>) says. */
+    void   sendAfterInvite(SendingMessage *src, int index = -1, int choice = T_AUTO);
     // execution
 
     T_AutoMode checkAutomaticResponseMode(char* P_recv);
@@ -514,7 +536,9 @@ protected:
 
     void extract_transaction(char *txn, size_t size, const char *msg);
 
-    int   send_raw(const char * msg, int index, int len);
+    /* msg_transport: T_TCP sends a request on tcp_socket; any other its
+     * socket's transport */
+    int   send_raw(const char * msg, int index, int len, int msg_transport = T_DEFAULT);
     char * send_scene(int index, int *send_status, int *msgLen);
     bool   connect_socket_if_needed();
 

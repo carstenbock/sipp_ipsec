@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!-- The TCP side: the large INVITE, its ACK and the INFO, each with a top
+     Via of TCP (RFC 3261 section 18.1.1) -->
+<scenario name="mixed transport UAS over TCP">
+  <recv request="INVITE">
+    <action>
+      <ereg regexp="^ *SIP/2\.0/TCP " search_in="hdr" header="Via:" check_it="true" assign_to="v1"/>
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:callee@[local_ip]:[local_port];transport=tcp>
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv request="ACK">
+    <action>
+      <ereg regexp="^ *SIP/2\.0/TCP " search_in="hdr" header="Via:" check_it="true" assign_to="v2"/>
+    </action>
+  </recv>
+
+  <recv request="INFO">
+    <action>
+      <ereg regexp="^ *SIP/2\.0/TCP " search_in="hdr" header="Via:" check_it="true" assign_to="v3"/>
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Content-Length: 0
+
+    ]]>
+  </send>
+  <Reference variables="v1,v2,v3"/>
+</scenario>

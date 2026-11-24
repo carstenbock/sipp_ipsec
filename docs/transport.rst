@@ -112,6 +112,62 @@ instance::
     ./sipp -sn uac -t t1 -max_reconnect 1 -reconnect_close false proxy:5060
 
 
+.. _mixed-transport:
+
+UDP and TCP in one call
+```````````````````````
+
+A phone sends small requests over UDP and switches to TCP for a request
+too large for UDP, such as an INVITE with a long SDP: :RFC:`3261`
+section 18.1.1 asks for TCP above 1300 bytes, and 3GPP TS 24.229
+clause 4.2A applies that limit to UEs whatever the MTU. With ``-t u1``,
+``un`` or ``ui``, the ``transport`` attribute of ``<send>`` does that per
+request:
+
+``transport="udp"`` / ``transport="tcp"``
+  Sends the request over that transport, whatever its size: a test may
+  send a large request over UDP on purpose.
+
+``transport="auto"``
+  Sends the request over UDP, or over TCP if it is larger than 1300
+  bytes. A CANCEL or an ACK goes over the transport of the last INVITE
+  of the call, as :RFC:`3261` sections 9.1 and 17.1.1.2 require; the ACK
+  of a 2xx follows it too.
+
+A request without the attribute goes over UDP, as before. Responses do
+not take the attribute: a response goes back on the transport, and the
+connection, its request came in on (:RFC:`3261` section 18.2.2).
+
+The call opens its TCP connection to the remote host on its first TCP
+request, from the address of its UDP socket, and keeps it for its other
+TCP requests; responses and requests that come on it belong to the call
+as on its UDP socket. If the remote host closes it, the next TCP request
+opens a new one. ``setdest`` closes it, for the next TCP request to go
+to the new destination. UDP retransmissions (``retrans``) apply to the
+requests sent over UDP only.
+
+In a request with the attribute, ``[transport]`` is its transport, and
+the top Via is set to it: with ``auto``, the request is made with UDP
+first, and the top Via of a request that then goes over TCP says TCP
+(:RFC:`3261` section 18.1.1 requires that). Other text, such as a
+``transport=`` parameter in the Contact, keeps what ``[transport]`` was.
+
+With ``-ipsec``, the TCP connection goes from the protected client port
+to the P-CSCF's protected server port once the security associations
+are up, and SIPp also listens for TCP on the protected server port, for
+the requests the P-CSCF sends over TCP (3GPP TS 33.203 clause 7.1); a
+response goes back on the connection its request came on. A TCP
+connection made before the security associations are up is closed when
+they are.
+
+Limits: the attribute needs ``-t u1``, ``un`` or ``ui``, and does not work
+with ``-rsa``. Without ``-ipsec``, SIPp does not listen for TCP next to
+its UDP port, so a request that the remote host sends over TCP on its
+own connection does not reach the call; on the call's TCP connection
+it does. The test ``regress/mixed-transport`` shows a call that sends
+over both.
+
+
 
 TLS mono socket
 ```````````````

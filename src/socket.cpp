@@ -1555,6 +1555,11 @@ SIPpSocket* SIPpSocket::new_sipp_ipsec_socket(bool use_ipv6, int transport, uint
     call_sockets++;
     /* Its only reference is the call's, as that of a call socket */
     sock->ss_own_ref = false;
+    /* TCP: SO_REUSEADDR, for the port to be bound again while an earlier
+     * connection from it is in TIME_WAIT */
+    if (transport_is_reliable(transport)) {
+        sipp_customize_socket(sock);
+    }
 
     /* Bind to the specific local port for IPSec protected traffic */
     struct sockaddr_storage bind_addr;
@@ -1577,6 +1582,7 @@ SIPpSocket* SIPpSocket::new_sipp_ipsec_socket(bool use_ipv6, int transport, uint
 
     sock->ss_port = local_port;
     sock->ss_bind_port = local_port;
+    sock->ss_prebound = true;
 
 #ifdef SO_BINDTODEVICE
     if (bind_to_device_name) {
@@ -1691,6 +1697,24 @@ SIPpSocket* SIPpSocket::accept() {
     return ret;
 }
 
+void SIPpSocket::close_accepted(listener *owner)
+{
+    /* Backwards: a close moves the last socket into the freed place. */
+    for (int i = (int)pollnfds - 1; i >= 0; i--) {
+        if (i >= (int)pollnfds) {
+            continue;
+        }
+        SIPpSocket *sock = sockets[i];
+        if (sock && sock->ss_accepted && sock->ss_owner == owner) {
+            sock->ss_owner = nullptr;
+            if (sock->ss_own_ref) {
+                sock->ss_own_ref = false;
+                sock->close();
+            }
+        }
+    }
+}
+
 int sipp_bind_socket(SIPpSocket *socket, struct sockaddr_storage *saddr, int *port)
 {
     int ret;
@@ -1762,7 +1786,9 @@ int SIPpSocket::connect(struct sockaddr_storage* dest)
 
     assert(transport_is_reliable(ss_transport));
 
-    if (ss_transport == T_TCP || ss_transport == T_TLS || TRANSPORT_IS_WS(ss_transport)) {
+    if (ss_prebound) {
+        /* Its address and port are bound already. */
+    } else if (ss_transport == T_TCP || ss_transport == T_TLS || TRANSPORT_IS_WS(ss_transport)) {
         struct sockaddr_storage with_optional_port;
         int port = -1;
         memcpy(&with_optional_port, &local_sockaddr, sizeof(struct sockaddr_storage));
@@ -1840,6 +1866,8 @@ int SIPpSocket::reconnect()
     if (ss_fd == -1) {
         ERROR_NO("Could not obtain new socket: ");
     }
+    /* A new descriptor: connect() binds it to ss_bind_port, as before. */
+    ss_prebound = false;
     /* With the options of the first one: an SCTP socket that asks for no
      * events never learns that its association is up. */
     sipp_customize_socket(this);
@@ -3694,6 +3722,12 @@ void SIPpSocket::pollset_process(int wait)
                 /* A peer that failed the TLS handshake got dropped (see
                  * accept()): nothing to do for it. */
                 sock->accept();
+            } else if (sock->ss_listening) {
+                /* The P-CSCF connects to a UE's protected server port: the
+                 * requests on the connection belong to the same call. */
+                if (SIPpSocket *conn = sock->accept()) {
+                    conn->ss_owner = sock->ss_owner;
+                }
             } else if (sock == ctrl_socket) {
                 handle_ctrl_socket();
             } else if (sock == stdin_socket) {

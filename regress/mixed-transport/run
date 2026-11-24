@@ -1,0 +1,35 @@
+#!/bin/sh
+# This regression test is a part of SIPp.
+# <send transport="...">: one call sends over UDP and TCP to the same
+# port (RFC 3261 section 18.1.1, as phones do it). The UDP UAS must get the
+# REGISTER and the small BYE, the TCP UAS the INVITE larger than 1300 bytes
+# ("auto"), the ACK that follows it and the INFO that asks for TCP; each
+# checks that the top Via names the transport the request came over.
+. "`dirname "$0"`/../functions"; init
+
+sippfg -sf uas-udp.xml -t u1 -i 127.0.0.1 -p 25531 -m 1 -timeout 15 -timeout_error \
+    >/dev/null 2>&1 &
+uas_udp=$!
+sippfg -sf uas-tcp.xml -t t1 -i 127.0.0.1 -p 25531 -m 1 -timeout 15 -timeout_error \
+    >/dev/null 2>&1 &
+uas_tcp=$!
+sleep 1
+sippfg -sf uac.xml -t un -i 127.0.0.1 -p 25530 -m 1 -timeout 15 -timeout_error \
+    127.0.0.1:25531 >uac.log 2>&1
+uac_status=$?
+# Each UAS fails its one call on a Via check, or if a request never came.
+wait $uas_udp
+udp_status=$?
+wait $uas_tcp
+tcp_status=$?
+rm -f uac.log
+
+if test $uac_status -ne 0; then
+    fail "UAC failed with $uac_status"
+elif test $udp_status -ne 0; then
+    fail "UDP UAS failed with $udp_status: REGISTER or BYE not over UDP"
+elif test $tcp_status -ne 0; then
+    fail "TCP UAS failed with $tcp_status: INVITE, ACK or INFO not over TCP"
+else
+    ok
+fi

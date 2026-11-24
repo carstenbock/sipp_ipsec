@@ -1248,6 +1248,12 @@ void call::init(scenario *call_scenario, SIPpSocket *socket, struct sockaddr_sto
 
     call_port = 0;
 
+    msg_transport = transport;
+    last_send_transport = transport;
+    last_invite_transport = transport;
+    last_recv_transport = transport;
+    tcp_socket = nullptr;
+
     start_time = clock_tick;
     call_established=false ;
     ack_is_pending=false ;
@@ -1262,6 +1268,7 @@ void call::init(scenario *call_scenario, SIPpSocket *socket, struct sockaddr_sto
     security_server_value = nullptr;
     ipsec_socket = nullptr;
     ipsec_server_socket = nullptr;
+    ipsec_server_tcp_socket = nullptr;
 #endif
 #ifdef USE_SWU
     swu = nullptr;
@@ -1529,6 +1536,8 @@ call::~call()
     while (!peekCold().request_sources.empty()) {
         forget_request_source(cold_state->request_sources.begin());
     }
+    /* Before the protected ports are given back, below */
+    close_tcp_socket();
 
     /* Deletion of the call variable */
     if(M_callVariableTable) {
@@ -1805,6 +1814,119 @@ bool call::connect_socket_if_needed()
     return true;
 }
 
+/* The transport of a request with <send transport=choice>, len bytes
+ * long (0: not made yet). "auto" is UDP unless the request is larger than
+ * RFC 3261 section 18.1.1 allows over UDP; a CANCEL or an ACK goes the way
+ * of its INVITE (RFC 3261 sections 9.1 and 17.1.1.2). */
+static int choose_message_transport(int choice, bool follows_invite, int invite_transport,
+                                    size_t len)
+{
+    if (choice == T_DEFAULT) {
+        return transport;
+    }
+    if (choice != T_AUTO) {
+        return choice;
+    }
+    if (follows_invite) {
+        return invite_transport;
+    }
+    return len > SIP_UDP_MAX_REQUEST_SIZE ? T_TCP : T_UDP;
+}
+
+/* Name t (UDP or TCP) in the sent-protocol of the top Via of request msg,
+ * if it names UDP or TCP: RFC 3261 section 18.1.1 wants it changed when
+ * the size rule changes the transport. Both names are three letters, so
+ * the length, and Content-Length, stay. */
+static void set_top_via_transport(char *msg, int t)
+{
+    if (!strncmp(msg, "SIP/2.0 ", 8) || (t != T_UDP && t != T_TCP)) {
+        return;
+    }
+    for (char *line = strchr(msg, '\n'); line; line = strchr(line, '\n')) {
+        line++;
+        if (*line == '\r' || *line == '\n' || !*line) {
+            return; /* The body: no Via */
+        }
+        char *p = line;
+        if (!strncasecmp(p, "Via", 3)) {
+            p += 3;
+        } else if (*p == 'v' || *p == 'V') {
+            p += 1;
+        } else {
+            continue;
+        }
+        p += strspn(p, " \t");
+        if (*p != ':') {
+            continue;
+        }
+        p++;
+        p += strspn(p, " \t");
+        if (strncasecmp(p, "SIP/2.0/", 8)) {
+            return;
+        }
+        p += 8;
+        if ((!strncasecmp(p, "UDP", 3) || !strncasecmp(p, "TCP", 3)) &&
+                (p[3] == ' ' || p[3] == '\t')) {
+            memcpy(p, TRANSPORT_TO_STRING(t), 3);
+        }
+        return;
+    }
+}
+
+SIPpSocket *call::get_tcp_socket()
+{
+    /* The peer ended the last one */
+    if (tcp_socket && tcp_socket->ss_fd == -1) {
+        close_tcp_socket();
+    }
+    if (tcp_socket) {
+        return tcp_socket;
+    }
+
+    /* From the address of the call's UDP socket: -t ui, the SWu or S8
+     * address of the UE, or the protected client port once IPSec is up,
+     * to the P-CSCF's protected server port (call_peer then). */
+    struct sockaddr_storage local;
+    socklen_t local_len = sizeof(local);
+    if (getsockname(call_socket->ss_fd, (struct sockaddr *)&local, &local_len) < 0) {
+        ERROR_NO("Unable to get the address of the UDP socket of call %s", id);
+    }
+    unsigned short port = 0;
+#ifdef USE_IPSEC
+    if (ipsec_params.state >= IPSEC_STATE_ACTIVE && call_socket == ipsec_socket) {
+        port = ipsec_params.port_uc;
+    }
+#endif
+    sockaddr_update_port(&local, port);
+
+    SIPpSocket *sock = new_sipp_socket(local.ss_family == AF_INET6, T_TCP);
+    /* Its reference is this call's */
+    sock->ss_own_ref = false;
+    sipp_customize_socket(sock);
+    int bound_port = 0;
+    if (sipp_bind_socket(sock, &local, &bound_port)) {
+        WARNING_NO("Unable to bind the TCP socket of call %s to port %u", id, port);
+        sock->close();
+        return nullptr;
+    }
+    sock->ss_prebound = true;
+    if (sock->connect(&call_peer)) {
+        WARNING_NO("Unable to connect the TCP socket of call %s", id);
+        sock->close();
+        return nullptr;
+    }
+    tcp_socket = sock;
+    return tcp_socket;
+}
+
+void call::close_tcp_socket()
+{
+    if (tcp_socket) {
+        tcp_socket->close();
+        tcp_socket = nullptr;
+    }
+}
+
 bool call::lost(int index)
 {
     double percent = global_lost;
@@ -1822,24 +1944,41 @@ bool call::lost(int index)
     return (((double)rand() / (double)RAND_MAX) < (percent / 100.0));
 }
 
-int call::send_raw(const char * msg, int index, int len)
+int call::send_raw(const char * msg, int index, int len, int msg_transport)
 {
     SIPpSocket *sock;
     int rc;
+    /* A response goes where its request came from, below. */
+    bool own_tcp = msg_transport == T_TCP && transport != T_TCP && strncmp(msg, "SIP/2.0 ", 8);
+    const char *transport_name = TRANSPORT_TO_STRING(own_tcp ? T_TCP : transport);
 
     callDebug("Sending %s message for call %s (index %d, hash %lu):\n%s\n\n",
-              TRANSPORT_TO_STRING(transport), id, index, hash(msg), msg);
+              transport_name, id, index, hash(msg), msg);
 
     if((index!=-1) && (lost(index))) {
-        TRACE_MSG("%s message voluntary lost (while sending).", TRANSPORT_TO_STRING(transport));
+        TRACE_MSG("%s message voluntary lost (while sending).", transport_name);
         callDebug("%s message voluntary lost (while sending) (index %d, hash %lu).\n",
-                  TRANSPORT_TO_STRING(transport), index, hash(msg));
+                  transport_name, index, hash(msg));
 
         call_scenario->messages[index] -> nb_lost++;
         return 0;
     }
 
     sock = call_socket;
+    if (own_tcp) {
+        sock = get_tcp_socket();
+        if (!sock) {
+            /* As a TCP call that fails to connect (see
+             * connect_socket_if_needed()) */
+            if (index != -1) {
+                computeStat(CStat::E_CALL_FAILED);
+                computeStat(CStat::E_FAILED_TCP_CONNECT);
+                delete this;
+            }
+            errno = ECONNREFUSED;
+            return -1;
+        }
+    }
 
     if ((use_remote_sending_addr) && (sendMode == MODE_SERVER)) {
         if (!call_remote_socket) {
@@ -1919,16 +2058,29 @@ int call::send_raw(const char * msg, int index, int len)
 
 /* This method is used to send messages that are not */
 /* part of the XML scenario                          */
-void call::sendBuffer(char * msg, int len)
+void call::sendBuffer(char * msg, int len, int msg_transport)
 {
     /* call send_raw but with a special scenario index */
-    if (send_raw(msg, -1, len) < 0) {
+    if (send_raw(msg, -1, len, msg_transport) < 0) {
         if (sendbuffer_warn) {
             ERROR_NO("Error sending raw message");
         } else {
             WARNING_NO("Error sending raw message");
         }
     }
+}
+
+void call::sendAfterInvite(SendingMessage *src, int index, int choice)
+{
+    int t = mixed_transport ? choose_message_transport(choice, true, last_invite_transport, 0)
+                            : transport;
+    msg_transport = t;
+    char *msg = createSendingMessage(src, index);
+    msg_transport = transport;
+    if (mixed_transport) {
+        set_top_via_transport(msg, t);
+    }
+    sendBuffer(msg, 0, t);
 }
 
 /* The header of name, "From" or "From:", of the last message received, or
@@ -1997,9 +2149,21 @@ char * call::send_scene(int index, int *send_status, int *len)
         len = &uselen;
     }
 
+    /* The transport of the message, for [transport] and the socket: one
+     * of its own (transport=), or as the call's. A response goes back the
+     * way its request came. */
+    message *m = call_scenario->messages[index];
+    bool response = m->send_scheme->isResponse();
+    bool follows_invite = m->send_scheme->isCancel() || m->send_scheme->isAck();
+    int choice = response ? T_DEFAULT : m->send_transport;
+    int t = response ? last_recv_transport
+                     : choose_message_transport(choice, follows_invite, last_invite_transport, 0);
+
     char * dest;
     auth_error.clear();
-    dest = createSendingMessage(call_scenario->messages[index]->send_scheme, index, len);
+    msg_transport = t;
+    dest = createSendingMessage(m->send_scheme, index, len);
+    msg_transport = transport;
 
     if (!dest) {
         *send_status = -2;
@@ -2039,7 +2203,18 @@ char * call::send_scene(int index, int *send_status, int *len)
         ack_is_pending = false ;
     }
 
-    *send_status = send_raw(dest, index, *len);
+    if (choice != T_DEFAULT) {
+        /* "auto": TCP if too large for UDP. RFC 3261 section 18.1.1: the
+         * top Via then names the transport it goes over. */
+        t = choose_message_transport(choice, follows_invite, last_invite_transport, *len);
+        set_top_via_transport(dest, t);
+    }
+    last_send_transport = t;
+    if (!response && !strcmp(msg_name, "INVITE")) {
+        last_invite_transport = t;
+    }
+
+    *send_status = send_raw(dest, index, *len, t);
 
     return dest;
 }
@@ -2089,7 +2264,8 @@ void call::tcpReconnected()
 {
     if (last_send_unanswered) {
         callDebug("Sending the unanswered request again on a new connection\n");
-        send_raw(last_send_msg.c_str(), last_send_index, last_send_msg.size());
+        send_raw(last_send_msg.c_str(), last_send_index, last_send_msg.size(),
+                 last_send_transport);
     }
 }
 
@@ -2491,7 +2667,7 @@ bool call::executeMessage(message *curmsg)
             recv_retrans_recv_index = last_recv_index;
             recv_retrans_send_index = curmsg->index;
             /* Only UDP retransmissions of the request get it again. */
-            if (transport == T_UDP && retrans_enabled) {
+            if (last_recv_transport == T_UDP && retrans_enabled) {
                 release(recv_retrans_msg);
                 recv_retrans_last = true;
             }
@@ -2510,7 +2686,7 @@ bool call::executeMessage(message *curmsg)
              * response to another request, such as the 200 of an INVITE
              * sent after the 200 of a PRACK, is not one. */
             recv_retrans_send_index = curmsg->index;
-            if (transport == T_UDP && retrans_enabled) {
+            if (last_recv_transport == T_UDP && retrans_enabled) {
                 release(recv_retrans_msg);
                 recv_retrans_last = true;
             }
@@ -2518,7 +2694,7 @@ bool call::executeMessage(message *curmsg)
 
         /* Update retransmission information */
         if(curmsg -> retrans_delay) {
-            if((transport == T_UDP) && (retrans_enabled)) {
+            if((last_send_transport == T_UDP) && (retrans_enabled)) {
                 next_retrans = clock_tick + curmsg -> retrans_delay;
                 nb_retrans = 0;
                 nb_last_delay = curmsg->retrans_delay;
@@ -2796,7 +2972,8 @@ bool call::run()
                     nb_last_delay = global_t2;
                 }
             }
-            if (send_raw(last_send_msg.c_str(), last_send_index, last_send_msg.size()) < 0) {
+            if (send_raw(last_send_msg.c_str(), last_send_index, last_send_msg.size(),
+                         last_send_transport) < 0) {
                 return false;
             }
             call_scenario->messages[last_send_index] -> nb_sent_retrans++;
@@ -2992,11 +3169,11 @@ bool call::process_unexpected(const char* msg)
 
     TRACE_MSG("-----------------------------------------------\n"
               "Unexpected %s message received:\n\n%s\n",
-              TRANSPORT_TO_STRING(transport),
+              TRANSPORT_TO_STRING(last_recv_transport),
               msg);
 
     callDebug("Unexpected %s message received (index %d, hash %lu):\n\n%s\n",
-              TRANSPORT_TO_STRING(transport), msg_index, hash(msg), msg);
+              TRANSPORT_TO_STRING(last_recv_transport), msg_index, hash(msg), msg);
 
     if (get_reply_code(msg)) {
         this->call_scenario->stats->error_codes.push_back(get_reply_code(msg));
@@ -3069,7 +3246,7 @@ bool call::abortCall(bool writeLog)
             // Answer unexpected errors (4XX, 5XX and beyond) with an ACK
             // Contributed by F. Tarek Rogers
             if (!last_recv_msg.empty() && (get_reply_code(last_recv_msg.c_str()) >= 400)) {
-                sendBuffer(createSendingMessage(get_default_message("ack")));
+                sendAfterInvite(get_default_message("ack"));
             } else if (!last_recv_msg.empty()) {
                 /* Call is not established and the reply is not a 4XX, 5XX */
                 /* And we already received a message. */
@@ -3077,14 +3254,14 @@ bool call::abortCall(bool writeLog)
                     /* If an ACK is expected from the other side, send it
                      * and send a BYE afterwards. */
                     ack_is_pending = false;
-                    sendBuffer(createSendingMessage(get_default_message("ack")));
+                    sendAfterInvite(get_default_message("ack"));
 
                     /* Send the BYE */
                     sendBuffer(createSendingMessage(get_default_message("bye"), byeIndex));
                     sent_bye = true;
                 } else {
                     /* Send a CANCEL */
-                    sendBuffer(createSendingMessage(get_default_message("cancel")));
+                    sendAfterInvite(get_default_message("cancel"));
                     sent_cancel = true;
                 }
             } else {
@@ -3334,6 +3511,10 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
         case E_Message_Local_Port: {
             int port;
 #ifdef USE_IPSEC
+            /* SPEC-DEVIATION: 3GPP TS 24.229 5.1.1.2.2 b), c) -- a protected
+             * REGISTER's Contact (and Via over UDP) carry the protected server
+             * port; [local_port] gives the client port and no keyword gives
+             * the server port (KI-233). */
             if (ipsec_params.state >= IPSEC_STATE_ACTIVE && ipsec_params.port_uc != 0) {
                 port = ipsec_params.port_uc;
             } else
@@ -3358,7 +3539,7 @@ std::string call::buildSendingMessage(SendingMessage *src, int P_index, char *sc
             break;
         }
         case E_Message_Transport:
-            out += TRANSPORT_TO_STRING(transport);
+            out += TRANSPORT_TO_STRING(msg_transport);
             break;
         case E_Message_Local_IP_Type:
 #ifdef USE_IPSEC
@@ -4543,8 +4724,11 @@ void call::remember_request_source(const char *msg, const struct sockaddr_storag
     if (use_remote_sending_addr || !strncmp(msg, "SIP/2.0 ", 8) || !strncmp(msg, "ACK ", 4)) {
         return;
     }
-    bool elsewhere = transport == T_UDP ? !same_address(src, &call_peer)
-                                        : socket && socket != call_socket;
+    /* Over its own transport: with mixed_transport, a TCP connection of
+     * a call that has UDP. */
+    bool reliable = transport_is_reliable(mixed_transport && socket ? socket->ss_transport : transport);
+    bool elsewhere = !reliable ? !same_address(src, &call_peer)
+                               : socket && socket != call_socket;
     if (!elsewhere && peekCold().request_sources.empty()) {
         return;
     }
@@ -4574,7 +4758,7 @@ void call::remember_request_source(const char *msg, const struct sockaddr_storag
     rs.branch = branch;
     memcpy(&rs.addr, src, sizeof(rs.addr));
     rs.socket = nullptr;
-    if (transport != T_UDP) {
+    if (reliable) {
         rs.socket = socket;
         socket->ss_count++;
     }
@@ -4628,6 +4812,9 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src,
     if (src) {
         remember_request_source(msg, src, socket);
     }
+    if (mixed_transport && socket) {
+        last_recv_transport = socket->ss_transport;
+    }
 
     /* A <nop> or <sendCmd> runs on the call's next turn, so a message can
      * arrive before it has, as the first command in server mode or right
@@ -4658,7 +4845,7 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src,
         return false;
     }
 
-    if ((transport == T_UDP) && (retrans_enabled)) {
+    if ((mixed_transport && socket ? socket->ss_transport : transport) == T_UDP && retrans_enabled) {
         /* Detects retransmissions from peer and retransmit the
          * message which was sent just after this one was received */
         cookie = hash(msg);
@@ -4906,7 +5093,8 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src,
                             } else if (int ackIndex = transactions[checkTxn - 1].ackIndex) {
                                 /* This is the message before an ACK, so verify that this is an invite transaction. */
                                 assert (call_scenario->transactions[checkTxn - 1].isInvite);
-                                sendBuffer(createSendingMessage(call_scenario->messages[ackIndex]->send_scheme, ackIndex));
+                                sendAfterInvite(call_scenario->messages[ackIndex]->send_scheme, ackIndex,
+                                                call_scenario->messages[ackIndex]->send_transport);
                                 return true;
                             } else {
                                 /* This is a non-provisional message for the transaction, and
@@ -4945,7 +5133,8 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src,
                                 (0 == strncmp (responsecseqmethod, "INVITE", strlen(responsecseqmethod)) ) &&
                                 (call_scenario->messages[search_index+1]->M_type == MSG_TYPE_SEND) &&
                                 (call_scenario->messages[search_index+1]->send_scheme->isAck()) ) {
-                            sendBuffer(createSendingMessage(call_scenario->messages[search_index+1]->send_scheme, search_index + 1));
+                            sendAfterInvite(call_scenario->messages[search_index+1]->send_scheme, search_index + 1,
+                                            call_scenario->messages[search_index+1]->send_transport);
                             return true;
                         }
                         /* The peer ACKs each 200 we retransmit, so an ACK
@@ -5585,6 +5774,8 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
                 ERROR("Unknown host '%s' for setdest", str_host);
             }
             memcpy(&call_socket->ss_dest, &call_peer, sizeof(call_peer));
+            /* A <send transport="tcp"> connects to the new one. */
+            close_tcp_socket();
 
             if (protocol == T_TCP || protocol == T_SCTP || protocol == T_WS) {
                 call_socket->close_fd();
@@ -7664,6 +7855,82 @@ TEST(send_packets_due, full_send_buffer) {
     close(listener);
 }
 #endif /* PCAP_PLAY */
+
+/* RFC 3261 section 18.1.1, which TS 24.229 clause 4.2A applies to UEs
+ * whatever the MTU: a request larger than 1300 bytes MUST go over TCP, a
+ * smaller one may stay on UDP, as phones send it. */
+TEST(message_transport, auto_switches_above_1300_bytes) {
+    EXPECT_EQ(T_UDP, choose_message_transport(T_AUTO, false, T_UDP, 1300));
+    EXPECT_EQ(T_TCP, choose_message_transport(T_AUTO, false, T_UDP, 1301));
+    /* Before it is made, a message renders [transport] as UDP. */
+    EXPECT_EQ(T_UDP, choose_message_transport(T_AUTO, false, T_TCP, 0));
+}
+
+/* RFC 3261 sections 9.1 and 17.1.1.2: a CANCEL and the ACK of a non-2xx
+ * MUST use the transport of their INVITE, though they are small: on UDP
+ * the P-CSCF would never match them to an INVITE it got over TCP. */
+TEST(message_transport, cancel_and_ack_follow_the_invite) {
+    EXPECT_EQ(T_TCP, choose_message_transport(T_AUTO, true, T_TCP, 300));
+    EXPECT_EQ(T_UDP, choose_message_transport(T_AUTO, true, T_UDP, 300));
+}
+
+/* An explicit choice is the scenario's, also against the size rule: a
+ * test may send a too large request over UDP on purpose. Without one,
+ * the message takes -t as before. */
+TEST(message_transport, explicit_choice_wins) {
+    EXPECT_EQ(T_TCP, choose_message_transport(T_TCP, false, T_UDP, 10));
+    EXPECT_EQ(T_UDP, choose_message_transport(T_UDP, false, T_UDP, 5000));
+    EXPECT_EQ(transport, choose_message_transport(T_DEFAULT, false, T_TCP, 5000));
+}
+
+/* RFC 3261 section 18.1.1: when the size rule changes the transport, the
+ * top Via MUST name the new one, or the P-CSCF answers over the wrong one.
+ * Only the top Via is ours; the length stays, so Content-Length does. */
+TEST(message_transport, top_via_names_the_transport) {
+    std::string msg =
+        "INVITE sip:b@example.com SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1\r\n"
+        "Via: SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-2\r\n"
+        "Content-Length: 0\r\n\r\n";
+    std::string expected = msg;
+    expected.replace(expected.find("UDP"), 3, "TCP");
+    set_top_via_transport(&msg[0], T_TCP);
+    EXPECT_EQ(expected, msg);
+
+    std::string compact =
+        "MESSAGE sip:b@example.com SIP/2.0\r\n"
+        "v : SIP/2.0/tcp 10.0.0.1:5060;branch=z9hG4bK-1\r\n\r\n";
+    set_top_via_transport(&compact[0], T_UDP);
+    EXPECT_NE(std::string::npos, compact.find("v : SIP/2.0/UDP 10.0.0.1"));
+}
+
+/* A response copies the Vias of its request, and goes back over the
+ * transport the request came in on (RFC 3261 section 18.2.2): nothing in
+ * it changes. Neither does a Via of another transport, or text in a body. */
+TEST(message_transport, top_via_left_alone) {
+    std::string response =
+        "SIP/2.0 200 OK\r\n"
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1\r\n\r\n";
+    std::string before = response;
+    set_top_via_transport(&response[0], T_TCP);
+    EXPECT_EQ(before, response);
+
+    std::string tls =
+        "INVITE sip:b@example.com SIP/2.0\r\n"
+        "Via: SIP/2.0/TLS 10.0.0.1:5061;branch=z9hG4bK-1\r\n\r\n";
+    before = tls;
+    set_top_via_transport(&tls[0], T_TCP);
+    EXPECT_EQ(before, tls);
+
+    std::string body_only =
+        "MESSAGE sip:b@example.com SIP/2.0\r\n"
+        "Content-Length: 37\r\n"
+        "\r\n"
+        "Via: SIP/2.0/UDP 10.0.0.1:5060;x=1\r\n";
+    before = body_only;
+    set_top_via_transport(&body_only[0], T_TCP);
+    EXPECT_EQ(before, body_only);
+}
 #endif
 
 #ifdef USE_IPSEC
@@ -7977,6 +8244,8 @@ int call::ipsec_activate_sas()
 
 void call::ipsec_teardown_sas()
 {
+    /* Its port is the protected client port */
+    close_tcp_socket();
     if (ipsec_manager && ipsec_params.state >= IPSEC_STATE_SA_ESTABLISHED) {
         ipsec_manager->teardown_security_associations(ipsec_params);
     }
@@ -7985,6 +8254,12 @@ void call::ipsec_teardown_sas()
         ipsec_server_socket->close();
         ipsec_server_socket = nullptr;
     }
+    if (ipsec_server_tcp_socket) {
+        ipsec_server_tcp_socket->ss_owner = nullptr;
+        ipsec_server_tcp_socket->close();
+        ipsec_server_tcp_socket = nullptr;
+    }
+    SIPpSocket::close_accepted(this);
     if (ipsec_manager) {
         delete ipsec_manager;
         ipsec_manager = nullptr;
@@ -7993,6 +8268,10 @@ void call::ipsec_teardown_sas()
 
 int call::ipsec_rebind_socket()
 {
+    /* A TCP connection made before goes unprotected: the next request
+     * over TCP makes one from the protected client port. */
+    close_tcp_socket();
+
     /*
      * If the current socket happens to be bound to port_uc already, reuse it
      * instead of creating a second socket on the same port (which would fail
@@ -8050,6 +8329,27 @@ int call::ipsec_rebind_socket()
         return -1;
     }
     ipsec_server_socket->ss_owner = this;
+
+    /* With <send transport=...>, the P-CSCF may also connect to the
+     * protected server port, for a request too large for UDP (3GPP TS
+     * 33.203 clause 7.1, RFC 3261 section 18.2.1). */
+    if (mixed_transport && transport == T_UDP) {
+        ipsec_server_tcp_socket = SIPpSocket::new_sipp_ipsec_socket(
+            use_ipv6, T_TCP, ipsec_params.port_us,
+            (peripsocket || tunnel_ip()) ? ipsec_params.local_ip : nullptr);
+        if (!ipsec_server_tcp_socket) {
+            WARNING("Failed to create the IPSec TCP server socket on port %d",
+                    ipsec_params.port_us);
+            return -1;
+        }
+        if (::listen(ipsec_server_tcp_socket->ss_fd, 16)) {
+            WARNING_NO("Failed to listen on the IPSec TCP server port %d",
+                       ipsec_params.port_us);
+            return -1;
+        }
+        ipsec_server_tcp_socket->ss_listening = true;
+        ipsec_server_tcp_socket->ss_owner = this;
+    }
 
     /* Update the peer address to P-CSCF's protected server port */
     sockaddr_update_port(&call_peer, ipsec_params.port_ps);

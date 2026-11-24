@@ -232,6 +232,19 @@ List of commands with their attributes
 
         10% of the message sent are actually not sent :).
     * -
+      - ``transport``
+      - Sends this request over ``udp`` or ``tcp``, whatever ``-t u1``,
+        ``un`` or ``ui`` says, or chooses by size with ``auto``: UDP, unless
+        the request is larger than 1300 bytes (:RFC:`3261` section 18.1.1,
+        which 3GPP TS 24.229 clause 4.2A applies to UEs), and a CANCEL or
+        ACK over the transport of the last INVITE. Not for responses: they
+        go back the way their request came. See :ref:`mixed-transport`.
+      - ::
+
+          <send transport="auto">
+
+        An INVITE with a large SDP goes over TCP, a REGISTER over UDP.
+    * -
       - ``start_txn``
       - Records the branch ID of this sent message so that responses
         can be properly matched (without this element the transaction

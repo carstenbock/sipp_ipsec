@@ -156,6 +156,12 @@ Where:
 - ``port_c`` = protected client port (SIPp sends from here)
 - ``port_s`` = protected server port (SIPp receives here)
 
+The selectors of the SAs name no transport protocol: they protect UDP
+and TCP alike (3GPP TS 33.203 clause 7.1). With ``<send
+transport="...">`` a UE sends a large request over TCP from port_c to
+the P-CSCF's port_s and listens for TCP on its port_s, next to UDP (see
+:ref:`mixed-transport` in the transport modes).
+
 The integrity key is derived from IK (Milenage f4) and the encryption
 key from CK (Milenage f3), both computed during AKA authentication.
 

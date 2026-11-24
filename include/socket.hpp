@@ -102,6 +102,9 @@ public:
 
     // Accept new connections from a TCP socket
     SIPpSocket* accept();
+    /* Close the connections accepted on a listener of owner (see
+     * ss_listening), for owner goes. */
+    static void close_accepted(class listener *owner);
 
     // Write data to the socket.
     int write(const char *buffer, ssize_t len, int flags, struct sockaddr_storage *dest);
@@ -146,6 +149,12 @@ public:
     int ss_fd = -1;             /* The underlying file descriptor for this socket. */
     int ss_port = 0;            /* The port used by this socket */
     int ss_bind_port = 0;       /* Optional local port used by this socket */
+    /* Bound to its address and port before connect(), which keeps them
+     * (an IPSec protected client port, or a call's own -t ui address) */
+    bool ss_prebound = false;
+    /* A call's TCP listener (a UE's protected server port): the poll loop
+     * accepts on it, and the connections get its ss_owner. */
+    bool ss_listening = false;
 
     bool ss_changed_dest = false;   /* Has the destination changed from default. */
     struct sockaddr_storage ss_dest; /* Who we are talking to. */

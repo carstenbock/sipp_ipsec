@@ -2670,6 +2670,16 @@ int main(int argc, char *argv[])
       ooc_scenario->stats->setFileName((char*)"ooc_default", (char*)".csv");
     }
     */
+    /* A message's own transport is UDP or TCP next to the UDP of the
+     * call (see choose_message_transport()). */
+    if (mixed_transport && transport != T_UDP) {
+        ERROR("<send transport=...> needs -t u1, un or ui: the calls send over "
+              "UDP and open TCP for the messages that ask for it");
+    }
+    if (mixed_transport && use_remote_sending_addr) {
+        ERROR("<send transport=...> does not work with -rsa");
+    }
+
     display_scenario = main_scenario;
     aa_scenario = new scenario(0, find_scenario("ooc_dummy"));
     aa_scenario->stats->setFileName("ooc_dummy", ".csv");

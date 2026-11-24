@@ -153,6 +153,8 @@ public:
     ContentLengthFlag   content_length_flag ;
 
     std::string recv_response_for_cseq_method_list;
+    /* <send transport="udp|tcp|auto">: T_UDP, T_TCP, T_AUTO or T_DEFAULT */
+    int            send_transport;
     int            start_txn;
     int            ack_txn;
     int            response_txn;
