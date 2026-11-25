@@ -120,7 +120,7 @@
       INVITE [key:target_uri] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
-      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
+      From: <sip:+[key:msisdn]@[key:domain]>;tag=[call_number]
       To: <[key:target_uri]>
       Call-ID: [call_id]
       CSeq: 1 INVITE
@@ -128,7 +128,7 @@
       Accept: application/3gpp-ims+xml,application/sdp
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-      P-Preferred-Identity: <sip:[key:msisdn]@[key:domain]>
+      P-Preferred-Identity: <sip:+[key:msisdn]@[key:domain]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
       P-Early-Media: supported
       Session-ID: [call_id]
@@ -173,7 +173,7 @@ a=sendrecv
       CANCEL [last_Request_URI] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
-      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
+      From: <sip:+[key:msisdn]@[key:domain]>;tag=[call_number]
       To: <[key:target_uri]>
       Call-ID: [call_id]
       CSeq: 1 CANCEL
@@ -192,7 +192,7 @@ a=sendrecv
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
-      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
+      From: <sip:+[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK
@@ -213,7 +213,7 @@ a=sendrecv
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
+      From: <sip:+[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK
@@ -229,7 +229,7 @@ a=sendrecv
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
+      From: <sip:+[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 2 BYE
@@ -254,7 +254,7 @@ a=sendrecv
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
-      From: <sip:[key:msisdn]@[key:domain]>;tag=[call_number]
+      From: <sip:+[key:msisdn]@[key:domain]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK

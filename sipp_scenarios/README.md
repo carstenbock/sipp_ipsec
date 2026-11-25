@@ -83,7 +83,7 @@ attribute on `<recv>` captures the Record-Route headers, and the
 |-----------|------|-------------|
 | IMSI | `-s <imsi>` | Private user identity (used for REGISTER) |
 | Domain | `-key domain <realm>` | IMS home domain (e.g. `ims.mnc001.mcc001.3gppnetwork.org`) |
-| MSISDN | `-key msisdn <number>` | Public user identity (used in INVITE From/P-Preferred-Identity) |
+| MSISDN | `-key msisdn <number>` | Digits without `+`. The call scenarios send the public user identity `sip:+<number>@<domain>` in INVITE From/P-Preferred-Identity; without the `+` it is not an identity of the registration (ADR-0058) |
 | AKA K | `-key aka_K <hex>` | Subscriber authentication key |
 | AKA OP | `-key aka_OP <hex>` | Operator key (raw) |
 | AKA OPc | `-key aka_OPc <hex>` | Operator key (pre-computed, use instead of OP) |
@@ -167,6 +167,8 @@ Example row:
 ```
 ue_to_gw,tel:+4989200011251,ims.mnc001.mcc001.3gppnetwork.org,494034927217,116,9,8000,001019999900001
 ```
+
+`calling_msisdn` and the `<own MSISDN>` of the VoWiFi and S8HR CSV files are digits without `+`; the scenarios add it.
 
 ### VoWiFi Registration via an ePDG
 

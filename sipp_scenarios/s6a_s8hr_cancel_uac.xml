@@ -138,7 +138,8 @@
 
   <!-- ================================================================== -->
   <!-- Phase 2: INVITE (over IPsec tunnel)                                -->
-  <!-- From/P-Preferred-Identity use MSISDN (public user identity)        -->
+  <!-- From/P-Preferred-Identity: sip:+<MSISDN>@<domain>, the public user -->
+  <!-- identity of the registration; the CSV holds the digits without "+" -->
   <!-- ================================================================== -->
 
   <send retrans="500">
@@ -147,7 +148,7 @@
       INVITE [field4] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
-      From: <sip:[field3]@[domain]>;tag=[call_number]
+      From: <sip:+[field3]@[domain]>;tag=[call_number]
       To: <[field4]>
       Call-ID: inv///[call_id]
       CSeq: 1 INVITE
@@ -155,7 +156,7 @@
       Accept: application/3gpp-ims+xml,application/sdp
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-      P-Preferred-Identity: <sip:[field3]@[domain]>
+      P-Preferred-Identity: <sip:+[field3]@[domain]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
       P-Early-Media: supported
       Supported: 100rel,path,precondition,replaces,timer
@@ -212,7 +213,7 @@
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[domain]>;tag=[call_number]
+      From: <sip:+[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 1 ACK
@@ -269,13 +270,13 @@
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[domain]>;tag=[call_number]
+      From: <sip:+[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 2 BYE
       Contact: <sip:[field3]@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
-      P-Preferred-Identity: <sip:[field3]@[domain]>
+      P-Preferred-Identity: <sip:+[field3]@[domain]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
       Max-Forwards: 70
       User-Agent: SIPp-S8HR/1.0
@@ -301,7 +302,7 @@
       PRACK [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[domain]>;tag=[call_number]
+      From: <sip:+[field3]@[domain]>;tag=[call_number]
       [last_To:]
       Call-ID: inv///[call_id]
       CSeq: 2 PRACK
@@ -335,7 +336,7 @@
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[domain]>;tag=[call_number]
+      From: <sip:+[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 1 ACK
@@ -392,13 +393,13 @@
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/[transport] [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[domain]>;tag=[call_number]
+      From: <sip:+[field3]@[domain]>;tag=[call_number]
       To: [$peer_to]
       Call-ID: inv///[call_id]
       CSeq: 3 BYE
       Contact: <sip:[field3]@[local_ip]:[protected_server_port];transport=[transport]>;audio
       Reason: SIP;cause=200;text="User Triggered"
-      P-Preferred-Identity: <sip:[field3]@[domain]>
+      P-Preferred-Identity: <sip:+[field3]@[domain]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=[cell_id]
       Max-Forwards: 70
       User-Agent: SIPp-S8HR/1.0

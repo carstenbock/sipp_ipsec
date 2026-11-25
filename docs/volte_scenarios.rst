@@ -110,7 +110,7 @@ Placeholder       Description
 ================= ================================================
 ``__DOMAIN__``    IMS home domain
 ``__TARGET_URI__``  Called party URI (``tel:`` or ``sip:``)
-``__MSISDN__``    Calling party MSISDN (public user identity)
+``__MSISDN__``    User part of the calling public user identity (``+<MSISDN>``)
 ``__SDP_OFFER__`` Codec-specific SDP body
 ``__PCAP_FILE__`` Path to RTP PCAP for ``play_pcap_audio``
 ``__CALL_DURATION_MS__``  Active call duration in milliseconds

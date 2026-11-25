@@ -125,7 +125,7 @@
       INVITE [field1] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
-      From: <sip:[field3]@[field2]>;tag=[call_number]
+      From: <sip:+[field3]@[field2]>;tag=[call_number]
       To: <[field1]>
       Call-ID: [call_id]
       CSeq: 1 INVITE
@@ -133,7 +133,7 @@
       Accept: application/3gpp-ims+xml,application/sdp
       Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
       P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel
-      P-Preferred-Identity: <sip:[field3]@[field2]>
+      P-Preferred-Identity: <sip:+[field3]@[field2]>
       P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=0010100015ee0000
       P-Early-Media: supported
       Supported: 100rel,path,precondition,replaces,timer
@@ -177,7 +177,7 @@ a=sendrecv
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[field2]>;tag=[call_number]
+      From: <sip:+[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK
@@ -195,7 +195,7 @@ a=sendrecv
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[field2]>;tag=[call_number]
+      From: <sip:+[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 2 BYE
@@ -219,7 +219,7 @@ a=sendrecv
       PRACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       Route: [$service_route]
-      From: <sip:[field3]@[field2]>;tag=[call_number]
+      From: <sip:+[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 2 PRACK
@@ -245,7 +245,7 @@ a=sendrecv
       ACK [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[field2]>;tag=[call_number]
+      From: <sip:+[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 1 ACK
@@ -263,7 +263,7 @@ a=sendrecv
       BYE [next_url] SIP/2.0
       Via: SIP/2.0/TCP [local_ip]:[protected_server_port];branch=[branch]
       [routes]
-      From: <sip:[field3]@[field2]>;tag=[call_number]
+      From: <sip:+[field3]@[field2]>;tag=[call_number]
       To: [last_To]
       Call-ID: [call_id]
       CSeq: 3 BYE
