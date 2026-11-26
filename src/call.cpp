@@ -1462,39 +1462,11 @@ void call::init(scenario *call_scenario, SIPpSocket *socket, struct sockaddr_sto
 
 bool call::checkAckCSeq(const char* msg)
 {
-    static char request[65];
-    unsigned long int rcseq = 0;
-    const char* ptr = nullptr;
+    const unsigned long int rcseq = get_cseq_value(msg);
 
-    rcseq = get_cseq_value(msg);
-    memset(request, 0, sizeof(request));
-
-    if ((msg[0] == 'S') &&
-        (msg[1] == 'I') &&
-        (msg[2] == 'P') &&
-        (msg[3] == '/') &&
-        (msg[4] == '2') &&
-        (msg[5] == '.') &&
-        (msg[6] == '0')) {
-        request[0]=0;
-    } else if ((ptr = strchr(msg, ' '))) {
-        if ((ptr - msg) < 64) {
-            memcpy(request, msg, ptr - msg);
-            request[ptr - msg] = 0;
-        } else {
-            ERROR("SIP method too long in received message '%s'", msg);
-        }
-    } else {
-        ERROR("Invalid SIP message received '%s'", msg);
-    }
-
-    if ((default_behaviors & DEFAULT_BEHAVIOR_BADCSEQ) &&
-        !strncmp(request, "ACK", 3) &&
-        (rcseq != last_recv_invite_cseq)) {
-        return false;
-    } else {
-        return true;
-    }
+    /* Only an ACK is checked. Anything else, a malformed message too,
+     * goes on to the scenario, which may find it unexpected. */
+    return !(default_behaviors & DEFAULT_BEHAVIOR_BADCSEQ) || strncmp(msg, "ACK", 3) || rcseq == last_recv_invite_cseq;
 }
 
 int call::_callDebug(const char *fmt, ...)
@@ -5059,12 +5031,10 @@ bool call::process_incoming(const char* msg, const struct sockaddr_storage* src,
             }
             reply_code = 0;
         } else {
-            ERROR("SIP method too long in received message '%s'",
-                  msg);
+            request[0] = 0; // no method we can take: an unexpected message
         }
     } else {
-        ERROR("Invalid sip message received '%s'",
-              msg);
+        request[0] = 0;
     }
 
     /* Try to find it in the expected non mandatory responses
