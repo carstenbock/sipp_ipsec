@@ -131,6 +131,12 @@ Two new scenario actions are available inside ``<action>`` blocks:
     After this action, all subsequent SIP messages for this call are
     sent over the IPSec-protected path.
 
+    If the setup fails, for example because the 401 has no
+    ``Security-Server`` header, the call fails here (counted as a
+    rejected call) and nothing more is sent. With ``-ipsec`` the UE asked
+    for security associations; registering and calling without them
+    would let a test pass that never used the protected path.
+
 ``<ipsec_teardown />``
     Removes the IPSec Security Associations and Policies from the
     kernel. This should be called when de-registering or when the

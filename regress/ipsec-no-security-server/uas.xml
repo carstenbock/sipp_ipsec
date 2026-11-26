@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<scenario name="P-CSCF that challenges without Security-Server">
+
+  <recv request="REGISTER"/>
+
+  <!-- An AKA challenge (RAND and AUTN of 3GPP TS 35.208 test set 1 form),
+       but no Security-Server header: the security associations were not
+       set up on this side. -->
+  <send>
+    <![CDATA[
+
+      SIP/2.0 401 Unauthorized
+      [last_Via:]
+      [last_From:]
+      [last_To:];tag=[pid]SIPpTag01[call_number]
+      [last_Call-ID:]
+      [last_CSeq:]
+      WWW-Authenticate: Digest realm="ims.example.com",nonce="I6CWTWBU8PEUeeoayeW8qqqqAACAAPGiNVVwTQwlVFd1bGk=",algorithm=AKAv1-MD5,qop="auth"
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <!-- A second REGISTER within this time is an unexpected message and
+       fails the call. -->
+  <pause milliseconds="3000"/>
+
+</scenario>

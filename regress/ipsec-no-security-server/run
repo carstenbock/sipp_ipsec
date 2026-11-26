@@ -1,0 +1,36 @@
+#!/bin/sh
+# This regression test is a part of SIPp.
+# -ipsec: a 401 without a Security-Server header fails the call. Before, SIPp
+# logged a warning, answered the challenge from its unprotected port and went
+# on registering and calling without security associations, so a run meant
+# to load the IPSec path did not (helm KI-309). The UAS answers the REGISTER
+# with such a 401 and fails if a second REGISTER arrives while it waits.
+. "`dirname "$0"`/../functions"; init
+
+if ! sippfg -h 2>&1 | grep -q -- '-ipsec '; then
+    skip "built without USE_IPSEC"
+fi
+
+sippfg -sf uas.xml -t u1 -i 127.0.0.1 -p 25541 -m 1 -timeout 15 -timeout_error \
+    >uas.log 2>&1 &
+uas=$!
+sleep 1
+sippfg -sf uac.xml -t u1 -i 127.0.0.1 -p 25540 -m 1 -timeout 15 -timeout_error \
+    -ipsec -au 001010000000001 -key aka_K 0x465B5CE8B199B49FAA5F0A2EE238A6BC \
+    -key aka_OPc 0xCD63CB71954A9F4E48A5994E37A02BAF -key aka_AMF 0x8000 \
+    127.0.0.1:25541 >uac.log 2>&1
+uac_status=$?
+wait $uas
+uas_status=$?
+aborted=`grep -c 'IPSec SA setup failed: aborting call' uac.log`
+rm -f uac.log uas.log *_errors.log
+
+if test $uac_status -eq 0; then
+    fail "the UAC's call succeeded without security associations"
+elif test "$aborted" -eq 0; then
+    fail "UAC failed with $uac_status, but not on the IPSec setup"
+elif test $uas_status -ne 0; then
+    fail "UAS failed with $uas_status: the UAC sent a second REGISTER"
+else
+    ok
+fi

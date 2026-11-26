@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<scenario name="IMS AKA REGISTER with IPSec, the 401 has no Security-Server">
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:ims.example.com SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:001010000000001@ims.example.com>;tag=[call_number]
+      To: <sip:001010000000001@ims.example.com>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:001010000000001@[local_ip]:[local_port]>
+      Supported: path, sec-agree
+      Require: sec-agree
+      Proxy-Require: sec-agree
+      Security-Client: [security_client]
+      Max-Forwards: 70
+      Expires: 600
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="401" auth="true">
+    <action>
+      <ipsec_setup />
+    </action>
+  </recv>
+
+  <!-- Not reached: the call fails on the 401. -->
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:ims.example.com SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      From: <sip:001010000000001@ims.example.com>;tag=[call_number]
+      To: <sip:001010000000001@ims.example.com>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:001010000000001@[local_ip]:[local_port]>
+      [authentication username=001010000000001@ims.example.com]
+      Max-Forwards: 70
+      Expires: 600
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+</scenario>

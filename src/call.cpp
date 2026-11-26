@@ -5838,6 +5838,15 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
 #ifdef USE_IPSEC
         } else if (currentAction->getActionType() == CAction::E_AT_IPSEC_SETUP) {
             if (ipsec_setup_sas(msg) < 0) {
+                /* With -ipsec the UE asked for security associations
+                 * (Require: sec-agree). Going on without them registers
+                 * and calls unprotected, and a run meant to load the
+                 * IPSec path silently does not (helm KI-309): the call
+                 * fails here instead. */
+                if (ipsec_enabled) {
+                    WARNING("Call-Id: %s, IPSec SA setup failed: aborting call", id);
+                    return call::E_AR_STOP_CALL;
+                }
                 WARNING("IPSec SA setup failed");
             }
         } else if (currentAction->getActionType() == CAction::E_AT_IPSEC_TEARDOWN) {
