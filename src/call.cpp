@@ -5886,6 +5886,7 @@ call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
             }
             SwuConfig cfg;
             cfg.epdg = swu_epdg;
+            cfg.imei = swu_imei ? swu_imei : "";
             cfg.local_ip = local_ip;
             cfg.identity = createSendingMessage(currentAction->getMessage(0));
             if (!swu_hex16(createSendingMessage(currentAction->getMessage(1)), cfg.k) ||

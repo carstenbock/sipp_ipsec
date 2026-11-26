@@ -22,6 +22,11 @@ Two scenario actions and one option:
 ``-swu_epdg <host>``
     The ePDG, as IPv4 address or host name.
 
+``-swu_imei <digits>``
+    The IMEI (15 digits) or IMEISV (16 digits) the UEs give an ePDG that asks
+    for the device identity during IKE_AUTH (``DEVICE_IDENTITY``, 3GPP
+    TS 24.302 clause 8.2.9.2). Without it such a question is not answered.
+
 ``-swu_keepalive <seconds>``
     Interval of the NAT keepalives (RFC 3948 section 2.3) each tunnel sends
     from its UDP port, default 20, ``0`` for none. An idle UE sends nothing

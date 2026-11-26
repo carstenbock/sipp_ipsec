@@ -84,6 +84,7 @@ struct SwuConfig {
     std::string identity;   /* NAI: <d><IMSI>@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org,
                                d = 6 for EAP-AKA', 0 for EAP-AKA (TS 23.003 §19.3.2) */
     std::string apn;        /* sent as IDr */
+    std::string imei;       /* IMEI or IMEISV digits for an ePDG that asks, or empty */
     int pdn_type;           /* inner addresses asked for: 1 IPv4, 2 IPv6, 3 both */
     int sip_family;         /* address family for SIP: 0 IPv6 if there is a
                                P-CSCF for it (GSMA IR.92), 4 or 6 */
@@ -182,6 +183,7 @@ private:
     SwuBytes last_peer_reply_;
 
     bool natt_;                 /* moved to UDP 4500 (after IKE_SA_INIT) */
+    bool device_identity_asked_ = false;  /* the ePDG sent N(DEVICE_IDENTITY) */
     std::string outer_local_;
     uint16_t outer_port_;
     std::string inner_ip_, pcscf_;          /* IPv4 */

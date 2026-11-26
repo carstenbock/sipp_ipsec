@@ -73,6 +73,7 @@ enum {
     IKE_PORT = 500,
     N_NO_ADDITIONAL_SAS = 35, N_INITIAL_CONTACT = 16384, N_NAT_SRC = 16388,
     N_NAT_DST = 16389, N_COOKIE = 16390, N_EAP_ONLY = 16417,
+    N_DEVICE_IDENTITY = 41101,  /* 3GPP TS 24.302 clause 8.2.9.2 */
     N_FIRST_STATUS = 16384,     /* notify types below this are errors */
     IKE_HDR_LEN = 28, IKE_NATT_PORT = 4500
 };
@@ -1183,6 +1184,9 @@ void SwuSession::handle_auth_response(const std::vector<Payload> &pls)
         if (pls[i].type == PL_NOTIFY && b.size() >= 4 && get16(b.data() + 2) < N_FIRST_STATUS) {
             fail("IKE_AUTH rejected by the ePDG (notify %u)", get16(b.data() + 2));
             return;
+        } else if (pls[i].type == PL_NOTIFY && b.size() >= 4 &&
+                   get16(b.data() + 2) == N_DEVICE_IDENTITY) {
+            device_identity_asked_ = true;
         } else if (pls[i].type == PL_IDR) {
             idr_body_ = b;
         } else if (pls[i].type == PL_EAP) {
@@ -1217,6 +1221,25 @@ void SwuSession::handle_auth_response(const std::vector<Payload> &pls)
     } else {
         out[0].type = PL_EAP;
         out[0].body = reply;
+    }
+    if (device_identity_asked_ && !cfg_.imei.empty()) {
+        /* TS 24.302 clause 7.2.2.1: the answer goes into the IKE_AUTH request
+         * that follows the ePDG's question. Length, identity type (1 IMEI,
+         * 2 IMEISV), then the digits, two per octet, the first in the low
+         * half, a last half octet filled with 1111. */
+        SwuBytes id;
+        const std::string &d = cfg_.imei;
+        put16(id, 1 + (d.size() + 1) / 2);
+        put8(id, d.size() > 15 ? 2 : 1);
+        for (size_t i = 0; i < d.size(); i += 2) {
+            uint8_t lo = d[i] - '0', hi = i + 1 < d.size() ? d[i + 1] - '0' : 0x0f;
+            put8(id, (hi << 4) | lo);
+        }
+        Payload n;
+        n.type = PL_NOTIFY;
+        n.body = notify_body(N_DEVICE_IDENTITY, id);
+        out.push_back(n);
+        device_identity_asked_ = false;
     }
     send_request(EXCH_IKE_AUTH, out, true);
 }
